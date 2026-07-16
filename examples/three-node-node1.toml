@@ -1,0 +1,94 @@
+# Three-node raft cluster config for node 1.
+
+[node]
+id = 1
+advertise_addr = "10.0.0.11"
+
+[sip]
+external_addr = "sip.example.com:5060"
+max_message_bytes = 65535
+
+[proxy]
+record_route = true
+
+[proxy.socket]
+reuse_port = false
+workers_per_listener = 1
+recv_buffer_bytes = 4194304
+send_buffer_bytes = 4194304
+tcp_nodelay = true
+
+[proxy.metrics]
+enabled = false
+bind_addr = "127.0.0.1:9100"
+
+[proxy.affinity]
+enabled = true
+key = "dialog-id"
+ttl_seconds = 3600
+
+[[proxy.upstream_groups]]
+name = "pbx-a"
+mode = "round-robin"
+servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
+
+[proxy.upstream_groups.health_check]
+enabled = true
+transport = "udp"
+interval_ms = 5000
+timeout_ms = 1000
+options_uri = "sip:healthcheck@pbx-a"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "udp"
+upstream_group = "pbx-a"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "tcp"
+upstream_group = "pbx-a"
+
+[cluster]
+mode = "raft"
+bind_addr = "10.0.0.11:7000"
+data_dir = "./data/node-1"
+
+[[cluster.peers]]
+id = 1
+raft_addr = "10.0.0.11:7000"
+sip_addr = "10.0.0.11:5060"
+
+[[cluster.peers]]
+id = 2
+raft_addr = "10.0.0.12:7000"
+sip_addr = "10.0.0.12:5060"
+
+[[cluster.peers]]
+id = 3
+raft_addr = "10.0.0.13:7000"
+sip_addr = "10.0.0.13:5060"
+
+[ha]
+leader_check_interval_ms = 1000
+
+[ha.active_standby]
+enabled = false
+initial_role = "standby"
+heartbeat_bind = "127.0.0.1:7900"
+peer_heartbeat_addr = "127.0.0.1:7900"
+heartbeat_interval_ms = 1000
+failover_timeout_ms = 5000
+
+[ha.replication]
+enabled = false
+bind_addr = "127.0.0.1:7901"
+peer_addr = "127.0.0.1:7902"
+pull_interval_ms = 10000
+request_timeout_ms = 2000
+
+[ha.addon]
+type = "command"
+on_become_leader = "/usr/local/bin/bind-eip.sh"
+on_step_down = "/usr/local/bin/unbind-eip.sh"
+timeout_ms = 5000
