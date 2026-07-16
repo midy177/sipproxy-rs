@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use rsipstack::sip::headers::{Header, Headers};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
-    HasHeaders, MaxForwards, Method, Request, Response, SipMessage as RsipMessage, StatusCode,
-    Version,
+    ContentLength, HasHeaders, MaxForwards, Method, Request, Response, SipMessage as RsipMessage,
+    StatusCode, Version,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,10 +147,15 @@ impl SipMessage {
     }
 
     pub fn max_forwards(&self) -> Result<Option<u32>> {
-        let Some(value) = self.header("Max-Forwards") else {
+        let value = match &self.inner {
+            RsipMessage::Request(request) => request.max_forwards_header().ok(),
+            RsipMessage::Response(response) => response.max_forwards_header().ok(),
+        };
+        let Some(value) = value else {
             return Ok(None);
         };
         value
+            .value()
             .trim()
             .parse::<u32>()
             .map(Some)
@@ -178,12 +183,19 @@ impl SipMessage {
 
     pub fn response_like(request: &Self, code: u16, reason: &str) -> Self {
         let mut headers = Headers::default();
-        for name in ["Via", "From", "To", "Call-ID", "CSeq"] {
-            for value in request.headers(name) {
-                headers.push(Header::Other(name.to_string(), value.to_string()));
+        for header in request.inner.headers().iter() {
+            match header {
+                Header::Via(_)
+                | Header::From(_)
+                | Header::To(_)
+                | Header::CallId(_)
+                | Header::CSeq(_) => {
+                    headers.push(header.clone());
+                }
+                _ => {}
             }
         }
-        headers.push(Header::Other("Content-Length".to_string(), "0".to_string()));
+        headers.push(Header::ContentLength(ContentLength::from(0)));
 
         let status_code =
             StatusCode::try_from((code, reason)).unwrap_or_else(|_| StatusCode::from(code));
@@ -302,6 +314,28 @@ CSeq: 1 OPTIONS\r\n\r\n",
                 .unwrap()
                 .starts_with("SIP/2.0 200 OK")
         );
+    }
+
+    #[test]
+    fn response_like_copies_standard_header_variants() {
+        let req = SipMessage::parse(
+            b"OPTIONS sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy\r\n\
+Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK-client\r\n\
+From: <sip:200@example.com>;tag=a\r\n\
+To: <sip:example.com>\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        let resp =
+            String::from_utf8(SipMessage::response_like(&req, 200, "OK").to_bytes()).unwrap();
+
+        assert!(resp.contains("Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy"));
+        assert!(resp.contains("Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK-client"));
+        assert!(resp.contains("Content-Length: 0"));
     }
 
     #[test]
