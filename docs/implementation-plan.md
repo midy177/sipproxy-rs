@@ -240,6 +240,28 @@ REGISTER：
 3. 根据配置写入 AOR affinity。
 4. active 将 location/affinity 复制给 standby。
 
+REGISTER 路由模式：
+
+1. 默认使用 `register_routing = "path"`：不改 Contact，只在 REGISTER 上添加 Path，并依赖 PBX/registrar 在后续请求中使用 Route。这是标准 proxy / PLB 优先模式。
+2. 可选使用 `register_routing = "contact-rewrite"`：将 Contact 改写为 sigproxy 可达地址，用于 PBX/registrar 不支持 Path 或 NAT 场景的兼容模式。
+3. `rewrite_register_contact = true` 仅作为历史配置兼容入口，后续配置和文档优先使用 `register_routing`。
+
+`contact-rewrite` 模式：
+
+1. 将发往 PBX/registrar 的 Contact 重写为 sigproxy 可达地址。
+2. rewritten Contact 的 user 部分携带稳定 token，用于区分同一 AOR 下的多设备、多连接、多租户 Contact。
+3. 重写后的 Contact 不保留 `;ob`，避免被上游误判为 RFC 5626 outbound flow。
+4. 本地保存 `rewritten Contact -> original Contact`，后续 PBX 呼入 rewritten Contact 时转回对应客户端。
+5. 该模式不终止 dialog，也不重写 Call-ID / tag / CSeq，因此不是完整 B2BUA；但它会改 Contact，不能称为纯透明 proxy 模式。
+
+后续可增强：
+
+1. 将当前轻量 token 生成切换为 BLAKE3。
+2. 支持 keyed BLAKE3，配置 `contact_token_secret`，避免 token 可被外部推测。
+3. 生产环境要求显式配置稳定 secret；开发环境可自动生成临时 secret。
+4. token 长度可配置，默认保持 16 到 20 个 hex 字符，兼顾低碰撞和 Contact 可读性。
+5. 完整 RFC 5626 outbound 支持作为独立模式设计，不与当前轻量 Contact rewrite 混用。
+
 CANCEL / ACK / BYE / re-INVITE / UPDATE：
 
 1. 优先使用 dialog affinity：`Call-ID + From tag + To tag`。
@@ -293,7 +315,7 @@ max_message_bytes = 65535
 
 [proxy]
 record_route = true
-rewrite_register_contact = false
+register_routing = "path"
 
 [proxy.socket]
 reuse_port = false

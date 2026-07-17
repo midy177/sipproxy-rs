@@ -112,6 +112,13 @@ impl Config {
         if self.proxy.affinity.enabled && self.proxy.affinity.ttl_seconds == 0 {
             bail!("proxy.affinity.ttl_seconds must be greater than 0 when affinity is enabled");
         }
+        if self.proxy.register_routing == Some(RegisterRoutingMode::Path)
+            && self.proxy.rewrite_register_contact
+        {
+            bail!(
+                "proxy.register_routing = \"path\" conflicts with legacy proxy.rewrite_register_contact = true"
+            );
+        }
 
         let mut group_names = HashSet::new();
         for group in &self.proxy.upstream_groups {
@@ -467,6 +474,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub record_route: bool,
     #[serde(default)]
+    pub register_routing: Option<RegisterRoutingMode>,
+    #[serde(default)]
     pub rewrite_register_contact: bool,
     #[serde(default)]
     pub socket: ProxySocketConfig,
@@ -486,6 +495,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             record_route: true,
+            register_routing: None,
             rewrite_register_contact: false,
             socket: ProxySocketConfig::default(),
             metrics: ProxyMetricsConfig::default(),
@@ -503,6 +513,40 @@ impl Default for ProxyConfig {
             }],
             routes: Vec::new(),
         }
+    }
+}
+
+impl ProxyConfig {
+    pub fn effective_register_routing(&self) -> RegisterRoutingMode {
+        self.register_routing.unwrap_or_else(|| {
+            if self.rewrite_register_contact {
+                RegisterRoutingMode::ContactRewrite
+            } else {
+                RegisterRoutingMode::Path
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RegisterRoutingMode {
+    Path,
+    ContactRewrite,
+}
+
+impl RegisterRoutingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::ContactRewrite => "contact-rewrite",
+        }
+    }
+}
+
+impl Default for RegisterRoutingMode {
+    fn default() -> Self {
+        Self::Path
     }
 }
 
@@ -909,6 +953,7 @@ max_message_bytes = 65535
 
 [proxy]
 record_route = true
+register_routing = "path"
 
 [proxy.socket]
 reuse_port = false
@@ -992,6 +1037,63 @@ mod tests {
     fn example_config_is_valid() {
         let config: Config = toml::from_str(example_config()).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_register_routing_mode() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy]
+register_routing = "contact-rewrite"
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.proxy.effective_register_routing(),
+            RegisterRoutingMode::ContactRewrite
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn legacy_rewrite_register_contact_selects_contact_rewrite_mode() {
+        let config = Config {
+            proxy: ProxyConfig {
+                rewrite_register_contact: true,
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert_eq!(
+            config.proxy.effective_register_routing(),
+            RegisterRoutingMode::ContactRewrite
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_conflicting_register_routing_config() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy]
+register_routing = "path"
+rewrite_register_contact = true
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

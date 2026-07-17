@@ -16,7 +16,9 @@ max_message_bytes = 65535
 
 [proxy]
 record_route = true
-rewrite_register_contact = false
+register_routing = "path"
+# Legacy compatibility equivalent to register_routing = "contact-rewrite".
+# rewrite_register_contact = true
 
 [proxy.socket]
 reuse_port = false

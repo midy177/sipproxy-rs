@@ -1,7 +1,7 @@
 use crate::cluster::{ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at};
 use crate::config::{
-    Config, ProxyListenerConfig, ProxyMetricsConfig, ProxySocketConfig, SipTransport,
-    UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
+    Config, ProxyListenerConfig, ProxyMetricsConfig, ProxySocketConfig, RegisterRoutingMode,
+    SipTransport, UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
 };
 use crate::ha::HaStateSnapshot;
 use crate::proxy::affinity::{AffinityTable, AffinityTarget};
@@ -255,6 +255,7 @@ impl ProxyServer {
             internal_addr = %internal,
             upstream_group = %listener.upstream_group,
             record_route = self.config.proxy.record_route,
+            register_routing = self.config.proxy.effective_register_routing().as_str(),
             rewrite_register_contact = self.config.proxy.rewrite_register_contact,
             affinity_enabled = self.config.proxy.affinity.enabled,
             affinity_key = ?self.config.proxy.affinity.key,
@@ -883,13 +884,16 @@ impl ProxyServer {
             }
         }
         if method == "REGISTER" {
-            if self.config.proxy.rewrite_register_contact {
-                self.rewrite_and_store_register_contact(&mut message, &via_host, _peer)
-                    .await?;
-            } else {
-                self.store_register_contact_routes(&message, &via_host, _peer)
-                    .await?;
-                message.prepend_header("Path", format!("<sip:{via_host};lr>"));
+            match self.config.proxy.effective_register_routing() {
+                RegisterRoutingMode::ContactRewrite => {
+                    self.rewrite_and_store_register_contact(&mut message, &via_host, _peer)
+                        .await?;
+                }
+                RegisterRoutingMode::Path => {
+                    self.store_register_contact_routes(&message, &via_host, _peer)
+                        .await?;
+                    message.prepend_header("Path", format!("<sip:{via_host};lr>"));
+                }
             }
         }
 
@@ -1139,14 +1143,25 @@ impl ProxyServer {
         via_host: &str,
         peer: SocketAddr,
     ) -> Result<()> {
+        let aor = extract_aor(message).ok();
         let original_contact = extract_contact(message).ok().flatten();
         let expires = extract_expires(message);
-        let rewritten_contacts = message.rewrite_contact_host(via_host)?;
+        let rewritten_contacts = message.rewrite_contact_host_with_user(
+            via_host,
+            |original_contact, original_user| {
+                rewritten_register_contact_user(
+                    aor.as_deref(),
+                    original_contact,
+                    peer,
+                    original_user,
+                )
+            },
+        )?;
         for (original, rewritten) in rewritten_contacts {
             self.store_contact_route_keys(&rewritten, &original, peer, expires)
                 .await;
         }
-        if let (Ok(aor), Some(contact)) = (extract_aor(message), original_contact) {
+        if let (Some(aor), Some(contact)) = (aor, original_contact) {
             self.state
                 .apply(ClusterCommand::RegisterContact(ContactBinding {
                     aor,
@@ -2685,6 +2700,35 @@ fn registration_route_keys(route: &str) -> Vec<String> {
     keys
 }
 
+fn rewritten_register_contact_user(
+    aor: Option<&str>,
+    original_contact: &str,
+    peer: SocketAddr,
+    original_user: &str,
+) -> String {
+    let key = format!(
+        "register-contact|{}|{}|{}",
+        aor.unwrap_or_default(),
+        original_contact,
+        peer
+    );
+    let token = compact_uuid_token(&uuid_like_id(&key), 16);
+    let user = if original_user.is_empty() {
+        "contact"
+    } else {
+        original_user
+    };
+    format!("{user}~{token}")
+}
+
+fn compact_uuid_token(value: &str, len: usize) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .take(len)
+        .collect()
+}
+
 fn normalized_sip_uri_without_params(value: &str) -> Option<String> {
     let mut uri = RsipContact::parse(value)
         .map(|contact| contact.uri)
@@ -2885,6 +2929,7 @@ mod tests {
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    register_routing: None,
                     rewrite_register_contact,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
@@ -2924,6 +2969,7 @@ mod tests {
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    register_routing: None,
                     rewrite_register_contact: false,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
@@ -2960,6 +3006,7 @@ mod tests {
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    register_routing: None,
                     rewrite_register_contact: false,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
@@ -2999,6 +3046,7 @@ mod tests {
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    register_routing: None,
                     rewrite_register_contact: false,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
@@ -3225,23 +3273,75 @@ Content-Length: 0\r\n\r\n",
         let mut buf = [0_u8; 4096];
         let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
         let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
-        assert!(forwarded.contains("Contact: \"wuly\" <sip:6805@127.0.0.1:5060;ob>;expires=60"));
+        let rewritten_contact = contact_uri_from_message(&forwarded);
+        assert!(rewritten_contact.starts_with("sip:6805~"));
+        assert!(rewritten_contact.ends_with("@127.0.0.1:5060"));
+        assert!(!rewritten_contact.contains(";ob"));
         assert!(!forwarded.contains("Path:"));
 
-        let binding = server
-            .state
-            .lookup("sip:6805@127.0.0.1:5060;ob")
-            .await
-            .unwrap();
-        assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
-        let binding = server
-            .state
-            .lookup("sip:6805@127.0.0.1:5060")
-            .await
-            .unwrap();
+        let binding = server.state.lookup(&rewritten_contact).await.unwrap();
         assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
         let binding = server.state.lookup("sip:6805@example.com").await.unwrap();
         assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
+    }
+
+    #[tokio::test]
+    async fn rewritten_register_contacts_are_unique_per_device() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream_config(upstream_socket.local_addr().unwrap(), true);
+
+        for (branch, client_contact, peer) in [
+            (
+                "z9hG4bK-register-device-a",
+                "sip:3001@10.0.0.10:53109;ob",
+                "127.0.0.1:53109",
+            ),
+            (
+                "z9hG4bK-register-device-b",
+                "sip:3001@10.0.0.11:53110;ob",
+                "127.0.0.1:53110",
+            ),
+        ] {
+            let register = format!(
+                "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch={branch}\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <{client_contact}>;expires=60\r\n\
+Call-ID: {branch}\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+            );
+            server
+                .handle_udp_packet(
+                    &proxy_socket,
+                    register.as_bytes(),
+                    peer.parse().unwrap(),
+                    &test_listener(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let first = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let second = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let first_contact = contact_uri_from_message(&first);
+        let second_contact = contact_uri_from_message(&second);
+
+        assert_ne!(first_contact, second_contact);
+        assert!(first_contact.starts_with("sip:3001~"));
+        assert!(second_contact.starts_with("sip:3001~"));
+        assert!(first_contact.ends_with("@127.0.0.1:5060"));
+        assert!(second_contact.ends_with("@127.0.0.1:5060"));
+
+        let first_binding = server.state.lookup(&first_contact).await.unwrap();
+        let second_binding = server.state.lookup(&second_contact).await.unwrap();
+        assert_eq!(first_binding.contact, "sip:3001@10.0.0.10:53109;ob");
+        assert_eq!(second_binding.contact, "sip:3001@10.0.0.11:53110;ob");
     }
 
     #[tokio::test]
@@ -4310,6 +4410,15 @@ Content-Length: 0\r\n\r\n",
             .lines()
             .filter(|line| line.starts_with(&prefix))
             .collect()
+    }
+
+    fn contact_uri_from_message(message: &str) -> String {
+        let value = header_lines(message, "Contact")
+            .first()
+            .unwrap()
+            .trim_start_matches("Contact:")
+            .trim();
+        RsipContact::parse(value).unwrap().uri.to_string()
     }
 
     #[test]

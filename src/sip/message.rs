@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rsipstack::sip::headers::{Header, Headers};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
-    ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
+    Auth, ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
     SipMessage as RsipMessage, StatusCode, Transport, Uri, Version,
     headers::{CallId, UserAgent},
     param::{Branch, Tag},
@@ -195,6 +195,17 @@ impl SipMessage {
     }
 
     pub fn rewrite_contact_host(&mut self, sent_by: &str) -> Result<Vec<(String, String)>> {
+        self.rewrite_contact_host_with_user(sent_by, |_, user| user.to_string())
+    }
+
+    pub fn rewrite_contact_host_with_user<F>(
+        &mut self,
+        sent_by: &str,
+        mut rewrite_user: F,
+    ) -> Result<Vec<(String, String)>>
+    where
+        F: FnMut(&str, &str) -> String,
+    {
         let host_with_port =
             HostWithPort::try_from(sent_by).context("invalid Contact rewrite host")?;
         let mut rewritten = Vec::new();
@@ -212,6 +223,16 @@ impl SipMessage {
                     if contact.to_string() != "*" {
                         let original = contact.uri.to_string();
                         contact.uri.host_with_port = host_with_port.clone();
+                        contact.uri.params.retain(|param| *param != Param::Ob);
+                        let original_user = contact.uri.user().unwrap_or_default().to_string();
+                        let rewritten_user = rewrite_user(&original, &original_user);
+                        if !rewritten_user.is_empty() {
+                            if let Some(auth) = contact.uri.auth.as_mut() {
+                                auth.user = rewritten_user;
+                            } else {
+                                contact.uri.auth = Some(Auth::from(rewritten_user));
+                            }
+                        }
                         rewritten.push((original, contact.uri.to_string()));
                     }
                     contact.to_string()

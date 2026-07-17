@@ -90,8 +90,9 @@ max_message_bytes = 65535
 
 [proxy]
 record_route = true
-# Rewrite REGISTER Contact to the proxy address for NAT/public-upstream tests.
-rewrite_register_contact = false
+# "path" keeps REGISTER Contact unchanged and adds Path for standard proxy/PLB.
+# Use "contact-rewrite" only for PBX/registrar compatibility deployments.
+register_routing = "path"
 
 [proxy.socket]
 reuse_port = false

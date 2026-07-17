@@ -44,10 +44,14 @@ max_message_bytes = 65535
 # requests.
 record_route = true
 
-# Rewrite REGISTER Contact to this proxy's advertised SIP address and keep the
-# original Contact in local state. Useful when a LAN softphone registers through
-# this proxy to a public PBX that rejects private Contact addresses.
-rewrite_register_contact = false
+# REGISTER routing mode:
+# - "path": standard proxy/PLB mode. Keep Contact unchanged and add Path.
+# - "contact-rewrite": compatibility mode for PBX/registrar deployments that
+#   do not support Path or need sigproxy to be stored as the reachable Contact.
+register_routing = "path"
+
+# Legacy compatibility equivalent to register_routing = "contact-rewrite".
+# rewrite_register_contact = true
 
 [proxy.socket]
 # Enable SO_REUSEPORT for listener sockets. Required when workers_per_listener

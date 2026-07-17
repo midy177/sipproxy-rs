@@ -97,6 +97,7 @@ mod tests {
     fn route_selection_prefers_matching_domain_and_prefix() {
         let table = RouteTable::new(&ProxyConfig {
             record_route: true,
+            register_routing: None,
             rewrite_register_contact: false,
             socket: Default::default(),
             metrics: Default::default(),
