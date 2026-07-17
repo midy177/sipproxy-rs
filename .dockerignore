@@ -1,0 +1,8 @@
+target
+.git
+.agents
+.codex
+*.pcap
+*.pcapng
+*.log
+data

@@ -1,6 +1,3 @@
-pub mod raft;
-
-use crate::config::{ClusterConfig, ClusterMode};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -101,7 +98,9 @@ impl SharedState {
     }
 
     pub async fn contact_count(&self) -> usize {
-        self.contacts.read().await.len()
+        let mut contacts = self.contacts.write().await;
+        contacts.retain(|_, binding| !binding.is_expired());
+        contacts.len()
     }
 
     pub async fn snapshot(&self) -> ContactStateSnapshot {
@@ -148,17 +147,8 @@ impl ClusterReplicator for StandaloneReplicator {
     }
 }
 
-pub async fn build_replicator(
-    node_id: NodeId,
-    config: &ClusterConfig,
-    state: Arc<SharedState>,
-) -> Result<Arc<dyn ClusterReplicator>> {
-    match config.mode {
-        ClusterMode::Standalone => Ok(Arc::new(StandaloneReplicator::new(state))),
-        ClusterMode::Raft => Ok(Arc::new(
-            raft::RaftReplicator::new(node_id, config, state).await?,
-        )),
-    }
+pub async fn build_replicator(state: Arc<SharedState>) -> Result<Arc<dyn ClusterReplicator>> {
+    Ok(Arc::new(StandaloneReplicator::new(state)))
 }
 
 pub fn expires_at(ttl: Duration) -> u128 {

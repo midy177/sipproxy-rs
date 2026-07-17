@@ -1,0 +1,87 @@
+# Two-node active-standby config for node 1.
+# Node 1 starts active. Node 2 should use active-standby-node2.toml.
+
+[node]
+id = 1
+
+[sip]
+public_addr = "sip.example.com"
+internal_addr = "10.0.0.11"
+max_message_bytes = 65535
+
+[proxy]
+record_route = true
+
+[proxy.socket]
+reuse_port = false
+workers_per_listener = 1
+recv_buffer_bytes = 4194304
+send_buffer_bytes = 4194304
+tcp_nodelay = true
+
+[proxy.metrics]
+enabled = false
+bind_addr = "127.0.0.1:9100"
+
+[proxy.affinity]
+enabled = true
+key = "dialog-id"
+ttl_seconds = 3600
+
+[[proxy.upstream_groups]]
+name = "pbx-a"
+mode = "round-robin"
+servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
+
+[proxy.upstream_groups.health_check]
+enabled = true
+interval_ms = 5000
+timeout_ms = 1000
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@pbx-a"
+success_codes = [200, 202, 405, 481]
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "udp"
+upstream_group = "pbx-a"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "tcp"
+upstream_group = "pbx-a"
+
+[ha]
+leader_check_interval_ms = 1000
+
+[ha.active_standby]
+enabled = true
+initial_role = "active"
+heartbeat_bind = "10.0.0.11:7900"
+peer_heartbeat_addr = "10.0.0.12:7900"
+heartbeat_interval_ms = 1000
+failover_timeout_ms = 5000
+
+[ha.replication]
+enabled = true
+bind_addr = "10.0.0.11:7901"
+peer_addr = "10.0.0.12:7901"
+pull_interval_ms = 1000
+request_timeout_ms = 2000
+
+[ha.addon]
+type = "noop"
+
+# Noop does not move traffic. In production, configure a VIP/EIP/LB hook so
+# only the active node receives SIP traffic.
+# Optional floating endpoint hook for EIP/VIP integration:
+# [ha.addon]
+# type = "command"
+# on_become_leader = "/usr/local/bin/bind-floating-endpoint.sh"
+# on_step_down = "/usr/local/bin/unbind-floating-endpoint.sh"
+# timeout_ms = 5000

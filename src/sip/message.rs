@@ -2,9 +2,15 @@ use anyhow::{Context, Result};
 use rsipstack::sip::headers::{Header, Headers};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
-    ContentLength, HasHeaders, MaxForwards, Method, Request, Response, SipMessage as RsipMessage,
-    StatusCode, Version,
+    ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
+    SipMessage as RsipMessage, StatusCode, Transport, Uri, Version,
+    headers::{CallId, UserAgent},
+    param::{Branch, Tag},
+    typed::{CSeq, Contact as TypedContact, From as FromHeader, To as ToHeader, Via},
 };
+use std::net::SocketAddr;
+
+const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SipStartLine {
@@ -103,6 +109,32 @@ impl SipMessage {
         Ok(Some(top.trim().to_string()))
     }
 
+    pub fn pop_top_header_value(&mut self, name: &str) -> Result<Option<String>> {
+        let Some((index, value)) = self
+            .inner
+            .headers()
+            .iter()
+            .enumerate()
+            .find(|(_, header)| header.name().eq_ignore_ascii_case(name))
+            .map(|(index, header)| (index, header.value().to_string()))
+        else {
+            return Ok(None);
+        };
+
+        let (top, rest) = split_first_header_value(&value)
+            .with_context(|| format!("failed to split top {name}"))?;
+        let headers = self.inner.headers_mut();
+        match rest {
+            Some(rest) if !rest.trim().is_empty() => {
+                headers.0[index] = Header::Other(name.to_string(), rest.trim().to_string());
+            }
+            _ => {
+                headers.0.remove(index);
+            }
+        }
+        Ok(Some(top.trim().to_string()))
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.inner
             .headers()
@@ -144,6 +176,35 @@ impl SipMessage {
         } else {
             self.inner.headers_mut().push(Header::Other(name, value));
         }
+    }
+
+    pub fn rewrite_contact_host(&mut self, sent_by: &str) -> Result<Vec<(String, String)>> {
+        let host_with_port =
+            HostWithPort::try_from(sent_by).context("invalid Contact rewrite host")?;
+        let mut rewritten = Vec::new();
+        for header in self
+            .inner
+            .headers_mut()
+            .iter_mut()
+            .filter(|header| header.name().eq_ignore_ascii_case("Contact"))
+        {
+            let contacts = TypedContact::parse_header_list(header.value())
+                .context("failed to parse Contact header")?;
+            let rendered = contacts
+                .into_iter()
+                .map(|mut contact| {
+                    if contact.to_string() != "*" {
+                        let original = contact.uri.to_string();
+                        contact.uri.host_with_port = host_with_port.clone();
+                        rewritten.push((original, contact.uri.to_string()));
+                    }
+                    contact.to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            *header = Header::Other("Contact".to_string(), rendered);
+        }
+        Ok(rewritten)
     }
 
     pub fn max_forwards(&self) -> Result<Option<u32>> {
@@ -205,6 +266,61 @@ impl SipMessage {
             headers,
             body: Vec::new(),
         }))
+    }
+
+    pub fn options_request(
+        uri: &str,
+        transport: Transport,
+        sent_by: SocketAddr,
+        branch: impl Into<String>,
+        tag: impl Into<String>,
+        call_id: impl Into<String>,
+        cseq: u32,
+    ) -> Result<Self> {
+        let uri = uri.parse::<Uri>().context("invalid OPTIONS request URI")?;
+        let from_uri = "sip:healthcheck@localhost"
+            .parse::<Uri>()
+            .context("invalid health-check From URI")?;
+        let via = Via {
+            version: Version::V2,
+            transport,
+            uri: HostWithPort::from(sent_by).into(),
+            params: vec![
+                Param::Branch(Branch::new(branch.into())),
+                Param::Rport(None),
+            ],
+        };
+        let from = FromHeader {
+            display_name: None,
+            uri: from_uri,
+            params: vec![Param::Tag(Tag::new(tag.into()))],
+        };
+        let to = ToHeader {
+            display_name: None,
+            uri: uri.clone(),
+            params: Vec::new(),
+        };
+        let request = Request {
+            method: Method::Options,
+            uri,
+            version: Version::V2,
+            headers: Headers::from(vec![
+                via.into(),
+                from.into(),
+                to.into(),
+                CallId::new(call_id).into(),
+                CSeq {
+                    seq: cseq,
+                    method: Method::Options,
+                }
+                .into(),
+                MaxForwards::from(70u32).into(),
+                Header::UserAgent(UserAgent::new(USER_AGENT)),
+                ContentLength::from(0u32).into(),
+            ]),
+            body: Vec::new(),
+        };
+        Ok(Self::from_inner(RsipMessage::Request(request)))
     }
 
     fn from_inner(inner: RsipMessage) -> Self {
@@ -314,6 +430,36 @@ CSeq: 1 OPTIONS\r\n\r\n",
                 .unwrap()
                 .starts_with("SIP/2.0 200 OK")
         );
+    }
+
+    #[test]
+    fn builds_typed_options_health_request() {
+        let request = SipMessage::options_request(
+            "sip:healthcheck@example.com",
+            Transport::Udp,
+            "127.0.0.1:5099".parse().unwrap(),
+            "z9hG4bK-health-1",
+            "health-tag-1",
+            "health-call-1@sigproxy",
+            42,
+        )
+        .unwrap();
+
+        assert_eq!(request.method(), Some("OPTIONS"));
+        assert_eq!(
+            request.request_uri().as_deref(),
+            Some("sip:healthcheck@example.com")
+        );
+        assert_eq!(
+            request.top_via_branch().unwrap().as_deref(),
+            Some("z9hG4bK-health-1")
+        );
+        assert_eq!(request.max_forwards().unwrap(), Some(70));
+        let wire = String::from_utf8(request.to_bytes()).unwrap();
+        assert!(wire.contains("Via: SIP/2.0/UDP 127.0.0.1:5099;branch=z9hG4bK-health-1;rport"));
+        assert!(wire.contains("CSeq: 42 OPTIONS"));
+        assert!(wire.contains("User-Agent: sigproxy-rs/0.1.0"));
+        assert!(wire.contains("Content-Length: 0"));
     }
 
     #[test]

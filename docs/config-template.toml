@@ -1,0 +1,248 @@
+# sigproxy-rs full configuration template.
+#
+# This template lists every supported configuration field. It is intentionally
+# valid as-is, but many values are placeholders and should be adjusted before
+# production use.
+#
+# Environment placeholders are expanded before TOML parsing:
+#   "${VAR}" requires VAR to be set.
+#   "$VAR" is also supported.
+#   "${VAR:-default}" uses default when VAR is unset or empty.
+# Keep quotes around placeholders that expand to TOML strings.
+
+[node]
+# Required. Stable numeric node id. Must be greater than 0.
+id = 1
+
+[sip]
+# Optional legacy single advertised address. Used as fallback when public_addr
+# or internal_addr is not set.
+external_addr = "sip.example.com:5060"
+
+# Optional public-side SIP address advertised toward clients. If the port is
+# omitted, the listener port is used.
+public_addr = "95.40.96.117"
+
+# Optional internal-side SIP address advertised toward upstream PBX servers. If
+# the port is omitted, the listener port is used.
+internal_addr = "172.30.0.101"
+
+# Optional STUN server used to detect public_addr when public_addr is empty or
+# omitted. Must be host:port.
+public_stun_server = "stun.example.com:3478"
+
+# Probe target used to detect internal_addr when internal_addr is empty or
+# omitted. Must be host:port.
+internal_probe_addr = "8.8.8.8:53"
+
+# Maximum SIP message size accepted from UDP/TCP. Must be greater than 0.
+max_message_bytes = 65535
+
+[proxy]
+# Whether to add Record-Route for dialog-forming requests such as INVITE.
+# Usually true when the proxy must stay on the signaling path for in-dialog
+# requests.
+record_route = true
+
+# Rewrite REGISTER Contact to this proxy's advertised SIP address and keep the
+# original Contact in local state. Useful when a LAN softphone registers through
+# this proxy to a public PBX that rejects private Contact addresses.
+rewrite_register_contact = false
+
+[proxy.socket]
+# Enable SO_REUSEPORT for listener sockets. Required when workers_per_listener
+# is greater than 1.
+reuse_port = false
+
+# Number of worker sockets/tasks per listener. Keep 1 unless reuse_port is
+# enabled and the operating system supports it.
+workers_per_listener = 1
+
+# Optional socket receive buffer size in bytes. Remove or comment out to use
+# the OS default.
+recv_buffer_bytes = 4194304
+
+# Optional socket send buffer size in bytes. Remove or comment out to use the
+# OS default.
+send_buffer_bytes = 4194304
+
+# Enable TCP_NODELAY on downstream TCP SIP connections.
+tcp_nodelay = true
+
+[proxy.metrics]
+# Enable Prometheus text metrics endpoint.
+enabled = false
+
+# Metrics HTTP bind address. Validated only when metrics are enabled.
+bind_addr = "127.0.0.1:9100"
+
+[proxy.affinity]
+# Enable SIP-aware upstream affinity/session persistence.
+enabled = true
+
+# Affinity key. Supported values:
+# - "dialog-id": From tag + To tag + Call-ID when available.
+# - "call-id": Call-ID only.
+# - "request-uri": Request-URI string.
+key = "dialog-id"
+
+# Affinity binding TTL in seconds. Must be greater than 0 when enabled.
+ttl_seconds = 3600
+
+[[proxy.upstream_groups]]
+# Upstream group name referenced by listeners and routes.
+name = "pbx-a"
+
+# Load-balancing mode. Currently supported: "round-robin".
+mode = "round-robin"
+
+# Backend SIP servers for this group. Each entry must be host:port. If host is
+# a DNS name it is resolved once at process startup, then treated as a fixed
+# SocketAddr until restart.
+servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
+
+[proxy.upstream_groups.health_check]
+# Active health check for this upstream group. Health is maintained per server.
+enabled = true
+
+# Active probe interval in milliseconds. Must be greater than 0 when enabled.
+interval_ms = 5000
+
+# Per-probe timeout in milliseconds. Must be greater than 0 when enabled.
+timeout_ms = 1000
+
+# Consecutive successes required before marking a server healthy.
+success_threshold = 2
+
+# Consecutive failures required before marking a server unhealthy.
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+# Probe mode. Supported values:
+# - "options": send SIP OPTIONS and evaluate SIP response status code.
+# - "tcp-connect": only test TCP connection establishment.
+mode = "options"
+
+# Transport used by the OPTIONS health probe. Supported: "udp", "tcp".
+# This field is used only for mode = "options".
+transport = "udp"
+
+# Request-URI used by the OPTIONS health probe. Must use sip: or sips: scheme.
+# This field is used only for mode = "options".
+uri = "sip:healthcheck@pbx-a"
+
+# SIP response codes treated as health-check success. Tune this for your PBX.
+# This field is used only for mode = "options".
+success_codes = [200, 202, 404, 405, 481]
+
+[[proxy.upstream_groups]]
+# Example group using tcp-connect health checks for TCP-only upstreams.
+name = "pbx-b"
+mode = "round-robin"
+servers = ["10.0.2.10:5060", "10.0.2.11:5060"]
+
+[proxy.upstream_groups.health_check]
+enabled = true
+interval_ms = 3000
+timeout_ms = 500
+success_threshold = 1
+failure_threshold = 2
+
+[proxy.upstream_groups.health_check.probe]
+mode = "tcp-connect"
+
+[[proxy.listeners]]
+# SIP listener bind address.
+bind = "0.0.0.0:5060"
+
+# Listener transport. Supported: "udp", "tcp".
+transport = "udp"
+
+# Default upstream group for requests received on this listener.
+upstream_group = "pbx-a"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "tcp"
+upstream_group = "pbx-a"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5080"
+transport = "tcp"
+upstream_group = "pbx-b"
+
+[[proxy.routes]]
+# Route name used for diagnostics.
+name = "tenant-a-on-5060"
+
+# Optional listener selector in the format "<transport>/<bind>". If omitted,
+# this route can match any listener.
+listener = "tcp/0.0.0.0:5080"
+
+# Optional SIP domain matcher. A request can match by Request-URI/domain.
+domain = "tenant-a.example.com"
+
+# Optional Request-URI prefix matcher.
+prefix = "sip:1"
+
+# Upstream group selected when this route matches.
+upstream_group = "pbx-b"
+
+[ha]
+# Interval in milliseconds for observing role changes and running HA addon
+# hooks. Must be greater than 0.
+leader_check_interval_ms = 1000
+
+[ha.active_standby]
+# Enable the simple two-node active-standby role monitor.
+enabled = false
+
+# Initial role when active-standby is enabled. Supported: "active", "standby".
+initial_role = "standby"
+
+# Local heartbeat HTTP bind address for active-standby.
+heartbeat_bind = "127.0.0.1:7900"
+
+# Optional peer heartbeat address. In a two-node pair, point this at the other
+# node's heartbeat_bind.
+peer_heartbeat_addr = "127.0.0.1:7900"
+
+# Heartbeat poll interval in milliseconds. Must be greater than 0 when enabled.
+heartbeat_interval_ms = 1000
+
+# Peer timeout before local promotion. Must be greater than heartbeat_interval_ms.
+failover_timeout_ms = 5000
+
+[ha.replication]
+# Enable standby snapshot pull from the active peer.
+enabled = false
+
+# Local HA snapshot HTTP bind address.
+bind_addr = "127.0.0.1:7901"
+
+# Optional peer snapshot address. In a two-node pair, point this at the other
+# node's ha.replication.bind_addr.
+peer_addr = "127.0.0.1:7902"
+
+# Snapshot pull interval in milliseconds. Must be greater than 0 when enabled.
+pull_interval_ms = 10000
+
+# Snapshot request timeout in milliseconds. Must be greater than 0 when enabled.
+request_timeout_ms = 2000
+
+[ha.addon]
+# HA addon type. Supported:
+# - "noop": do nothing, useful for normal stateless proxy deployments.
+# - "command": run shell commands on leader promotion / step-down.
+# In active-standby deployments, noop does not move traffic by itself. Use a
+# VIP/EIP/LB mechanism to ensure only the active node receives SIP traffic.
+type = "noop"
+
+# Command addon variant. Uncomment this section instead of the noop section
+# above when wiring EIP/VIP/floating endpoint scripts.
+#
+# [ha.addon]
+# type = "command"
+# on_become_leader = "/usr/local/bin/bind-floating-endpoint.sh"
+# on_step_down = "/usr/local/bin/unbind-floating-endpoint.sh"
+# timeout_ms = 5000

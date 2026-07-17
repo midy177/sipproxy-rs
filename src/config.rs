@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
+use rsipstack::sip::{Scheme, Uri};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -14,8 +16,6 @@ pub struct Config {
     #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
-    pub cluster: ClusterConfig,
-    #[serde(default)]
     pub ha: HaConfig,
 }
 
@@ -25,7 +25,6 @@ impl Default for Config {
             node: NodeConfig::default(),
             sip: SipConfig::default(),
             proxy: ProxyConfig::default(),
-            cluster: ClusterConfig::default(),
             ha: HaConfig::default(),
         }
     }
@@ -36,6 +35,8 @@ impl Config {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
+        let content = expand_env_placeholders(&content)
+            .with_context(|| format!("failed to expand config {}", path.display()))?;
         let config: Self = toml::from_str(&content)
             .with_context(|| format!("failed to parse config {}", path.display()))?;
         config.validate()?;
@@ -59,6 +60,27 @@ impl Config {
         }
         if self.sip.max_message_bytes == 0 {
             bail!("sip.max_message_bytes must be greater than 0");
+        }
+        for (name, value) in [
+            ("sip.external_addr", self.sip.external_addr.as_deref()),
+            ("sip.public_addr", self.sip.public_addr.as_deref()),
+            ("sip.internal_addr", self.sip.internal_addr.as_deref()),
+        ] {
+            if let Some(value) = value
+                && !value.trim().is_empty()
+            {
+                validate_advertised_addr(value)
+                    .with_context(|| format!("{name} must be host or host:port"))?;
+            }
+        }
+        if let Some(server) = &self.sip.public_stun_server
+            && !server.trim().is_empty()
+        {
+            validate_host_port(server).context("sip.public_stun_server must be host:port")?;
+        }
+        if !self.sip.internal_probe_addr.trim().is_empty() {
+            validate_host_port(&self.sip.internal_probe_addr)
+                .context("sip.internal_probe_addr must be host:port")?;
         }
         if self.proxy.listeners.is_empty() {
             bail!("proxy.listeners must contain at least one SIP listener");
@@ -102,10 +124,61 @@ impl Config {
                     group.name
                 );
             }
+            if group.health_check.enabled {
+                if group.health_check.interval_ms == 0 {
+                    bail!(
+                        "proxy upstream group '{}' health_check.interval_ms must be greater than 0",
+                        group.name
+                    );
+                }
+                if group.health_check.timeout_ms == 0 {
+                    bail!(
+                        "proxy upstream group '{}' health_check.timeout_ms must be greater than 0",
+                        group.name
+                    );
+                }
+                if group.health_check.success_threshold == 0 {
+                    bail!(
+                        "proxy upstream group '{}' health_check.success_threshold must be greater than 0",
+                        group.name
+                    );
+                }
+                if group.health_check.failure_threshold == 0 {
+                    bail!(
+                        "proxy upstream group '{}' health_check.failure_threshold must be greater than 0",
+                        group.name
+                    );
+                }
+                if let UpstreamHealthProbeConfig::Options {
+                    uri, success_codes, ..
+                } = &group.health_check.probe
+                {
+                    let parsed_uri = uri.parse::<Uri>().with_context(|| {
+                        format!(
+                            "proxy upstream group '{}' health_check.probe.uri must be a SIP URI",
+                            group.name
+                        )
+                    })?;
+                    if !matches!(parsed_uri.scheme, Some(Scheme::Sip | Scheme::Sips)) {
+                        bail!(
+                            "proxy upstream group '{}' health_check.probe.uri must use sip or sips scheme",
+                            group.name
+                        );
+                    }
+                    for code in success_codes {
+                        if !(100..=699).contains(code) {
+                            bail!(
+                                "proxy upstream group '{}' health_check.probe.success_codes must contain valid SIP status codes",
+                                group.name
+                            );
+                        }
+                    }
+                }
+            }
             for server in &group.servers {
-                server.parse::<SocketAddr>().with_context(|| {
+                validate_host_port(server).with_context(|| {
                     format!(
-                        "proxy upstream group '{}' server must be host:port SocketAddr",
+                        "proxy upstream group '{}' server must be host:port",
                         group.name
                     )
                 })?;
@@ -153,12 +226,6 @@ impl Config {
                 );
             }
         }
-        if matches!(self.cluster.mode, ClusterMode::Raft) {
-            self.cluster
-                .bind_addr
-                .parse::<SocketAddr>()
-                .context("cluster.bind_addr must be a SocketAddr in raft mode")?;
-        }
         if self.ha.leader_check_interval_ms == 0 {
             bail!("ha.leader_check_interval_ms must be greater than 0");
         }
@@ -168,11 +235,15 @@ impl Config {
                 .heartbeat_bind
                 .parse::<SocketAddr>()
                 .context("ha.active_standby.heartbeat_bind must be a SocketAddr when enabled")?;
-            if let Some(peer_addr) = &self.ha.active_standby.peer_heartbeat_addr {
-                peer_addr.parse::<SocketAddr>().context(
+            self.ha
+                .active_standby
+                .peer_heartbeat_addr
+                .as_ref()
+                .context("ha.active_standby.peer_heartbeat_addr must be set when enabled")?
+                .parse::<SocketAddr>()
+                .context(
                     "ha.active_standby.peer_heartbeat_addr must be a SocketAddr when enabled",
                 )?;
-            }
             if self.ha.active_standby.heartbeat_interval_ms == 0 {
                 bail!("ha.active_standby.heartbeat_interval_ms must be greater than 0");
             }
@@ -192,11 +263,15 @@ impl Config {
                 .context(
                     "ha.replication.bind_addr must be a SocketAddr when replication is enabled",
                 )?;
-            if let Some(peer_addr) = &self.ha.replication.peer_addr {
-                peer_addr.parse::<SocketAddr>().context(
+            self.ha
+                .replication
+                .peer_addr
+                .as_ref()
+                .context("ha.replication.peer_addr must be set when replication is enabled")?
+                .parse::<SocketAddr>()
+                .context(
                     "ha.replication.peer_addr must be a SocketAddr when replication is enabled",
                 )?;
-            }
             if self.ha.replication.pull_interval_ms == 0 {
                 bail!("ha.replication.pull_interval_ms must be greater than 0");
             }
@@ -208,24 +283,160 @@ impl Config {
     }
 }
 
+fn expand_env_placeholders(input: &str) -> Result<String> {
+    expand_env_placeholders_with(input, |name| env::var(name).ok())
+}
+
+fn expand_env_placeholders_with(
+    input: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            output.push(ch);
+            continue;
+        }
+
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next();
+                let mut expression = String::new();
+                let mut closed = false;
+                for ch in chars.by_ref() {
+                    if ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    expression.push(ch);
+                }
+                if !closed {
+                    bail!("unclosed environment placeholder '${{{expression}'");
+                }
+                output.push_str(&resolve_env_expression(&expression, &lookup)?);
+            }
+            Some(next) if is_env_name_start(next) => {
+                let mut name = String::new();
+                while let Some(next) = chars.peek().copied() {
+                    if !is_env_name_continue(next) {
+                        break;
+                    }
+                    name.push(next);
+                    chars.next();
+                }
+                output.push_str(&lookup_env_required(&name, &lookup)?);
+            }
+            _ => output.push('$'),
+        }
+    }
+    Ok(output)
+}
+
+fn resolve_env_expression(
+    expression: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<String> {
+    let (name, default) = expression
+        .split_once(":-")
+        .map_or((expression, None), |(name, default)| (name, Some(default)));
+    if !is_valid_env_name(name) {
+        bail!("invalid environment placeholder name '{name}'");
+    }
+    match lookup(name) {
+        Some(value) if !value.is_empty() => Ok(value),
+        Some(value) if default.is_none() => Ok(value),
+        _ => default
+            .map(str::to_string)
+            .map_or_else(|| lookup_env_required(name, lookup), Ok),
+    }
+}
+
+fn lookup_env_required(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+    if !is_valid_env_name(name) {
+        bail!("invalid environment placeholder name '{name}'");
+    }
+    lookup(name).with_context(|| format!("environment variable '{name}' is not set"))
+}
+
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(is_env_name_start) && chars.all(is_env_name_continue)
+}
+
+fn is_env_name_start(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphabetic()
+}
+
+fn is_env_name_continue(ch: char) -> bool {
+    ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn validate_host_port(value: &str) -> Result<()> {
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let Some((host, port)) = value.rsplit_once(':') else {
+        bail!("missing port");
+    };
+    if host.trim().is_empty() {
+        bail!("missing host");
+    }
+    port.parse::<u16>().context("invalid port")?;
+    Ok(())
+}
+
+fn validate_advertised_addr(value: &str) -> Result<()> {
+    if value.trim().is_empty() {
+        bail!("missing host");
+    }
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    if let Some((host, port)) = split_host_port(value) {
+        if host.trim().is_empty() {
+            bail!("missing host");
+        }
+        port.parse::<u16>().context("invalid port")?;
+    }
+    Ok(())
+}
+
+fn split_host_port(value: &str) -> Option<(&str, &str)> {
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        return value[end + 1..]
+            .strip_prefix(':')
+            .map(|port| (&value[..=end], port));
+    }
+    if value.matches(':').count() == 1 {
+        value.rsplit_once(':')
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub id: u64,
-    pub advertise_addr: String,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        Self {
-            id: 1,
-            advertise_addr: "127.0.0.1".to_string(),
-        }
+        Self { id: 1 }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SipConfig {
+    /// Legacy single advertised address. Used as a fallback when public_addr or
+    /// internal_addr is not set.
     pub external_addr: Option<String>,
+    pub public_addr: Option<String>,
+    pub internal_addr: Option<String>,
+    pub public_stun_server: Option<String>,
+    #[serde(default = "default_internal_probe_addr")]
+    pub internal_probe_addr: String,
     #[serde(default = "default_max_message_bytes")]
     pub max_message_bytes: usize,
 }
@@ -234,9 +445,17 @@ impl Default for SipConfig {
     fn default() -> Self {
         Self {
             external_addr: None,
+            public_addr: None,
+            internal_addr: None,
+            public_stun_server: None,
+            internal_probe_addr: default_internal_probe_addr(),
             max_message_bytes: default_max_message_bytes(),
         }
     }
+}
+
+fn default_internal_probe_addr() -> String {
+    "8.8.8.8:53".to_string()
 }
 
 fn default_max_message_bytes() -> usize {
@@ -247,6 +466,8 @@ fn default_max_message_bytes() -> usize {
 pub struct ProxyConfig {
     #[serde(default)]
     pub record_route: bool,
+    #[serde(default)]
+    pub rewrite_register_contact: bool,
     #[serde(default)]
     pub socket: ProxySocketConfig,
     #[serde(default)]
@@ -265,6 +486,7 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             record_route: true,
+            rewrite_register_contact: false,
             socket: ProxySocketConfig::default(),
             metrics: ProxyMetricsConfig::default(),
             affinity: ProxyAffinityConfig::default(),
@@ -449,24 +671,51 @@ impl Default for UpstreamMode {
 pub struct UpstreamHealthCheckConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
-    pub transport: SipTransport,
     #[serde(default = "default_health_interval_ms")]
     pub interval_ms: u64,
     #[serde(default = "default_health_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default = "default_health_options_uri")]
-    pub options_uri: String,
+    #[serde(default = "default_health_success_threshold")]
+    pub success_threshold: usize,
+    #[serde(default = "default_health_failure_threshold")]
+    pub failure_threshold: usize,
+    #[serde(default)]
+    pub probe: UpstreamHealthProbeConfig,
 }
 
 impl Default for UpstreamHealthCheckConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            transport: SipTransport::Udp,
             interval_ms: default_health_interval_ms(),
             timeout_ms: default_health_timeout_ms(),
-            options_uri: default_health_options_uri(),
+            success_threshold: default_health_success_threshold(),
+            failure_threshold: default_health_failure_threshold(),
+            probe: UpstreamHealthProbeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum UpstreamHealthProbeConfig {
+    Options {
+        #[serde(default)]
+        transport: SipTransport,
+        #[serde(default = "default_health_options_uri")]
+        uri: String,
+        #[serde(default = "default_health_success_codes")]
+        success_codes: Vec<u16>,
+    },
+    TcpConnect,
+}
+
+impl Default for UpstreamHealthProbeConfig {
+    fn default() -> Self {
+        Self::Options {
+            transport: SipTransport::Udp,
+            uri: default_health_options_uri(),
+            success_codes: default_health_success_codes(),
         }
     }
 }
@@ -483,6 +732,18 @@ fn default_health_options_uri() -> String {
     "sip:healthcheck@localhost".to_string()
 }
 
+fn default_health_success_codes() -> Vec<u16> {
+    vec![200, 202, 405, 481]
+}
+
+fn default_health_success_threshold() -> usize {
+    2
+}
+
+fn default_health_failure_threshold() -> usize {
+    3
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub name: String,
@@ -490,57 +751,6 @@ pub struct RouteConfig {
     pub domain: Option<String>,
     pub prefix: Option<String>,
     pub upstream_group: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ClusterMode {
-    Standalone,
-    Raft,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterConfig {
-    #[serde(default)]
-    pub mode: ClusterMode,
-    #[serde(default = "default_cluster_bind")]
-    pub bind_addr: String,
-    #[serde(default)]
-    pub peers: Vec<ClusterPeer>,
-    #[serde(default = "default_data_dir")]
-    pub data_dir: String,
-}
-
-impl Default for ClusterConfig {
-    fn default() -> Self {
-        Self {
-            mode: ClusterMode::Standalone,
-            bind_addr: default_cluster_bind(),
-            peers: Vec::new(),
-            data_dir: default_data_dir(),
-        }
-    }
-}
-
-impl Default for ClusterMode {
-    fn default() -> Self {
-        Self::Standalone
-    }
-}
-
-fn default_cluster_bind() -> String {
-    "127.0.0.1:7000".to_string()
-}
-
-fn default_data_dir() -> String {
-    "./data".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterPeer {
-    pub id: u64,
-    pub raft_addr: String,
-    pub sip_addr: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,10 +899,12 @@ pub fn example_config() -> &'static str {
 
 [node]
 id = 1
-advertise_addr = "10.0.0.11"
 
 [sip]
-external_addr = "sip.example.com:5060"
+public_addr = "127.0.0.1"
+internal_addr = "127.0.0.1"
+public_stun_server = ""
+internal_probe_addr = "8.8.8.8:53"
 max_message_bytes = 65535
 
 [proxy]
@@ -721,64 +933,26 @@ servers = ["127.0.0.1:5080"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-transport = "udp"
 interval_ms = 5000
 timeout_ms = 1000
-options_uri = "sip:healthcheck@127.0.0.1"
+success_threshold = 2
+failure_threshold = 3
 
-[[proxy.upstream_groups]]
-name = "pbx-a"
-mode = "round-robin"
-servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
-
-[proxy.upstream_groups.health_check]
-enabled = true
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
 transport = "udp"
-interval_ms = 5000
-timeout_ms = 1000
-options_uri = "sip:healthcheck@pbx-a"
+uri = "sip:healthcheck@127.0.0.1"
+success_codes = [200, 202, 405, 481]
 
 [[proxy.listeners]]
-bind = "0.0.0.0:5060"
+bind = "127.0.0.1:5060"
 transport = "udp"
 upstream_group = "default"
 
 [[proxy.listeners]]
-bind = "0.0.0.0:5060"
+bind = "127.0.0.1:5060"
 transport = "tcp"
 upstream_group = "default"
-
-[[proxy.listeners]]
-bind = "0.0.0.0:5080"
-transport = "udp"
-upstream_group = "pbx-a"
-
-[[proxy.listeners]]
-bind = "0.0.0.0:5080"
-transport = "tcp"
-upstream_group = "pbx-a"
-
-[[proxy.routes]]
-name = "tenant-a-on-5060"
-listener = "udp/0.0.0.0:5060"
-domain = "tenant-a.example.com"
-prefix = "sip:1"
-upstream_group = "pbx-a"
-
-[cluster]
-mode = "standalone"
-bind_addr = "127.0.0.1:7000"
-data_dir = "./data/node-1"
-
-[[cluster.peers]]
-id = 1
-raft_addr = "10.0.0.11:7000"
-sip_addr = "10.0.0.11:5060"
-
-[[cluster.peers]]
-id = 2
-raft_addr = "10.0.0.12:7000"
-sip_addr = "10.0.0.12:5060"
 
 [ha]
 leader_check_interval_ms = 1000
@@ -818,6 +992,40 @@ mod tests {
     fn example_config_is_valid() {
         let config: Config = toml::from_str(example_config()).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn expands_environment_placeholders() {
+        let expanded = expand_env_placeholders_with(
+            r#"external_addr = "${SIP_ADDR}"
+bind = "$BIND_ADDR"
+port = ${PORT:-5060}
+fallback = "${EMPTY:-default-value}"
+literal = "$-not-a-placeholder"
+"#,
+            |name| match name {
+                "SIP_ADDR" => Some("10.10.16.41:5060".to_string()),
+                "BIND_ADDR" => Some("0.0.0.0:5060".to_string()),
+                "EMPTY" => Some(String::new()),
+                _ => None,
+            },
+        )
+        .unwrap();
+
+        assert!(expanded.contains(r#"external_addr = "10.10.16.41:5060""#));
+        assert!(expanded.contains(r#"bind = "0.0.0.0:5060""#));
+        assert!(expanded.contains("port = 5060"));
+        assert!(expanded.contains(r#"fallback = "default-value""#));
+        assert!(expanded.contains(r#"literal = "$-not-a-placeholder""#));
+    }
+
+    #[test]
+    fn rejects_missing_environment_placeholder() {
+        let err = expand_env_placeholders_with("${MISSING}", |_| None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("environment variable 'MISSING' is not set")
+        );
     }
 
     #[test]
@@ -872,6 +1080,92 @@ mod tests {
             },
             ..Config::default()
         };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_hostname_upstream_servers_for_startup_resolution() {
+        let mut config = Config::default();
+        config.proxy.upstream_groups[0].servers = vec!["edge0.example.com:5060".to_string()];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_health_check_thresholds() {
+        let mut config = Config::default();
+        config.proxy.upstream_groups[0].health_check = UpstreamHealthCheckConfig {
+            enabled: true,
+            failure_threshold: 0,
+            ..UpstreamHealthCheckConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_check_success_code() {
+        let mut config = Config::default();
+        config.proxy.upstream_groups[0].health_check = UpstreamHealthCheckConfig {
+            enabled: true,
+            probe: UpstreamHealthProbeConfig::Options {
+                transport: SipTransport::Udp,
+                uri: "sip:healthcheck@example.com".to_string(),
+                success_codes: vec![99],
+            },
+            ..UpstreamHealthCheckConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_health_check_options_uri() {
+        let mut config = Config::default();
+        config.proxy.upstream_groups[0].health_check = UpstreamHealthCheckConfig {
+            enabled: true,
+            probe: UpstreamHealthProbeConfig::Options {
+                transport: SipTransport::Udp,
+                uri: "http://healthcheck.example.com".to_string(),
+                success_codes: vec![200],
+            },
+            ..UpstreamHealthCheckConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_active_standby_without_peer_heartbeat() {
+        let config = Config {
+            ha: HaConfig {
+                active_standby: HaActiveStandbyConfig {
+                    enabled: true,
+                    peer_heartbeat_addr: None,
+                    ..HaActiveStandbyConfig::default()
+                },
+                ..HaConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ha_replication_without_peer_addr() {
+        let config = Config {
+            ha: HaConfig {
+                replication: HaReplicationConfig {
+                    enabled: true,
+                    peer_addr: None,
+                    ..HaReplicationConfig::default()
+                },
+                ..HaConfig::default()
+            },
+            ..Config::default()
+        };
+
         assert!(config.validate().is_err());
     }
 }

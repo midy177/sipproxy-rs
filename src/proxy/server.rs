@@ -1,7 +1,7 @@
 use crate::cluster::{ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at};
 use crate::config::{
     Config, ProxyListenerConfig, ProxyMetricsConfig, ProxySocketConfig, SipTransport,
-    UpstreamGroupConfig, UpstreamHealthCheckConfig,
+    UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
 };
 use crate::ha::HaStateSnapshot;
 use crate::proxy::affinity::{AffinityTable, AffinityTarget};
@@ -13,14 +13,17 @@ use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, routing::get};
 use bytes::BytesMut;
 use rsipstack::sip::prelude::HeadersExt;
-use rsipstack::sip::{Transport as RsipTransport, typed::Contact as RsipContact, uri::Param};
+use rsipstack::sip::{
+    Transport as RsipTransport, Uri as RsipUri, typed::Contact as RsipContact, uri::Param,
+};
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -31,48 +34,53 @@ use tokio_util::codec::Decoder;
 use tracing::{debug, error, info, warn};
 
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+const INVITE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_BRANCH_TTL: Duration = Duration::from_secs(300);
+const UDP_BRANCH_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const TCP_BRANCH_TTL: Duration = Duration::from_secs(300);
 const INVITE_TRANSACTION_TTL: Duration = Duration::from_secs(300);
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct ProxyServer {
     config: Config,
     state: Arc<SharedState>,
-    replicator: Arc<dyn ClusterReplicator>,
     routes: RouteTable,
     upstreams: UpstreamGroups,
     affinity: AffinityTable,
     metrics: Arc<ProxyMetrics>,
     udp_branches: Mutex<HashMap<String, UdpBranchRoute>>,
+    udp_branch_last_prune: Mutex<Instant>,
     invite_transactions: Mutex<HashMap<String, InviteTransactionRoute>>,
     tcp_upstreams: TcpUpstreamPool,
+    advertised_addrs: Mutex<HashMap<String, String>>,
 }
 
 impl ProxyServer {
     pub fn new(
         config: Config,
         state: Arc<SharedState>,
-        replicator: Arc<dyn ClusterReplicator>,
-    ) -> Self {
-        let routes = RouteTable::new(&config.proxy)
-            .expect("configuration should be validated before building proxy server");
+        _replicator: Arc<dyn ClusterReplicator>,
+    ) -> Result<Self> {
+        let routes = RouteTable::new(&config.proxy).context("failed to build proxy route table")?;
         let upstreams = UpstreamGroups::new(&config.proxy.upstream_groups)
-            .expect("configuration should be validated before building proxy server");
+            .context("failed to build upstream groups")?;
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
-        Self {
+        Ok(Self {
             config,
             state,
-            replicator,
             routes,
             upstreams,
             affinity: AffinityTable::new(affinity_config),
             metrics: Arc::new(ProxyMetrics::default()),
             udp_branches: Mutex::new(HashMap::new()),
+            udp_branch_last_prune: Mutex::new(Instant::now()),
             invite_transactions: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
-        }
+            advertised_addrs: Mutex::new(HashMap::new()),
+        })
     }
 
     pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -91,13 +99,14 @@ impl ProxyServer {
         if this.config.proxy.metrics.enabled {
             tasks.push(tokio::spawn(run_metrics_server(
                 this.config.proxy.metrics.clone(),
-                this.metrics.clone(),
+                this.clone(),
                 shutdown.clone(),
             )));
         }
 
         let workers_per_listener = this.config.proxy.socket.workers_per_listener;
         for listener in &this.config.proxy.listeners {
+            this.log_listener_advertised_addrs(listener).await;
             for worker in 0..workers_per_listener {
                 match listener.transport {
                     SipTransport::Udp => {
@@ -152,6 +161,115 @@ impl ProxyServer {
         self.affinity.install_snapshot(snapshot.affinity).await;
     }
 
+    async fn render_metrics(&self) -> String {
+        let mut output = self.metrics.render_prometheus();
+        let udp_branch_routes = self.active_udp_branch_count().await;
+        let invite_transaction_routes = self.active_invite_transaction_count().await;
+        let (tcp_upstream_connections, tcp_branch_routes) =
+            self.tcp_upstreams.active_counts().await;
+        let affinity_bindings = self.affinity.active_len().await;
+        let location_bindings = self.state.contact_count().await;
+        let upstream_health = self.upstreams.health_snapshots();
+
+        append_gauge(
+            &mut output,
+            "proxy_udp_branch_routes",
+            udp_branch_routes as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_invite_transaction_routes",
+            invite_transaction_routes as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_tcp_upstream_connections",
+            tcp_upstream_connections as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_tcp_branch_routes",
+            tcp_branch_routes as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_affinity_bindings",
+            affinity_bindings as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_location_bindings",
+            location_bindings as u64,
+        );
+        for health in upstream_health {
+            let labels = [
+                ("group", health.group.as_str()),
+                ("server", health.server.as_str()),
+            ];
+            append_labeled_gauge(
+                &mut output,
+                "proxy_upstream_healthy",
+                &labels,
+                u64::from(health.healthy),
+            );
+            append_labeled_gauge(
+                &mut output,
+                "proxy_upstream_consecutive_successes",
+                &labels,
+                health.consecutive_successes as u64,
+            );
+            append_labeled_gauge(
+                &mut output,
+                "proxy_upstream_consecutive_failures",
+                &labels,
+                health.consecutive_failures as u64,
+            );
+        }
+        output
+    }
+
+    async fn active_udp_branch_count(&self) -> usize {
+        let mut branches = self.udp_branches.lock().await;
+        prune_udp_branches(&mut branches, Instant::now());
+        branches.len()
+    }
+
+    async fn active_invite_transaction_count(&self) -> usize {
+        let mut transactions = self.invite_transactions.lock().await;
+        prune_invite_transactions(&mut transactions, Instant::now());
+        transactions.len()
+    }
+
+    async fn log_listener_advertised_addrs(&self, listener: &ProxyListenerConfig) {
+        let target = self.first_upstream_for_listener(listener);
+        let public = self
+            .advertised_sip_addr(AdvertiseSide::Public, listener, target)
+            .await;
+        let internal = self
+            .advertised_sip_addr(AdvertiseSide::Internal, listener, target)
+            .await;
+        info!(
+            bind = %listener.bind,
+            transport = %listener.transport.as_str(),
+            public_addr = %public,
+            internal_addr = %internal,
+            "SIP advertised addresses resolved"
+        );
+    }
+
+    fn first_upstream_for_listener(&self, listener: &ProxyListenerConfig) -> SocketAddr {
+        self.upstreams
+            .groups
+            .get(&listener.upstream_group)
+            .and_then(|group| group.servers.first().copied())
+            .unwrap_or_else(|| {
+                listener
+                    .bind
+                    .parse()
+                    .unwrap_or_else(|_| "127.0.0.1:5060".parse().unwrap())
+            })
+    }
+
     async fn run_udp(
         self: Arc<Self>,
         socket: Arc<UdpSocket>,
@@ -165,12 +283,129 @@ impl ProxyServer {
                     break;
                 }
                 received = socket.recv_from(&mut buf) => {
-                    let (len, peer) = received?;
-                    let packet = &buf[..len];
-                    if let Err(err) = self.handle_udp_packet(&socket, packet, peer, &listener).await {
-                        warn!(%peer, error = %err, "failed to handle UDP SIP packet");
-                    }
+                    let (len, peer) = match received {
+                        Ok(received) => received,
+                        Err(err) => {
+                            warn!(error = %err, "failed to receive UDP SIP packet");
+                            continue;
+                        }
+                    };
+                    let packet = buf[..len].to_vec();
+                    let this = self.clone();
+                    let socket = socket.clone();
+                    let listener = listener.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = this.handle_udp_packet(&socket, &packet, peer, &listener).await {
+                            warn!(
+                                %peer,
+                                bytes = packet.len(),
+                                preview = %packet_preview(&packet),
+                                error = %err,
+                                "failed to handle UDP SIP packet"
+                            );
+                        }
+                    });
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn prune_udp_branches_if_due(
+        &self,
+        branches: &mut HashMap<String, UdpBranchRoute>,
+        now: Instant,
+    ) {
+        let mut last_prune = self.udp_branch_last_prune.lock().await;
+        if now.duration_since(*last_prune) >= UDP_BRANCH_PRUNE_INTERVAL {
+            prune_udp_branches(branches, now);
+            *last_prune = now;
+        }
+    }
+
+    async fn remove_udp_branch(&self, branch: &str) {
+        self.udp_branches.lock().await.remove(branch);
+    }
+
+    async fn remember_successful_forward(
+        &self,
+        message: &SipMessage,
+        target: UpstreamTarget,
+        branch: &str,
+        invite_transaction_key: Option<String>,
+        method: &str,
+    ) {
+        if let Err(err) = self
+            .affinity
+            .remember(
+                message,
+                AffinityTarget {
+                    addr: target.addr,
+                    transport: target.transport,
+                },
+            )
+            .await
+        {
+            warn!(error = %err, "failed to record SIP affinity for forwarded request");
+        }
+
+        if method == "INVITE" {
+            self.remember_invite_transaction(invite_transaction_key, target, branch.to_string())
+                .await;
+        }
+    }
+
+    fn upstream_response_timeout(method: &str) -> Duration {
+        if method == "INVITE" {
+            INVITE_UPSTREAM_TIMEOUT
+        } else {
+            UPSTREAM_TIMEOUT
+        }
+    }
+
+    async fn recv_upstream_response(
+        &self,
+        responses: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        upstream: SocketAddr,
+        method: &str,
+    ) -> Result<Vec<u8>> {
+        match timeout(Self::upstream_response_timeout(method), responses.recv()).await {
+            Ok(Some(response)) => Ok(response),
+            Ok(None) => {
+                self.upstreams.record_passive_result(upstream, false);
+                bail!("upstream SIP TCP response channel closed");
+            }
+            Err(_) => {
+                self.upstreams.record_passive_result(upstream, false);
+                bail!("upstream SIP TCP response timed out");
+            }
+        }
+    }
+
+    async fn send_udp_to_tcp_responses(
+        &self,
+        socket: &UdpSocket,
+        responses: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        client_peer: SocketAddr,
+        upstream: SocketAddr,
+        method: &str,
+    ) -> Result<()> {
+        loop {
+            let response = self
+                .recv_upstream_response(responses, upstream, method)
+                .await?;
+            let response_message = SipMessage::parse(&response)?;
+            let is_final = matches!(
+                &response_message.start_line,
+                SipStartLine::Response { code, .. } if *code >= 200
+            );
+            if let SipStartLine::Response { code, .. } = &response_message.start_line {
+                self.record_upstream_response("tcp", *code);
+                self.upstreams.record_passive_result(upstream, *code < 500);
+            }
+            socket.send_to(&response, client_peer).await?;
+            if is_final {
+                break;
             }
         }
         Ok(())
@@ -188,9 +423,18 @@ impl ProxyServer {
                     break;
                 }
                 accepted = listener.accept() => {
-                    let (stream, peer) = accepted?;
+                    let (stream, peer) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(err) => {
+                            warn!(error = %err, "failed to accept TCP SIP connection");
+                            continue;
+                        }
+                    };
                     if self.config.proxy.socket.tcp_nodelay {
-                        stream.set_nodelay(true)?;
+                        if let Err(err) = stream.set_nodelay(true) {
+                            warn!(%peer, error = %err, "failed to set TCP_NODELAY on SIP connection");
+                            continue;
+                        }
                     }
                     let this = self.clone();
                     let proxy_listener = proxy_listener.clone();
@@ -239,50 +483,34 @@ impl ProxyServer {
             "sip_requests_total",
             &[("transport", "tcp"), ("method", method.as_str())],
         );
-        match method.as_str() {
-            "OPTIONS" => {
-                let response = SipMessage::response_like(&message, 200, "OK");
-                self.record_local_response("tcp", 200);
+
+        let mut message = message;
+        match decrement_max_forwards(&mut message) {
+            Ok(true) => {}
+            Ok(false) => {
+                let response = SipMessage::response_like(&message, 483, "Too Many Hops");
+                self.record_local_response("tcp", 483);
                 stream.write_all(&response.to_bytes()).await?;
+                return Ok(());
             }
-            "REGISTER" => {
-                let response = self.handle_register(message, peer).await?;
-                self.record_local_response("tcp", 200);
+            Err(err) => {
+                warn!(%peer, error = %err, "invalid Max-Forwards header");
+                let response = SipMessage::response_like(&message, 400, "Bad Request");
+                self.record_local_response("tcp", 400);
                 stream.write_all(&response.to_bytes()).await?;
+                return Ok(());
             }
-            _ => {
-                let mut message = message;
-                match decrement_max_forwards(&mut message) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let response = SipMessage::response_like(&message, 483, "Too Many Hops");
-                        self.record_local_response("tcp", 483);
-                        stream.write_all(&response.to_bytes()).await?;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        warn!(%peer, error = %err, "invalid Max-Forwards header");
-                        let response = SipMessage::response_like(&message, 400, "Bad Request");
-                        self.record_local_response("tcp", 400);
-                        stream.write_all(&response.to_bytes()).await?;
-                        return Ok(());
-                    }
-                }
-                if let Err(err) = self
-                    .forward_tcp_stream(stream, message, peer, listener)
-                    .await
-                {
-                    error!(error = %err, "failed to forward TCP SIP request");
-                    self.record_forward_error("tcp");
-                    let response = SipMessage::response_like(
-                        &SipMessage::parse(packet)?,
-                        503,
-                        "Service Unavailable",
-                    );
-                    self.record_local_response("tcp", 503);
-                    stream.write_all(&response.to_bytes()).await?;
-                }
-            }
+        }
+        if let Err(err) = self
+            .forward_tcp_stream(stream, message, peer, listener)
+            .await
+        {
+            error!(error = %format!("{err:#}"), "failed to forward TCP SIP request");
+            self.record_forward_error("tcp");
+            let response =
+                SipMessage::response_like(&SipMessage::parse(packet)?, 503, "Service Unavailable");
+            self.record_local_response("tcp", 503);
+            stream.write_all(&response.to_bytes()).await?;
         }
         Ok(())
     }
@@ -294,6 +522,20 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
+        if is_crlf_keepalive(packet) {
+            debug!(%peer, "ignoring UDP CRLF keepalive");
+            return Ok(());
+        }
+        if let Some(response) = stun_binding_success_response(packet, peer) {
+            socket.send_to(&response, peer).await?;
+            debug!(%peer, "answered UDP STUN binding request");
+            return Ok(());
+        }
+        if is_stun_packet(packet) {
+            debug!(%peer, "ignoring non-binding UDP STUN packet");
+            return Ok(());
+        }
+
         let message = SipMessage::parse(packet)?;
         if message.is_response() {
             return self.handle_udp_response(socket, message, peer).await;
@@ -306,47 +548,31 @@ impl ProxyServer {
             "sip_requests_total",
             &[("transport", "udp"), ("method", method.as_str())],
         );
-        match method.as_str() {
-            "OPTIONS" => {
-                let response = SipMessage::response_like(&message, 200, "OK");
-                self.record_local_response("udp", 200);
+
+        let mut message = message;
+        match decrement_max_forwards(&mut message) {
+            Ok(true) => {}
+            Ok(false) => {
+                let response = SipMessage::response_like(&message, 483, "Too Many Hops");
+                self.record_local_response("udp", 483);
                 socket.send_to(&response.to_bytes(), peer).await?;
+                return Ok(());
             }
-            "REGISTER" => {
-                let response = self.handle_register(message, peer).await?;
-                self.record_local_response("udp", 200);
+            Err(err) => {
+                warn!(%peer, error = %err, "invalid Max-Forwards header");
+                let response = SipMessage::response_like(&message, 400, "Bad Request");
+                self.record_local_response("udp", 400);
                 socket.send_to(&response.to_bytes(), peer).await?;
+                return Ok(());
             }
-            _ => {
-                let mut message = message;
-                match decrement_max_forwards(&mut message) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        let response = SipMessage::response_like(&message, 483, "Too Many Hops");
-                        self.record_local_response("udp", 483);
-                        socket.send_to(&response.to_bytes(), peer).await?;
-                        return Ok(());
-                    }
-                    Err(err) => {
-                        warn!(%peer, error = %err, "invalid Max-Forwards header");
-                        let response = SipMessage::response_like(&message, 400, "Bad Request");
-                        self.record_local_response("udp", 400);
-                        socket.send_to(&response.to_bytes(), peer).await?;
-                        return Ok(());
-                    }
-                }
-                if let Err(err) = self.forward_udp(socket, message, peer, listener).await {
-                    error!(error = %err, "failed to forward UDP SIP request");
-                    self.record_forward_error("udp");
-                    let response = SipMessage::response_like(
-                        &SipMessage::parse(packet)?,
-                        503,
-                        "Service Unavailable",
-                    );
-                    self.record_local_response("udp", 503);
-                    socket.send_to(&response.to_bytes(), peer).await?;
-                }
-            }
+        }
+        if let Err(err) = self.forward_udp(socket, message, peer, listener).await {
+            error!(error = %format!("{err:#}"), "failed to forward UDP SIP request");
+            self.record_forward_error("udp");
+            let response =
+                SipMessage::response_like(&SipMessage::parse(packet)?, 503, "Service Unavailable");
+            self.record_local_response("udp", 503);
+            socket.send_to(&response.to_bytes(), peer).await?;
         }
         Ok(())
     }
@@ -371,7 +597,8 @@ impl ProxyServer {
 
         let route = {
             let mut branches = self.udp_branches.lock().await;
-            prune_udp_branches(&mut branches, Instant::now());
+            self.prune_udp_branches_if_due(&mut branches, Instant::now())
+                .await;
             branches.get(&branch).copied()
         };
         let Some(route) = route else {
@@ -391,8 +618,10 @@ impl ProxyServer {
             );
         }
 
-        if let SipStartLine::Response { code, .. } = message.start_line {
-            self.record_upstream_response("udp", code);
+        if let SipStartLine::Response { code, .. } = &message.start_line {
+            self.record_upstream_response("udp", *code);
+            self.upstreams
+                .record_passive_result(route.upstream, *code < 500);
         }
         message
             .pop_top_via()?
@@ -403,26 +632,6 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn handle_register(&self, message: SipMessage, peer: SocketAddr) -> Result<SipMessage> {
-        let aor = extract_aor(&message)?;
-        let expires = extract_expires(&message);
-        let command = if expires.is_zero() {
-            ClusterCommand::UnregisterContact { aor }
-        } else if let Some(contact) = extract_contact(&message)? {
-            ClusterCommand::RegisterContact(ContactBinding {
-                aor,
-                contact,
-                source: peer.to_string(),
-                expires_at_epoch_ms: expires_at(expires),
-            })
-        } else {
-            ClusterCommand::UnregisterContact { aor }
-        };
-
-        self.replicator.submit(command).await?;
-        Ok(SipMessage::response_like(&message, 200, "OK"))
-    }
-
     async fn forward_udp(
         &self,
         socket: &UdpSocket,
@@ -430,24 +639,27 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
-        let (message, target, branch) = self.prepare_forward(message, peer, listener).await?;
+        let (message, target, branch, invite_transaction_key) =
+            self.prepare_forward(message, peer, listener).await?;
+        let method = message.method().unwrap_or_default().to_string();
 
         debug!(
             %peer,
             target = %target.addr,
             transport = %target.transport.as_str(),
-            method = ?message.method(),
+            method = %method,
             branch = %branch,
             "forwarding UDP SIP request"
         );
         match target.transport {
             SipTransport::Udp => {
-                self.record_forwarded_request("udp", target.transport, message.method());
+                self.record_forwarded_request("udp", target.transport, Some(method.as_str()));
                 {
                     let mut branches = self.udp_branches.lock().await;
-                    prune_udp_branches(&mut branches, Instant::now());
+                    self.prune_udp_branches_if_due(&mut branches, Instant::now())
+                        .await;
                     branches.insert(
-                        branch,
+                        branch.clone(),
                         UdpBranchRoute {
                             client_peer: peer,
                             upstream: target.addr,
@@ -455,17 +667,80 @@ impl ProxyServer {
                         },
                     );
                 }
-                socket.send_to(&message.to_bytes(), target.addr).await?;
+                if let Err(err) = socket.send_to(&message.to_bytes(), target.addr).await {
+                    self.remove_udp_branch(&branch).await;
+                    self.upstreams.record_passive_result(target.addr, false);
+                    return Err(err).context("failed to send SIP request to upstream UDP socket");
+                }
+                self.remember_successful_forward(
+                    &message,
+                    target,
+                    &branch,
+                    invite_transaction_key,
+                    method.as_str(),
+                )
+                .await;
                 Ok(())
             }
             SipTransport::Tcp => {
-                self.record_forwarded_request("udp", target.transport, message.method());
-                let response = forward_tcp(target.addr, message.to_bytes()).await?;
-                let response = self.finalize_upstream_response(response, &branch)?;
-                socket.send_to(&response, peer).await?;
-                Ok(())
+                self.record_forwarded_request("udp", target.transport, Some(method.as_str()));
+                self.forward_udp_to_tcp_upstream(
+                    socket,
+                    message.to_bytes(),
+                    peer,
+                    target.addr,
+                    branch,
+                    invite_transaction_key,
+                    method,
+                )
+                .await
             }
         }
+    }
+
+    async fn forward_udp_to_tcp_upstream(
+        &self,
+        socket: &UdpSocket,
+        packet: Vec<u8>,
+        client_peer: SocketAddr,
+        upstream: SocketAddr,
+        branch: String,
+        invite_transaction_key: Option<String>,
+        method: String,
+    ) -> Result<()> {
+        let mut responses = match self
+            .tcp_upstreams
+            .send_request(upstream, branch.clone(), packet.clone())
+            .await
+        {
+            Ok(responses) => responses,
+            Err(err) => {
+                self.upstreams.record_passive_result(upstream, false);
+                return Err(err);
+            }
+        };
+        let target = UpstreamTarget {
+            addr: upstream,
+            transport: SipTransport::Tcp,
+        };
+        let message = SipMessage::parse(&packet)?;
+        self.remember_successful_forward(
+            &message,
+            target,
+            &branch,
+            invite_transaction_key,
+            method.as_str(),
+        )
+        .await;
+
+        self.send_udp_to_tcp_responses(
+            socket,
+            &mut responses,
+            client_peer,
+            upstream,
+            method.as_str(),
+        )
+        .await
     }
 
     async fn forward_tcp_stream(
@@ -476,32 +751,44 @@ impl ProxyServer {
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
         let method = message.method().unwrap_or_default().to_string();
-        let (message, target, branch) = self.prepare_forward(message, peer, listener).await?;
+        let (message, target, branch, invite_transaction_key) =
+            self.prepare_forward(message, peer, listener).await?;
         self.record_forwarded_request("tcp", target.transport, Some(method.as_str()));
-        let mut responses = self
+        let mut responses = match self
             .tcp_upstreams
-            .send_request(
-                target.addr,
-                branch.clone(),
-                method.clone(),
-                message.to_bytes(),
-            )
-            .await?;
+            .send_request(target.addr, branch.clone(), message.to_bytes())
+            .await
+        {
+            Ok(responses) => responses,
+            Err(err) => {
+                self.upstreams.record_passive_result(target.addr, false);
+                return Err(err);
+            }
+        };
+        self.remember_successful_forward(
+            &message,
+            target,
+            &branch,
+            invite_transaction_key,
+            method.as_str(),
+        )
+        .await;
         loop {
-            let response = timeout(UPSTREAM_TIMEOUT, responses.recv())
-                .await
-                .context("upstream SIP TCP response timed out")?
-                .context("upstream SIP TCP response channel closed")?;
+            let response = self
+                .recv_upstream_response(&mut responses, target.addr, method.as_str())
+                .await?;
             let response_message = SipMessage::parse(&response)?;
             let is_final = matches!(
-                response_message.start_line,
-                SipStartLine::Response { code, .. } if code >= 200
+                &response_message.start_line,
+                SipStartLine::Response { code, .. } if *code >= 200
             );
-            if let SipStartLine::Response { code, .. } = response_message.start_line {
-                self.record_upstream_response("tcp", code);
+            if let SipStartLine::Response { code, .. } = &response_message.start_line {
+                self.record_upstream_response("tcp", *code);
+                self.upstreams
+                    .record_passive_result(target.addr, *code < 500);
             }
             client_stream.write_all(&response).await?;
-            if method != "INVITE" || is_final {
+            if is_final {
                 break;
             }
         }
@@ -511,77 +798,347 @@ impl ProxyServer {
     async fn prepare_forward(
         &self,
         mut message: SipMessage,
-        peer: SocketAddr,
+        _peer: SocketAddr,
         listener: &ProxyListenerConfig,
-    ) -> Result<(SipMessage, UpstreamTarget, String)> {
+    ) -> Result<(SipMessage, UpstreamTarget, String, Option<String>)> {
         let request_uri = message
             .request_uri()
             .context("request forwarding requires a request URI")?
             .to_string();
         let method = message.method().unwrap_or_default().to_string();
         let invite_transaction_key = invite_transaction_key(&message)?;
-        let target = if matches!(method.as_str(), "CANCEL" | "ACK")
-            && let Some(target) = self
-                .lookup_invite_transaction(invite_transaction_key.as_deref())
+        let transaction_route = if matches!(method.as_str(), "CANCEL" | "ACK") {
+            self.lookup_invite_transaction(invite_transaction_key.as_deref())
                 .await
-        {
+        } else {
+            None
+        };
+        let target = if let Some(route) = transaction_route.as_ref() {
             self.record_affinity_lookup("transaction-hit");
-            target
-        } else if let Some(binding) = self.state.lookup(&request_uri).await {
+            route.target
+        } else if let Some(binding) = self.lookup_registration_binding(&request_uri).await {
             self.record_affinity_lookup("location-hit");
             parse_contact_target(&binding.contact, listener.transport)
                 .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
+        } else if let Some(target) =
+            self.request_uri_target_from_upstream(_peer, &request_uri, listener)
+        {
+            self.record_affinity_lookup("request-uri-target");
+            target
         } else if let Some(target) = self.affinity.lookup(&message).await? {
-            self.record_affinity_lookup("hit");
-            UpstreamTarget {
+            let target = UpstreamTarget {
                 addr: target.addr,
                 transport: target.transport,
+            };
+            if self.upstreams.is_healthy(target.addr) {
+                self.record_affinity_lookup("hit");
+                target
+            } else {
+                self.record_affinity_lookup("unhealthy");
+                self.select_upstream(&request_uri, listener)
             }
         } else {
             self.record_affinity_lookup("miss");
             self.select_upstream(&request_uri, listener)
         };
 
-        let branch = format!("{PROXY_BRANCH_PREFIX}{}", monotonic_id());
+        if self.upstreams.contains(_peer) && !self.upstreams.contains(target.addr) {
+            message.pop_top_header_value("Route")?;
+        }
+
+        let branch = transaction_route
+            .map(|route| route.branch)
+            .unwrap_or_else(|| format!("{PROXY_BRANCH_PREFIX}{}", unique_id()));
+        let target_side = if self.upstreams.contains(target.addr) {
+            AdvertiseSide::Internal
+        } else {
+            AdvertiseSide::Public
+        };
         let via_host = self
-            .config
-            .sip
-            .external_addr
-            .clone()
-            .or_else(|| Some(listener.bind.clone()))
-            .unwrap_or_else(|| "127.0.0.1:5060".to_string());
+            .advertised_sip_addr(target_side, listener, target.addr)
+            .await;
         message.prepend_header(
             "Via",
             format!(
-                "SIP/2.0/{} {via_host};branch={branch};received={}",
-                listener.transport.sip_via_token(),
-                peer.ip()
+                "SIP/2.0/{} {via_host};branch={branch};rport",
+                target.transport.sip_via_token()
             ),
         );
 
-        if self.config.proxy.record_route
-            && should_record_route(&method)
-            && let Some(external) = &self.config.sip.external_addr
-        {
-            message.prepend_header("Record-Route", format!("<sip:{external};lr>"));
+        if self.config.proxy.record_route && should_record_route(&method) {
+            for addr in self
+                .record_route_addrs(_peer, target.addr, listener)
+                .await
+                .into_iter()
+                .rev()
+            {
+                message.prepend_header("Record-Route", format!("<sip:{addr};lr>"));
+            }
+        }
+        if method == "REGISTER" {
+            if self.config.proxy.rewrite_register_contact {
+                self.rewrite_and_store_register_contact(&mut message, &via_host, _peer)
+                    .await?;
+            } else {
+                self.store_register_contact_routes(&message, &via_host, _peer)
+                    .await?;
+                message.prepend_header("Path", format!("<sip:{via_host};lr>"));
+            }
         }
 
-        self.affinity
-            .remember(
-                &message,
-                AffinityTarget {
-                    addr: target.addr,
-                    transport: target.transport,
-                },
-            )
-            .await?;
+        Ok((message, target, branch, invite_transaction_key))
+    }
 
-        if method == "INVITE" {
-            self.remember_invite_transaction(invite_transaction_key, target)
+    fn request_uri_target_from_upstream(
+        &self,
+        peer: SocketAddr,
+        request_uri: &str,
+        listener: &ProxyListenerConfig,
+    ) -> Option<UpstreamTarget> {
+        self.upstreams
+            .contains(peer)
+            .then(|| parse_contact_target(request_uri, listener.transport))
+            .flatten()
+            .filter(|target| !self.upstreams.contains(target.addr))
+            .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
+    }
+
+    fn is_advertised_or_listener_addr(
+        &self,
+        addr: SocketAddr,
+        listener: &ProxyListenerConfig,
+    ) -> bool {
+        [
+            self.config.sip.external_addr.as_deref(),
+            self.config.sip.public_addr.as_deref(),
+            self.config.sip.internal_addr.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|configured| {
+            parse_socket_addr_with_default_port(configured, listener_port(listener))
+                .is_some_and(|external| external == addr)
+        }) || listener
+            .bind
+            .parse::<SocketAddr>()
+            .ok()
+            .filter(|bind| !bind.ip().is_unspecified())
+            .is_some_and(|bind| bind == addr)
+    }
+
+    async fn advertised_sip_addr(
+        &self,
+        side: AdvertiseSide,
+        listener: &ProxyListenerConfig,
+        target: SocketAddr,
+    ) -> String {
+        let cache_key = format!("{}|{}", side.as_str(), listener.key());
+        if let Some(addr) = self.advertised_addrs.lock().await.get(&cache_key).cloned() {
+            return addr;
+        }
+
+        let addr = self
+            .resolve_advertised_sip_addr(side, listener, target)
+            .await;
+        self.advertised_addrs
+            .lock()
+            .await
+            .insert(cache_key, addr.clone());
+        addr
+    }
+
+    async fn resolve_advertised_sip_addr(
+        &self,
+        side: AdvertiseSide,
+        listener: &ProxyListenerConfig,
+        target: SocketAddr,
+    ) -> String {
+        let configured = self.configured_addr_for_side(side);
+        let port = listener_port(listener);
+        if let Some(configured) = configured
+            && !advertised_addr_needs_auto(configured)
+            && let Some(addr) = render_advertised_addr(configured, port)
+        {
+            return addr;
+        }
+
+        match side {
+            AdvertiseSide::Public => {
+                if let Some(server) = non_empty(self.config.sip.public_stun_server.as_deref()) {
+                    match discover_public_ip(server).await {
+                        Ok(ip) => return render_host_port(&ip.to_string(), port),
+                        Err(err) => {
+                            warn!(
+                                stun_server = %server,
+                                error = %err,
+                                "failed to detect public SIP address with STUN"
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        bind = %listener.bind,
+                        "sip.public_addr is empty and sip.public_stun_server is not set; falling back to local address detection"
+                    );
+                }
+            }
+            AdvertiseSide::Internal => {
+                if let Some(probe) = non_empty(Some(self.config.sip.internal_probe_addr.as_str())) {
+                    match resolve_probe_addr(probe) {
+                        Ok(probe_addr) => match outbound_local_addr(probe_addr, port).await {
+                            Ok(addr) => return addr.to_string(),
+                            Err(err) => {
+                                warn!(
+                                    probe_addr = %probe,
+                                    error = %err,
+                                    "failed to detect internal SIP address"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            warn!(
+                                probe_addr = %probe,
+                                error = %err,
+                                "failed to resolve internal SIP address probe target"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        advertised_sip_addr(configured, listener, target).await
+    }
+
+    async fn record_route_addrs(
+        &self,
+        peer: SocketAddr,
+        target: SocketAddr,
+        listener: &ProxyListenerConfig,
+    ) -> Vec<String> {
+        let from_upstream = self.upstreams.contains(peer);
+        let to_upstream = self.upstreams.contains(target);
+        if from_upstream == to_upstream {
+            let side = if to_upstream {
+                AdvertiseSide::Internal
+            } else {
+                AdvertiseSide::Public
+            };
+            return vec![self.advertised_sip_addr(side, listener, target).await];
+        }
+
+        let public = self
+            .advertised_sip_addr(AdvertiseSide::Public, listener, target)
+            .await;
+        let internal = self
+            .advertised_sip_addr(AdvertiseSide::Internal, listener, target)
+            .await;
+        match to_upstream {
+            true => vec![internal, public],
+            false => vec![public, internal],
+        }
+    }
+
+    fn configured_addr_for_side(&self, side: AdvertiseSide) -> Option<&str> {
+        match side {
+            AdvertiseSide::Public => non_empty(
+                self.config
+                    .sip
+                    .public_addr
+                    .as_deref()
+                    .or(self.config.sip.external_addr.as_deref()),
+            ),
+            AdvertiseSide::Internal => non_empty(
+                self.config.sip.internal_addr.as_deref().or(self
+                    .config
+                    .sip
+                    .external_addr
+                    .as_deref()),
+            ),
+        }
+    }
+
+    async fn lookup_registration_binding(&self, request_uri: &str) -> Option<ContactBinding> {
+        for key in registration_route_keys(request_uri) {
+            if let Some(binding) = self.state.lookup(&key).await {
+                return Some(binding);
+            }
+        }
+        None
+    }
+
+    async fn rewrite_and_store_register_contact(
+        &self,
+        message: &mut SipMessage,
+        via_host: &str,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let original_contact = extract_contact(message).ok().flatten();
+        let expires = extract_expires(message);
+        let rewritten_contacts = message.rewrite_contact_host(via_host)?;
+        for (original, rewritten) in rewritten_contacts {
+            self.store_contact_route_keys(&rewritten, &original, peer, expires)
                 .await;
         }
+        if let (Ok(aor), Some(contact)) = (extract_aor(message), original_contact) {
+            self.state
+                .apply(ClusterCommand::RegisterContact(ContactBinding {
+                    aor,
+                    contact,
+                    source: peer.to_string(),
+                    expires_at_epoch_ms: expires_at(expires),
+                }))
+                .await;
+        }
+        Ok(())
+    }
 
-        Ok((message, target, branch))
+    async fn store_register_contact_routes(
+        &self,
+        message: &SipMessage,
+        via_host: &str,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let expires = extract_expires(message);
+        let mut first_contact = None;
+        let mut rewritten = message.clone();
+        for (original, proxy_contact) in rewritten.rewrite_contact_host(via_host)? {
+            if first_contact.is_none() {
+                first_contact = Some(original.clone());
+            }
+            self.store_contact_route_keys(&proxy_contact, &original, peer, expires)
+                .await;
+        }
+        if let (Ok(aor), Some(contact)) = (extract_aor(message), first_contact) {
+            self.state
+                .apply(ClusterCommand::RegisterContact(ContactBinding {
+                    aor,
+                    contact,
+                    source: peer.to_string(),
+                    expires_at_epoch_ms: expires_at(expires),
+                }))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn store_contact_route_keys(
+        &self,
+        route: &str,
+        contact: &str,
+        peer: SocketAddr,
+        expires: Duration,
+    ) {
+        for aor in registration_route_keys(route) {
+            self.state
+                .apply(ClusterCommand::RegisterContact(ContactBinding {
+                    aor,
+                    contact: contact.to_string(),
+                    source: peer.to_string(),
+                    expires_at_epoch_ms: expires_at(expires),
+                }))
+                .await;
+        }
     }
 
     fn record_forwarded_request(
@@ -628,14 +1185,19 @@ impl ProxyServer {
             .incr("proxy_affinity_lookup_total", &[("result", result)]);
     }
 
-    async fn lookup_invite_transaction(&self, key: Option<&str>) -> Option<UpstreamTarget> {
+    async fn lookup_invite_transaction(&self, key: Option<&str>) -> Option<InviteTransactionRoute> {
         let key = key?;
         let mut transactions = self.invite_transactions.lock().await;
         prune_invite_transactions(&mut transactions, Instant::now());
-        transactions.get(key).map(|route| route.target)
+        transactions.get(key).cloned()
     }
 
-    async fn remember_invite_transaction(&self, key: Option<String>, target: UpstreamTarget) {
+    async fn remember_invite_transaction(
+        &self,
+        key: Option<String>,
+        target: UpstreamTarget,
+        branch: String,
+    ) {
         let Some(key) = key else {
             return;
         };
@@ -645,27 +1207,10 @@ impl ProxyServer {
             key,
             InviteTransactionRoute {
                 target,
+                branch,
                 created_at: Instant::now(),
             },
         );
-    }
-
-    fn finalize_upstream_response(&self, response: Vec<u8>, branch: &str) -> Result<Vec<u8>> {
-        let mut message = SipMessage::parse(&response)?;
-        let response_branch = message
-            .top_via_branch()?
-            .context("upstream response is missing top Via branch")?;
-        if response_branch != branch {
-            bail!(
-                "upstream response top Via branch '{}' did not match proxy branch '{}'",
-                response_branch,
-                branch
-            );
-        }
-        message
-            .pop_top_via()?
-            .context("upstream response is missing Via")?;
-        Ok(message.to_bytes())
     }
 
     fn select_upstream(&self, uri: &str, listener: &ProxyListenerConfig) -> UpstreamTarget {
@@ -689,6 +1234,21 @@ impl ProxyServer {
 struct UpstreamTarget {
     addr: SocketAddr,
     transport: SipTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdvertiseSide {
+    Public,
+    Internal,
+}
+
+impl AdvertiseSide {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 async fn bind_udp_socket(
@@ -724,7 +1284,7 @@ async fn bind_tcp_listener(
 
 async fn run_metrics_server(
     config: ProxyMetricsConfig,
-    metrics: Arc<ProxyMetrics>,
+    server: Arc<ProxyServer>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let bind_addr = config
@@ -736,7 +1296,7 @@ async fn run_metrics_server(
         .with_context(|| format!("failed to bind proxy metrics listener {bind_addr}"))?;
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
-        .with_state(metrics);
+        .with_state(server);
     info!(bind = %bind_addr, "proxy metrics listener started");
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -746,8 +1306,55 @@ async fn run_metrics_server(
         .context("proxy metrics HTTP server failed")
 }
 
-async fn metrics_handler(State(metrics): State<Arc<ProxyMetrics>>) -> String {
-    metrics.render_prometheus()
+async fn metrics_handler(State(server): State<Arc<ProxyServer>>) -> String {
+    server.render_metrics().await
+}
+
+fn append_gauge(output: &mut String, name: &str, value: u64) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str("# TYPE ");
+    output.push_str(name);
+    output.push_str(" gauge\n");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+fn append_labeled_gauge(output: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    let type_line = format!("# TYPE {name} gauge\n");
+    if !output.contains(&type_line) {
+        output.push_str(&type_line);
+    }
+    output.push_str(name);
+    if !labels.is_empty() {
+        output.push('{');
+        for (index, (key, value)) in labels.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(key);
+            output.push_str("=\"");
+            output.push_str(&escape_metric_label(value));
+            output.push('"');
+        }
+        output.push('}');
+    }
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+fn escape_metric_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('"', "\\\"")
 }
 
 fn configure_socket(socket: &Socket, config: &ProxySocketConfig) -> Result<()> {
@@ -790,9 +1397,10 @@ struct UdpBranchRoute {
     created_at: Instant,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct InviteTransactionRoute {
     target: UpstreamTarget,
+    branch: String,
     created_at: Instant,
 }
 
@@ -813,14 +1421,13 @@ impl TcpUpstreamPool {
         &self,
         target: SocketAddr,
         branch: String,
-        method: String,
         packet: Vec<u8>,
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         let mut last_error = None;
         for _ in 0..2 {
             let connection = self.get_or_connect(target).await?;
             match connection
-                .send_request(branch.clone(), method.clone(), packet.clone())
+                .send_request(branch.clone(), packet.clone())
                 .await
             {
                 Ok(responses) => return Ok(responses),
@@ -856,6 +1463,24 @@ impl TcpUpstreamPool {
             connections.remove(&target);
         }
     }
+
+    async fn active_counts(&self) -> (usize, usize) {
+        let connections = self
+            .connections
+            .lock()
+            .await
+            .values()
+            .filter(|connection| connection.is_alive())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut branch_count = 0;
+        for connection in &connections {
+            let mut branches = connection.branches.lock().await;
+            prune_tcp_branches(&mut branches, Instant::now());
+            branch_count += branches.len();
+        }
+        (connections.len(), branch_count)
+    }
 }
 
 struct TcpUpstreamConnection {
@@ -867,7 +1492,6 @@ struct TcpUpstreamConnection {
 
 struct TcpBranchRoute {
     tx: mpsc::UnboundedSender<Vec<u8>>,
-    method: String,
     created_at: Instant,
 }
 
@@ -898,7 +1522,6 @@ impl TcpUpstreamConnection {
     async fn send_request(
         &self,
         branch: String,
-        method: String,
         packet: Vec<u8>,
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         if !self.is_alive() {
@@ -913,7 +1536,6 @@ impl TcpUpstreamConnection {
                 branch.clone(),
                 TcpBranchRoute {
                     tx,
-                    method,
                     created_at: Instant::now(),
                 },
             );
@@ -985,8 +1607,8 @@ async fn dispatch_tcp_upstream_response(
     }
 
     let is_final = matches!(
-        message.start_line,
-        SipStartLine::Response { code, .. } if code >= 200
+        &message.start_line,
+        SipStartLine::Response { code, .. } if *code >= 200
     );
     message
         .pop_top_via()?
@@ -1005,8 +1627,7 @@ async fn dispatch_tcp_upstream_response(
             return Ok(());
         };
         let tx = route.tx.clone();
-        let remove_after_send = route.method != "INVITE" || is_final;
-        if remove_after_send {
+        if is_final {
             branches.remove(&branch);
         }
         tx
@@ -1040,12 +1661,59 @@ impl UpstreamGroups {
         };
         group.select()
     }
+
+    fn record_passive_result(&self, server: SocketAddr, healthy: bool) {
+        for group in self.groups.values() {
+            group.record_passive_result(server, healthy);
+        }
+    }
+
+    fn is_healthy(&self, server: SocketAddr) -> bool {
+        let mut found = false;
+        for group in self.groups.values() {
+            if group.contains(server) {
+                found = true;
+                if group.is_healthy(server) {
+                    return true;
+                }
+            }
+        }
+        !found
+    }
+
+    fn contains(&self, server: SocketAddr) -> bool {
+        self.groups.values().any(|group| group.contains(server))
+    }
+
+    fn health_snapshots(&self) -> Vec<UpstreamHealthSnapshot> {
+        self.groups
+            .values()
+            .flat_map(|group| group.health_snapshots())
+            .collect()
+    }
+}
+
+struct UpstreamHealthSnapshot {
+    group: String,
+    server: String,
+    healthy: bool,
+    consecutive_successes: usize,
+    consecutive_failures: usize,
+}
+
+struct HealthRecordUpdate {
+    was_healthy: bool,
+    is_healthy: bool,
+    consecutive_successes: usize,
+    consecutive_failures: usize,
 }
 
 struct UpstreamGroupRuntime {
     name: String,
     servers: Vec<SocketAddr>,
     health: Vec<AtomicBool>,
+    consecutive_successes: Vec<AtomicUsize>,
+    consecutive_failures: Vec<AtomicUsize>,
     next: AtomicUsize,
     health_check: UpstreamHealthCheckConfig,
 }
@@ -1055,17 +1723,17 @@ impl UpstreamGroupRuntime {
         let servers = config
             .servers
             .iter()
-            .map(|server| {
-                server
-                    .parse::<SocketAddr>()
-                    .with_context(|| format!("invalid server in upstream group '{}'", config.name))
-            })
+            .map(|server| resolve_upstream_server(&config.name, server))
             .collect::<Result<Vec<_>>>()?;
         let health = servers.iter().map(|_| AtomicBool::new(true)).collect();
+        let consecutive_successes = servers.iter().map(|_| AtomicUsize::new(0)).collect();
+        let consecutive_failures = servers.iter().map(|_| AtomicUsize::new(0)).collect();
         Ok(Self {
             name: config.name.clone(),
             servers,
             health,
+            consecutive_successes,
+            consecutive_failures,
             next: AtomicUsize::new(0),
             health_check: config.health_check.clone(),
         })
@@ -1087,39 +1755,271 @@ impl UpstreamGroupRuntime {
         Ok(self.servers[index])
     }
 
+    #[cfg(test)]
     fn set_health(&self, index: usize, healthy: bool) {
         self.health[index].store(healthy, Ordering::Relaxed);
+        self.consecutive_successes[index].store(0, Ordering::Relaxed);
+        self.consecutive_failures[index].store(0, Ordering::Relaxed);
     }
+
+    fn record_health_result(&self, index: usize, healthy: bool) -> HealthRecordUpdate {
+        let was_healthy = self.health[index].load(Ordering::Relaxed);
+        if healthy {
+            self.consecutive_failures[index].store(0, Ordering::Relaxed);
+            let successes = self.consecutive_successes[index].fetch_add(1, Ordering::Relaxed) + 1;
+            if successes >= self.health_check.success_threshold {
+                self.health[index].store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.consecutive_successes[index].store(0, Ordering::Relaxed);
+            let failures = self.consecutive_failures[index].fetch_add(1, Ordering::Relaxed) + 1;
+            if failures >= self.health_check.failure_threshold {
+                self.health[index].store(false, Ordering::Relaxed);
+            }
+        }
+        HealthRecordUpdate {
+            was_healthy,
+            is_healthy: self.health[index].load(Ordering::Relaxed),
+            consecutive_successes: self.consecutive_successes[index].load(Ordering::Relaxed),
+            consecutive_failures: self.consecutive_failures[index].load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_passive_result(&self, server: SocketAddr, healthy: bool) {
+        if !self.health_check.enabled {
+            return;
+        }
+        if let Some(index) = self
+            .servers
+            .iter()
+            .position(|candidate| *candidate == server)
+        {
+            self.record_health_result(index, healthy);
+        }
+    }
+
+    fn contains(&self, server: SocketAddr) -> bool {
+        self.servers.contains(&server)
+    }
+
+    fn is_healthy(&self, server: SocketAddr) -> bool {
+        let Some(index) = self
+            .servers
+            .iter()
+            .position(|candidate| *candidate == server)
+        else {
+            return false;
+        };
+        self.health[index].load(Ordering::Relaxed)
+    }
+
+    fn health_snapshots(&self) -> Vec<UpstreamHealthSnapshot> {
+        self.servers
+            .iter()
+            .enumerate()
+            .map(|(index, server)| UpstreamHealthSnapshot {
+                group: self.name.clone(),
+                server: server.to_string(),
+                healthy: self.health[index].load(Ordering::Relaxed),
+                consecutive_successes: self.consecutive_successes[index].load(Ordering::Relaxed),
+                consecutive_failures: self.consecutive_failures[index].load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+}
+
+fn resolve_upstream_server(group: &str, server: &str) -> Result<SocketAddr> {
+    if let Ok(addr) = server.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    let mut addrs = server
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve upstream '{server}' in group '{group}'"))?;
+    addrs.next().with_context(|| {
+        format!("upstream '{server}' in group '{group}' did not resolve to any address")
+    })
 }
 
 async fn run_health_checks(
     group: Arc<UpstreamGroupRuntime>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
+    let probes = HealthCheckRuntime::new(&group).await?;
     let interval = Duration::from_millis(group.health_check.interval_ms);
     loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        run_health_check_round(group.clone(), &probes).await;
         tokio::select! {
-            _ = shutdown.changed() => break,
-            _ = tokio::time::sleep(interval) => {
-                for (index, server) in group.servers.iter().copied().enumerate() {
-                    let healthy = probe_sip_options(
-                        server,
-                        group.health_check.transport,
-                        &group.health_check.options_uri,
-                        Duration::from_millis(group.health_check.timeout_ms),
-                    ).await;
-                    group.set_health(index, healthy);
-                    debug!(
-                        group = %group.name,
-                        %server,
-                        healthy,
-                        "backend health check completed"
-                    );
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    break;
                 }
             }
+            _ = tokio::time::sleep(interval) => {}
         }
     }
     Ok(())
+}
+
+struct HealthCheckRuntime {
+    udp_sockets: Vec<Option<Arc<UdpSocket>>>,
+    tcp_streams: Vec<Option<Arc<Mutex<Option<TcpStream>>>>>,
+}
+
+impl HealthCheckRuntime {
+    async fn new(group: &UpstreamGroupRuntime) -> Result<Self> {
+        let probe_transport = match group.health_check.probe {
+            UpstreamHealthProbeConfig::Options { transport, .. } => Some(transport),
+            UpstreamHealthProbeConfig::TcpConnect => None,
+        };
+        let mut udp_sockets = Vec::with_capacity(group.servers.len());
+        let mut tcp_streams = Vec::with_capacity(group.servers.len());
+        for server in group.servers.iter().copied() {
+            if probe_transport == Some(SipTransport::Udp) {
+                let socket = bind_health_probe_udp_socket(server)
+                    .await
+                    .with_context(|| {
+                        format!("failed to bind UDP health-check socket for {server}")
+                    })?;
+                udp_sockets.push(Some(Arc::new(socket)));
+            } else {
+                udp_sockets.push(None);
+            }
+            if probe_transport == Some(SipTransport::Tcp) {
+                tcp_streams.push(Some(Arc::new(Mutex::new(None))));
+            } else {
+                tcp_streams.push(None);
+            }
+        }
+        Ok(Self {
+            udp_sockets,
+            tcp_streams,
+        })
+    }
+
+    fn udp_socket(&self, index: usize) -> Option<Arc<UdpSocket>> {
+        self.udp_sockets.get(index).cloned().flatten()
+    }
+
+    fn tcp_stream(&self, index: usize) -> Option<Arc<Mutex<Option<TcpStream>>>> {
+        self.tcp_streams.get(index).cloned().flatten()
+    }
+}
+
+async fn run_health_check_round(group: Arc<UpstreamGroupRuntime>, probes: &HealthCheckRuntime) {
+    let mut checks = tokio::task::JoinSet::new();
+    for (index, server) in group.servers.iter().copied().enumerate() {
+        let config = group.health_check.clone();
+        let udp_socket = probes.udp_socket(index);
+        let tcp_stream = probes.tcp_stream(index);
+        checks.spawn(async move {
+            let result = probe_upstream_health(server, &config, udp_socket, tcp_stream).await;
+            (index, server, result)
+        });
+    }
+
+    while let Some(result) = checks.join_next().await {
+        let Ok((index, server, result)) = result else {
+            warn!("backend health check task failed");
+            continue;
+        };
+        let update = group.record_health_result(index, result.healthy);
+        let mode = health_probe_mode(&group.health_check.probe);
+        if !result.healthy {
+            warn!(
+                group = %group.name,
+                %server,
+                mode,
+                reason = %result.reason.as_deref().unwrap_or("probe returned unhealthy"),
+                consecutive_failures = update.consecutive_failures,
+                failure_threshold = group.health_check.failure_threshold,
+                currently_healthy = update.is_healthy,
+                "backend health check failed"
+            );
+        }
+        if update.was_healthy && !update.is_healthy {
+            warn!(
+                group = %group.name,
+                %server,
+                mode,
+                consecutive_failures = update.consecutive_failures,
+                "backend marked unhealthy"
+            );
+        } else if !update.was_healthy && update.is_healthy {
+            info!(
+                group = %group.name,
+                %server,
+                mode,
+                consecutive_successes = update.consecutive_successes,
+                "backend marked healthy"
+            );
+        }
+        debug!(
+            group = %group.name,
+            %server,
+            healthy = result.healthy,
+            mode,
+            "backend health check completed"
+        );
+    }
+}
+
+struct HealthProbeResult {
+    healthy: bool,
+    reason: Option<String>,
+}
+
+impl HealthProbeResult {
+    fn healthy() -> Self {
+        Self {
+            healthy: true,
+            reason: None,
+        }
+    }
+
+    fn failed(reason: impl Into<String>) -> Self {
+        Self {
+            healthy: false,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+async fn probe_upstream_health(
+    server: SocketAddr,
+    config: &UpstreamHealthCheckConfig,
+    udp_socket: Option<Arc<UdpSocket>>,
+    tcp_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
+) -> HealthProbeResult {
+    let limit = Duration::from_millis(config.timeout_ms);
+    match &config.probe {
+        UpstreamHealthProbeConfig::Options {
+            transport,
+            uri,
+            success_codes,
+        } => {
+            probe_sip_options(
+                server,
+                *transport,
+                uri,
+                limit,
+                success_codes,
+                udp_socket,
+                tcp_stream,
+            )
+            .await
+        }
+        UpstreamHealthProbeConfig::TcpConnect => probe_tcp_connect(server, limit).await,
+    }
+}
+
+fn health_probe_mode(probe: &UpstreamHealthProbeConfig) -> &'static str {
+    match probe {
+        UpstreamHealthProbeConfig::Options { .. } => "options",
+        UpstreamHealthProbeConfig::TcpConnect => "tcp-connect",
+    }
 }
 
 async fn probe_sip_options(
@@ -1127,54 +2027,434 @@ async fn probe_sip_options(
     transport: SipTransport,
     uri: &str,
     limit: Duration,
-) -> bool {
-    let packet = format!(
-        "OPTIONS {uri} SIP/2.0\r\n\
-         Via: SIP/2.0/{} 127.0.0.1:0;branch=z9hG4bK-health-{}\r\n\
-         From: <sip:healthcheck@localhost>;tag=health\r\n\
-         To: <{uri}>\r\n\
-         Call-ID: health-{}\r\n\
-         CSeq: 1 OPTIONS\r\n\
-         Content-Length: 0\r\n\r\n",
-        transport.sip_via_token(),
-        monotonic_id(),
-        monotonic_id()
-    )
-    .into_bytes();
-
+    success_codes: &[u16],
+    udp_socket: Option<Arc<UdpSocket>>,
+    tcp_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
+) -> HealthProbeResult {
     let future = async {
         match transport {
-            SipTransport::Udp => forward_udp_once(server, packet).await,
-            SipTransport::Tcp => forward_tcp(server, packet).await,
+            SipTransport::Udp => {
+                let socket = udp_socket.context("missing UDP health-check socket")?;
+                probe_sip_options_udp(server, uri, socket).await
+            }
+            SipTransport::Tcp => {
+                let stream = tcp_stream.context("missing TCP health-check stream")?;
+                probe_sip_options_tcp(server, uri, stream).await
+            }
         }
     };
     let Ok(response) = timeout(limit, future).await else {
-        return false;
+        return HealthProbeResult::failed(format!("SIP OPTIONS timed out after {:?}", limit));
     };
-    let Ok(response) = response else {
-        return false;
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            return HealthProbeResult::failed(format!("SIP OPTIONS probe failed: {err:#}"));
+        }
     };
-    let Ok(message) = SipMessage::parse(&response) else {
-        return false;
+    let message = match SipMessage::parse(&response) {
+        Ok(message) => message,
+        Err(err) => {
+            return HealthProbeResult::failed(format!(
+                "SIP OPTIONS returned invalid SIP response: {err:#}"
+            ));
+        }
     };
     match message.start_line {
-        SipStartLine::Response { code, .. } => code < 500,
-        SipStartLine::Request { .. } => false,
+        SipStartLine::Response { code, .. } => {
+            let accepted = if success_codes.is_empty() {
+                code < 500
+            } else {
+                success_codes.contains(&code)
+            };
+            if accepted {
+                HealthProbeResult::healthy()
+            } else {
+                HealthProbeResult::failed(format!(
+                    "SIP OPTIONS returned status {code}, expected one of {success_codes:?}"
+                ))
+            }
+        }
+        SipStartLine::Request { .. } => {
+            HealthProbeResult::failed("SIP OPTIONS probe received a request instead of a response")
+        }
     }
 }
 
-async fn forward_udp_once(target: SocketAddr, packet: Vec<u8>) -> Result<Vec<u8>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    socket.send_to(&packet, target).await?;
+struct HealthOptionsRequest {
+    packet: Vec<u8>,
+    branch: String,
+}
+
+fn build_health_options_request(
+    server: SocketAddr,
+    uri: &str,
+    transport: SipTransport,
+    sent_by: SocketAddr,
+) -> Result<HealthOptionsRequest> {
+    let id = unique_id();
+    let branch = format!("z9hG4bK-health-{id}");
+    let cseq = cseq_from_id(id);
+    let call_id = health_options_call_id(server, transport, uri);
+    let transport = match transport {
+        SipTransport::Udp => RsipTransport::Udp,
+        SipTransport::Tcp => RsipTransport::Tcp,
+    };
+    let packet = SipMessage::options_request(
+        uri,
+        transport,
+        sent_by,
+        branch.clone(),
+        format!("health-{id}"),
+        call_id,
+        cseq,
+    )?
+    .to_bytes();
+    Ok(HealthOptionsRequest { packet, branch })
+}
+
+fn cseq_from_id(id: u64) -> u32 {
+    ((id.saturating_sub(1) % u64::from(u32::MAX)) + 1) as u32
+}
+
+fn health_options_call_id(server: SocketAddr, transport: SipTransport, uri: &str) -> String {
+    let key = format!(
+        "health|{}|{}|{}|{}",
+        std::process::id(),
+        transport.as_str(),
+        server,
+        uri
+    );
+    format!("{}@sipproxy-rs", uuid_like_id(&key))
+}
+
+fn uuid_like_id(key: &str) -> String {
+    let mut hash = 0x6a09_e667_f3bc_c908_bb67_ae85_84ca_a73b_u128;
+    for byte in key.bytes() {
+        hash ^= u128::from(byte);
+        hash = hash.wrapping_mul(0x0000_0000_0100_0000_0000_0000_0000_013b_u128);
+        hash ^= hash >> 64;
+    }
+
+    let mut bytes = hash.to_be_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{}-{}-{}-{}-{}",
+        hex_bytes(&bytes[0..4]),
+        hex_bytes(&bytes[4..6]),
+        hex_bytes(&bytes[6..8]),
+        hex_bytes(&bytes[8..10]),
+        hex_bytes(&bytes[10..16])
+    )
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+async fn bind_health_probe_udp_socket(server: SocketAddr) -> Result<UdpSocket> {
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(server).await?;
+    Ok(socket)
+}
+
+async fn probe_sip_options_udp(
+    server: SocketAddr,
+    uri: &str,
+    socket: Arc<UdpSocket>,
+) -> Result<Vec<u8>> {
+    let request =
+        build_health_options_request(server, uri, SipTransport::Udp, socket.local_addr()?)?;
+    socket.send(&request.packet).await?;
     let mut buf = vec![0; 65_535];
-    let (len, _) = timeout(UPSTREAM_TIMEOUT, socket.recv_from(&mut buf))
-        .await
-        .context("upstream SIP response timed out")??;
-    Ok(buf[..len].to_vec())
+    loop {
+        let len = socket.recv(&mut buf).await?;
+        let response = buf[..len].to_vec();
+        if health_options_response_matches_branch(&response, &request.branch)? {
+            return Ok(response);
+        }
+    }
+}
+
+fn health_options_response_matches_branch(response: &[u8], branch: &str) -> Result<bool> {
+    let message = SipMessage::parse(response)?;
+    if !matches!(message.start_line, SipStartLine::Response { .. }) {
+        return Ok(true);
+    }
+    let Some(via) = message.header("Via") else {
+        return Ok(true);
+    };
+    Ok(via_branch_param(via).is_none_or(|response_branch| response_branch == branch))
+}
+
+fn via_branch_param(via: &str) -> Option<&str> {
+    let top_via = via.split(',').next().unwrap_or(via);
+    top_via.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.trim().split_once('=')?;
+        name.trim()
+            .eq_ignore_ascii_case("branch")
+            .then_some(value.trim())
+    })
+}
+
+async fn probe_sip_options_tcp(
+    server: SocketAddr,
+    uri: &str,
+    stream_slot: Arc<Mutex<Option<TcpStream>>>,
+) -> Result<Vec<u8>> {
+    let mut stream_guard = stream_slot.lock().await;
+    if stream_guard.is_none() {
+        *stream_guard = Some(TcpStream::connect(server).await?);
+    }
+
+    let stream = stream_guard.as_mut().expect("stream initialized above");
+    let request =
+        build_health_options_request(server, uri, SipTransport::Tcp, stream.local_addr()?)?;
+    if let Err(err) = stream.write_all(&request.packet).await {
+        *stream_guard = None;
+        return Err(err).context("failed to write SIP OPTIONS to upstream TCP connection");
+    }
+
+    let mut reader = TcpSipReader::new(65_535);
+    loop {
+        let response = match reader.read_message(stream).await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                *stream_guard = None;
+                bail!("upstream SIP TCP connection closed without health-check response");
+            }
+            Err(err) => {
+                *stream_guard = None;
+                return Err(err);
+            }
+        };
+        if health_options_response_matches_branch(&response, &request.branch)? {
+            return Ok(response);
+        }
+    }
+}
+
+async fn probe_tcp_connect(server: SocketAddr, limit: Duration) -> HealthProbeResult {
+    match timeout(limit, TcpStream::connect(server)).await {
+        Ok(Ok(_)) => HealthProbeResult::healthy(),
+        Ok(Err(err)) => HealthProbeResult::failed(format!("TCP connect failed: {err:#}")),
+        Err(_) => HealthProbeResult::failed(format!("TCP connect timed out after {:?}", limit)),
+    }
 }
 
 fn prune_udp_branches(branches: &mut HashMap<String, UdpBranchRoute>, now: Instant) {
     branches.retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL);
+}
+
+fn is_crlf_keepalive(packet: &[u8]) -> bool {
+    packet.is_empty() || packet.iter().all(|byte| matches!(byte, b'\r' | b'\n'))
+}
+
+fn is_stun_packet(packet: &[u8]) -> bool {
+    packet.len() >= 20
+        && packet[0] & 0b1100_0000 == 0
+        && u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]) == STUN_MAGIC_COOKIE
+        && 20 + u16::from_be_bytes([packet[2], packet[3]]) as usize <= packet.len()
+}
+
+async fn discover_public_ip(server: &str) -> Result<IpAddr> {
+    let server = resolve_probe_addr(server)?;
+    let bind_addr = if server.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(server).await?;
+    let request = stun_binding_request();
+    socket.send(&request).await?;
+
+    let mut buf = [0_u8; 1500];
+    let len = timeout(Duration::from_secs(2), socket.recv(&mut buf))
+        .await
+        .context("STUN request timed out")??;
+    parse_stun_mapped_addr(&buf[..len])
+        .map(|addr| addr.ip())
+        .context("STUN response did not contain a mapped address")
+}
+
+fn resolve_probe_addr(addr: &str) -> Result<SocketAddr> {
+    if let Ok(addr) = addr.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    addr.to_socket_addrs()?
+        .next()
+        .with_context(|| format!("probe target '{addr}' did not resolve to any address"))
+}
+
+fn stun_binding_request() -> Vec<u8> {
+    let id = unique_id();
+    let mut transaction_id = [0_u8; 12];
+    transaction_id[4..12].copy_from_slice(&id.to_be_bytes());
+
+    let mut request = Vec::with_capacity(20);
+    request.extend_from_slice(&0x0001_u16.to_be_bytes());
+    request.extend_from_slice(&0_u16.to_be_bytes());
+    request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    request.extend_from_slice(&transaction_id);
+    request
+}
+
+fn parse_stun_mapped_addr(packet: &[u8]) -> Option<SocketAddr> {
+    if !is_stun_packet(packet) || u16::from_be_bytes([packet[0], packet[1]]) != 0x0101 {
+        return None;
+    }
+    let transaction_id = &packet[8..20];
+    let mut offset = 20;
+    while offset + 4 <= packet.len() {
+        let attr_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let attr_len = u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
+        let value_start = offset + 4;
+        let value_end = value_start + attr_len;
+        if value_end > packet.len() {
+            return None;
+        }
+        let value = &packet[value_start..value_end];
+        let mapped = match attr_type {
+            0x0020 => parse_stun_xor_mapped_addr(value, transaction_id),
+            0x0001 => parse_stun_plain_mapped_addr(value),
+            _ => None,
+        };
+        if mapped.is_some() {
+            return mapped;
+        }
+        offset = value_end + ((4 - (attr_len % 4)) % 4);
+    }
+    None
+}
+
+fn parse_stun_xor_mapped_addr(value: &[u8], transaction_id: &[u8]) -> Option<SocketAddr> {
+    if value.len() < 8 || transaction_id.len() != 12 {
+        return None;
+    }
+    let family = value[1];
+    let port = u16::from_be_bytes([value[2], value[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    match family {
+        0x01 if value.len() >= 8 => {
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            let octets = [
+                value[4] ^ cookie[0],
+                value[5] ^ cookie[1],
+                value[6] ^ cookie[2],
+                value[7] ^ cookie[3],
+            ];
+            Some(SocketAddr::new(IpAddr::from(octets), port))
+        }
+        0x02 if value.len() >= 20 => {
+            let mut mask = [0_u8; 16];
+            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+            mask[4..].copy_from_slice(transaction_id);
+            let mut octets = [0_u8; 16];
+            for index in 0..16 {
+                octets[index] = value[4 + index] ^ mask[index];
+            }
+            Some(SocketAddr::new(IpAddr::from(octets), port))
+        }
+        _ => None,
+    }
+}
+
+fn parse_stun_plain_mapped_addr(value: &[u8]) -> Option<SocketAddr> {
+    if value.len() < 8 {
+        return None;
+    }
+    let family = value[1];
+    let port = u16::from_be_bytes([value[2], value[3]]);
+    match family {
+        0x01 if value.len() >= 8 => Some(SocketAddr::new(
+            IpAddr::from([value[4], value[5], value[6], value[7]]),
+            port,
+        )),
+        0x02 if value.len() >= 20 => {
+            let mut octets = [0_u8; 16];
+            octets.copy_from_slice(&value[4..20]);
+            Some(SocketAddr::new(IpAddr::from(octets), port))
+        }
+        _ => None,
+    }
+}
+
+fn stun_binding_success_response(packet: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
+    if !is_stun_packet(packet) || u16::from_be_bytes([packet[0], packet[1]]) != 0x0001 {
+        return None;
+    }
+
+    let transaction_id = &packet[8..20];
+    let attr = stun_xor_mapped_address_attr(peer, transaction_id);
+    let mut response = Vec::with_capacity(20 + attr.len());
+    response.extend_from_slice(&0x0101_u16.to_be_bytes());
+    response.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+    response.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+    response.extend_from_slice(transaction_id);
+    response.extend_from_slice(&attr);
+    Some(response)
+}
+
+fn stun_xor_mapped_address_attr(peer: SocketAddr, transaction_id: &[u8]) -> Vec<u8> {
+    let xor_port = peer.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+    let mut value = Vec::new();
+    value.push(0);
+    match peer.ip() {
+        IpAddr::V4(ip) => {
+            value.push(0x01);
+            value.extend_from_slice(&xor_port.to_be_bytes());
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            for (byte, mask) in ip.octets().iter().zip(cookie.iter()) {
+                value.push(byte ^ mask);
+            }
+        }
+        IpAddr::V6(ip) => {
+            value.push(0x02);
+            value.extend_from_slice(&xor_port.to_be_bytes());
+            let mut mask = [0_u8; 16];
+            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+            mask[4..].copy_from_slice(transaction_id);
+            for (byte, mask) in ip.octets().iter().zip(mask.iter()) {
+                value.push(byte ^ mask);
+            }
+        }
+    }
+
+    let mut attr = Vec::with_capacity(4 + value.len());
+    attr.extend_from_slice(&0x0020_u16.to_be_bytes());
+    attr.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    attr.extend_from_slice(&value);
+    attr
+}
+
+fn packet_preview(packet: &[u8]) -> String {
+    let mut output = String::new();
+    for byte in packet.iter().take(48) {
+        match byte {
+            b'\r' => output.push_str("\\r"),
+            b'\n' => output.push_str("\\n"),
+            0x20..=0x7e => output.push(*byte as char),
+            _ => {
+                let _ = write!(output, "\\x{byte:02x}");
+            }
+        }
+    }
+    if packet.len() > 48 {
+        output.push_str("...");
+    }
+    output
 }
 
 fn prune_invite_transactions(
@@ -1236,6 +2516,7 @@ fn status_class(code: u16) -> &'static str {
     }
 }
 
+#[cfg(test)]
 async fn forward_tcp(target: SocketAddr, packet: Vec<u8>) -> Result<Vec<u8>> {
     let mut stream = timeout(UPSTREAM_TIMEOUT, TcpStream::connect(target))
         .await
@@ -1327,6 +2608,44 @@ fn parse_contact_target(contact: &str, default_transport: SipTransport) -> Optio
     Some(UpstreamTarget { addr, transport })
 }
 
+fn registration_route_keys(route: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    push_unique_key(&mut keys, route.trim().to_string());
+
+    if let Some(normalized) = normalized_sip_uri_without_params(route) {
+        push_unique_key(&mut keys, normalized);
+    }
+
+    keys
+}
+
+fn normalized_sip_uri_without_params(value: &str) -> Option<String> {
+    let mut uri = RsipContact::parse(value)
+        .map(|contact| contact.uri)
+        .or_else(|_| value.parse::<RsipUri>())
+        .ok()?;
+    uri.params.clear();
+    uri.headers.clear();
+    Some(uri.to_string())
+}
+
+fn push_unique_key(keys: &mut Vec<String>, key: String) {
+    if !key.is_empty() && !keys.iter().any(|existing| existing == &key) {
+        keys.push(key);
+    }
+}
+
+fn parse_socket_addr_with_default_port(value: &str, default_port: u16) -> Option<SocketAddr> {
+    render_advertised_addr(value, default_port)?.parse().ok()
+}
+
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
 fn sip_transport_from_rsip(transport: RsipTransport) -> Option<SipTransport> {
     match transport.protocol() {
         RsipTransport::Udp => Some(SipTransport::Udp),
@@ -1335,21 +2654,133 @@ fn sip_transport_from_rsip(transport: RsipTransport) -> Option<SipTransport> {
     }
 }
 
-fn monotonic_id() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
+async fn advertised_sip_addr(
+    configured: Option<&str>,
+    listener: &ProxyListenerConfig,
+    upstream: SocketAddr,
+) -> String {
+    let fallback_port = listener_port(listener);
+    let port = configured
+        .and_then(advertised_addr_port)
+        .or_else(|| {
+            listener
+                .bind
+                .parse::<SocketAddr>()
+                .ok()
+                .map(|addr| addr.port())
+        })
+        .unwrap_or(upstream.port());
+
+    if let Some(configured) = configured
+        && !advertised_addr_needs_auto(configured)
+    {
+        return render_advertised_addr(configured, fallback_port)
+            .unwrap_or_else(|| configured.to_string());
+    }
+
+    if let Ok(addr) = outbound_local_addr(upstream, port).await {
+        return addr.to_string();
+    }
+
+    listener.bind.clone()
+}
+
+fn advertised_addr_needs_auto(value: &str) -> bool {
+    let Some(host) = advertised_addr_host(value) else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    ip.is_loopback() || ip.is_unspecified()
+}
+
+fn render_advertised_addr(value: &str, default_port: u16) -> Option<String> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr.to_string());
+    }
+    let (host, port) = match split_advertised_host_port(value) {
+        Some((host, port)) => (host, port.parse::<u16>().ok()?),
+        None => (value, default_port),
+    };
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(render_host_port(host, port))
+}
+
+fn advertised_addr_host(value: &str) -> Option<&str> {
+    split_advertised_host_port(value)
+        .map(|(host, _)| host)
+        .or(Some(value))
+}
+
+fn advertised_addr_port(value: &str) -> Option<u16> {
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr.port());
+    }
+    split_advertised_host_port(value).and_then(|(_, port)| port.parse().ok())
+}
+
+fn split_advertised_host_port(value: &str) -> Option<(&str, &str)> {
+    if value.starts_with('[') {
+        let end = value.find(']')?;
+        return value[end + 1..]
+            .strip_prefix(':')
+            .map(|port| (&value[..=end], port));
+    }
+    if value.matches(':').count() == 1 {
+        value.rsplit_once(':')
+    } else {
+        None
+    }
+}
+
+fn render_host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.starts_with('[') && host.ends_with(']') {
+        format!("{host}:{port}")
+    } else if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn listener_port(listener: &ProxyListenerConfig) -> u16 {
+    listener
+        .bind
+        .parse::<SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(5060)
+}
+
+async fn outbound_local_addr(upstream: SocketAddr, port: u16) -> Result<SocketAddr> {
+    let bind_addr = if upstream.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
+    socket.connect(upstream).await?;
+    let local_ip = socket.local_addr()?.ip();
+    Ok(SocketAddr::new(local_ip, port))
+}
+
+fn unique_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::StandaloneReplicator;
+    use crate::cluster::{ClusterCommand, ContactBinding, StandaloneReplicator, expires_at};
     use crate::config::{
-        Config, ProxyAffinityConfig, ProxyConfig, ProxyListenerConfig, ProxySocketConfig,
-        RouteConfig, SipConfig, SipTransport, UpstreamGroupConfig, UpstreamHealthCheckConfig,
-        UpstreamMode,
+        Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyListenerConfig,
+        ProxySocketConfig, RouteConfig, SipConfig, SipTransport, UpstreamGroupConfig,
+        UpstreamHealthCheckConfig, UpstreamMode,
     };
     use tokio::net::UdpSocket;
 
@@ -1370,16 +2801,25 @@ mod tests {
     }
 
     fn test_server_with_upstream(upstream: SocketAddr) -> ProxyServer {
+        test_server_with_upstream_config(upstream, false)
+    }
+
+    fn test_server_with_upstream_config(
+        upstream: SocketAddr,
+        rewrite_register_contact: bool,
+    ) -> ProxyServer {
         let state = Arc::new(SharedState::default());
         let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
         ProxyServer::new(
             Config {
                 sip: SipConfig {
                     external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstream.to_string(),
                     ..SipConfig::default()
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    rewrite_register_contact,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -1403,10 +2843,40 @@ mod tests {
             state,
             replicator,
         )
+        .unwrap()
     }
 
-    fn test_server() -> ProxyServer {
-        test_server_with_upstream("127.0.0.1:5080".parse().unwrap())
+    fn test_server_with_dual_advertise(upstream: SocketAddr) -> ProxyServer {
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
+        ProxyServer::new(
+            Config {
+                sip: SipConfig {
+                    public_addr: Some("95.40.96.117".to_string()),
+                    internal_addr: Some("172.30.0.101".to_string()),
+                    ..SipConfig::default()
+                },
+                proxy: ProxyConfig {
+                    record_route: true,
+                    rewrite_register_contact: false,
+                    socket: ProxySocketConfig::default(),
+                    metrics: Default::default(),
+                    affinity: Default::default(),
+                    listeners: vec![test_listener()],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream.to_string()],
+                    }],
+                    routes: vec![],
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+        )
+        .unwrap()
     }
 
     fn test_server_with_upstreams(upstreams: Vec<SocketAddr>) -> ProxyServer {
@@ -1416,10 +2886,15 @@ mod tests {
             Config {
                 sip: SipConfig {
                     external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstreams
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "127.0.0.1:5080".to_string()),
                     ..SipConfig::default()
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    rewrite_register_contact: false,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -1437,6 +2912,7 @@ mod tests {
             state,
             replicator,
         )
+        .unwrap()
     }
 
     fn test_server_with_upstreams_and_affinity(
@@ -1449,10 +2925,15 @@ mod tests {
             Config {
                 sip: SipConfig {
                     external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstreams
+                        .first()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "127.0.0.1:5080".to_string()),
                     ..SipConfig::default()
                 },
                 proxy: ProxyConfig {
                     record_route: true,
+                    rewrite_register_contact: false,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity,
@@ -1470,13 +2951,14 @@ mod tests {
             state,
             replicator,
         )
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn options_gets_local_ok() {
-        let server = test_server();
+    async fn options_is_forwarded_to_upstream() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
         server
             .handle_udp_packet(
                 &proxy_socket,
@@ -1486,7 +2968,152 @@ From: <sip:100@example.com>;tag=a\r\n\
 To: <sip:example.com>\r\n\
 Call-ID: c1\r\n\
 CSeq: 1 OPTIONS\r\n\r\n",
-                client_socket.local_addr().unwrap(),
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("OPTIONS sip:example.com SIP/2.0"));
+        assert!(forwarded.contains("Call-ID: c1"));
+    }
+
+    #[tokio::test]
+    async fn register_is_forwarded_to_upstream() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-register-forward\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Contact: <sip:100@127.0.0.1:5061>;expires=60\r\n\
+Call-ID: register-forward\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("REGISTER sip:example.com SIP/2.0"));
+        assert!(forwarded.contains("Path: <sip:127.0.0.1:5060;lr>"));
+        assert!(forwarded.contains("Contact: <sip:100@127.0.0.1:5061>;expires=60"));
+        assert!(forwarded.contains("Call-ID: register-forward"));
+        assert_eq!(
+            server
+                .state
+                .lookup("sip:100@example.com")
+                .await
+                .unwrap()
+                .contact,
+            "sip:100@127.0.0.1:5061"
+        );
+        assert_eq!(
+            server
+                .state
+                .lookup("sip:100@127.0.0.1:5060")
+                .await
+                .unwrap()
+                .contact,
+            "sip:100@127.0.0.1:5061"
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_advertise_uses_internal_address_toward_upstream() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-dual-register\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Contact: <sip:100@127.0.0.1:5061>;expires=60\r\n\
+Call-ID: dual-register\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(top_via_line(&register).contains("172.30.0.101:5060"));
+        assert!(register.contains("Path: <sip:172.30.0.101:5060;lr>"));
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-dual-invite\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: dual-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let invite = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(top_via_line(&invite).contains("172.30.0.101:5060"));
+        assert_eq!(
+            header_lines(&invite, "Record-Route"),
+            vec![
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dual_advertise_uses_public_address_toward_client() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let packet = format!(
+            "INVITE sip:6805@{client_addr} SIP/2.0\r\n\
+Route: <sip:172.30.0.101:5060;lr>\r\n\
+Via: SIP/2.0/UDP 172.30.0.60:5060;branch=z9hG4bK-dual-inbound\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>\r\n\
+Call-ID: dual-inbound\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:100@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
                 &test_listener(),
             )
             .await
@@ -1494,38 +3121,186 @@ CSeq: 1 OPTIONS\r\n\r\n",
 
         let mut buf = [0_u8; 4096];
         let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
-        let response = buf[..len].to_vec();
-        let text = String::from_utf8(response).unwrap();
-        assert!(text.starts_with("SIP/2.0 200 OK"));
-        assert!(text.contains("CSeq: 1 OPTIONS"));
+        let invite = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(top_via_line(&invite).contains("95.40.96.117:5060"));
+        assert_eq!(
+            header_lines(&invite, "Record-Route"),
+            vec![
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+            ]
+        );
+        assert!(!invite.lines().any(|line| line.starts_with("Route:")));
     }
 
     #[tokio::test]
-    async fn register_updates_shared_state() {
-        let server = test_server();
+    async fn register_contact_can_be_rewritten_to_proxy_address() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream_config(upstream_socket.local_addr().unwrap(), true);
+
         server
             .handle_udp_packet(
                 &proxy_socket,
                 b"REGISTER sip:example.com SIP/2.0\r\n\
-Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK1\r\n\
-From: <sip:100@example.com>;tag=a\r\n\
-To: <sip:100@example.com>\r\n\
-Contact: <sip:100@127.0.0.1:5061>;expires=60\r\n\
-Call-ID: c1\r\n\
-CSeq: 1 REGISTER\r\n\r\n",
-                "127.0.0.1:5061".parse().unwrap(),
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-register-rewrite\r\n\
+From: \"wuly\" <sip:6805@example.com>;tag=a\r\n\
+To: \"wuly\" <sip:6805@example.com>\r\n\
+Contact: \"wuly\" <sip:6805@10.0.0.10:53109;ob>;expires=60\r\n\
+Call-ID: register-rewrite\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:53109".parse().unwrap(),
                 &test_listener(),
             )
             .await
             .unwrap();
 
-        let binding = server.state.lookup("sip:100@example.com").await.unwrap();
-        assert_eq!(binding.contact, "sip:100@127.0.0.1:5061");
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.contains("Contact: \"wuly\" <sip:6805@127.0.0.1:5060;ob>;expires=60"));
+        assert!(!forwarded.contains("Path:"));
+
+        let binding = server
+            .state
+            .lookup("sip:6805@127.0.0.1:5060;ob")
+            .await
+            .unwrap();
+        assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
+        let binding = server
+            .state
+            .lookup("sip:6805@127.0.0.1:5060")
+            .await
+            .unwrap();
+        assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
+        let binding = server.state.lookup("sip:6805@example.com").await.unwrap();
+        assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
     }
 
     #[tokio::test]
-    async fn metrics_records_local_and_forwarded_udp_requests() {
+    async fn register_path_mode_routes_proxy_contact_to_original_contact() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-register-path\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3000@example.com>\r\n\
+Contact: <sip:3000@{client_addr};ob>;expires=60\r\n\
+Call-ID: register-path\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut upstream_buf = [0_u8; 4096];
+        let _ = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+
+        let invite = b"INVITE sip:3000@127.0.0.1:5060;ob SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bK-upstream-invite\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3000@example.com>\r\n\
+Call-ID: inbound-through-proxy-contact\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3001@example.com>\r\n\
+Content-Length: 0\r\n\r\n";
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite,
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let forwarded = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3000@127.0.0.1:5060;ob SIP/2.0"));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+
+        let invite_without_ob = b"INVITE sip:3000@127.0.0.1:5060 SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5080;branch=z9hG4bK-upstream-invite-no-ob\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3000@example.com>\r\n\
+Call-ID: inbound-through-proxy-contact-no-ob\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3001@example.com>\r\n\
+Content-Length: 0\r\n\r\n";
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite_without_ob,
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let forwarded = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3000@127.0.0.1:5060 SIP/2.0"));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn upstream_request_uri_contact_routes_directly_to_client() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let packet = format!(
+            "INVITE sip:6805@{client_addr} SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP 18.162.106.21:5060;branch=z9hG4bK-upstream\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>\r\n\
+Call-ID: upstream-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:100@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with(&format!("INVITE sip:6805@{client_addr} SIP/2.0")));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn metrics_records_forwarded_udp_requests() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1568,15 +3343,27 @@ Content-Length: 0\r\n\r\n",
 
         let mut upstream_buf = [0_u8; 4096];
         let _ = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+        let _ = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
 
-        let metrics = server.metrics.render_prometheus();
+        let metrics = server.render_metrics().await;
         assert!(metrics.contains("sip_requests_total{transport=\"udp\",method=\"OPTIONS\"} 1"));
         assert!(metrics.contains("sip_requests_total{transport=\"udp\",method=\"MESSAGE\"} 1"));
-        assert!(metrics.contains("sip_local_responses_total{transport=\"udp\",code=\"200\"} 1"));
+        assert!(metrics.contains(
+            "proxy_forwarded_requests_total{downstream_transport=\"udp\",upstream_transport=\"udp\",method=\"OPTIONS\"} 1"
+        ));
         assert!(metrics.contains(
             "proxy_forwarded_requests_total{downstream_transport=\"udp\",upstream_transport=\"udp\",method=\"MESSAGE\"} 1"
         ));
-        assert!(metrics.contains("proxy_affinity_lookup_total{result=\"miss\"} 1"));
+        assert!(metrics.contains("proxy_affinity_lookup_total{result=\"miss\"} 2"));
+        assert!(metrics.contains("# TYPE proxy_udp_branch_routes gauge"));
+        assert!(metrics.contains("proxy_udp_branch_routes 2"));
+        assert!(metrics.contains("proxy_invite_transaction_routes 0"));
+        assert!(metrics.contains("proxy_affinity_bindings 2"));
+        assert!(metrics.contains("proxy_location_bindings 0"));
+        assert!(metrics.contains(&format!(
+            "proxy_upstream_healthy{{group=\"default\",server=\"{}\"}} 1",
+            upstream_socket.local_addr().unwrap()
+        )));
     }
 
     #[tokio::test]
@@ -1601,7 +3388,7 @@ Content-Length: 0\r\n\r\n",
             assert!(vias[0].contains(PROXY_BRANCH_PREFIX));
             assert!(vias[1].contains("z9hG4bK-client"));
 
-            for code in ["100 Trying", "180 Ringing"] {
+            for code in ["100 Trying", "180 Ringing", "200 OK", "200 OK"] {
                 let response = format!(
                     "SIP/2.0 {code}\r\n\
 {proxy_via}\r\n\
@@ -1637,7 +3424,7 @@ Content-Length: 0\r\n\r\n",
             .await
             .unwrap();
 
-        for code in ["100 Trying", "180 Ringing"] {
+        for code in ["100 Trying", "180 Ringing", "200 OK", "200 OK"] {
             let mut proxy_buf = [0_u8; 4096];
             let (len, upstream_peer) = proxy_socket.recv_from(&mut proxy_buf).await.unwrap();
             server
@@ -1652,6 +3439,94 @@ Content-Length: 0\r\n\r\n",
             assert!(!response.contains(PROXY_BRANCH_PREFIX));
             assert!(response.contains("z9hG4bK-client"));
         }
+
+        assert_eq!(server.active_udp_branch_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_to_tcp_upstream_streams_multiple_invite_responses() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = Arc::new(test_server_with_upstream(upstream_addr));
+        let listener = test_listener();
+
+        server
+            .state
+            .apply(ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:200@example.com".to_string(),
+                contact: format!("<sip:200@{upstream_addr};transport=tcp>"),
+                source: "127.0.0.1:5061".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await;
+
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut reader = TcpSipReader::new(4096);
+            let request = reader.read_message(&mut stream).await.unwrap().unwrap();
+            let request = String::from_utf8(request).unwrap();
+            let vias = request
+                .lines()
+                .filter(|line| line.starts_with("Via:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(vias.len(), 2);
+            assert!(vias[0].contains(PROXY_BRANCH_PREFIX));
+            assert!(vias[0].contains("SIP/2.0/TCP"));
+            assert!(vias[1].contains("z9hG4bK-client"));
+
+            for code in ["100 Trying", "180 Ringing", "200 OK"] {
+                let response = format!(
+                    "SIP/2.0 {code}\r\n\
+{proxy_via}\r\n\
+{client_via}\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>;tag=b\r\n\
+Call-ID: udp-tcp-call\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                    proxy_via = vias[0],
+                    client_via = vias[1],
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let proxy_task = {
+            let server = server.clone();
+            let proxy_socket = proxy_socket.clone();
+            tokio::spawn(async move {
+                server
+                    .handle_udp_packet(
+                        proxy_socket.as_ref(),
+                        b"INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-client\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: udp-tcp-call\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                        client_addr,
+                        &listener,
+                    )
+                    .await
+                    .unwrap();
+            })
+        };
+
+        for code in ["100 Trying", "180 Ringing", "200 OK"] {
+            let mut client_buf = [0_u8; 4096];
+            let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+            let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+            assert!(response.starts_with(&format!("SIP/2.0 {code}")));
+            assert!(!response.contains(PROXY_BRANCH_PREFIX));
+            assert!(response.contains("z9hG4bK-client"));
+        }
+
+        proxy_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -1698,6 +3573,77 @@ Content-Length: 0\r\n\r\n"
             timeout(
                 Duration::from_millis(100),
                 second_upstream.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn unhealthy_affinity_target_falls_back_to_healthy_upstream() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_upstream.local_addr().unwrap();
+        let second_addr = second_upstream.local_addr().unwrap();
+        let server = test_server_with_upstreams_and_affinity(
+            vec![first_addr, second_addr],
+            ProxyAffinityConfig {
+                enabled: true,
+                key: ProxyAffinityKey::CallId,
+                ttl_seconds: 3600,
+            },
+        );
+        server
+            .upstreams
+            .groups
+            .get("default")
+            .unwrap()
+            .set_health(0, false);
+        let request = SipMessage::parse(
+            b"MESSAGE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-affinity-unhealthy\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: stale-affinity\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        server
+            .affinity
+            .remember(
+                &request,
+                AffinityTarget {
+                    addr: first_addr,
+                    transport: SipTransport::Udp,
+                },
+            )
+            .await
+            .unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                &request.to_bytes(),
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        timeout(
+            Duration::from_millis(500),
+            second_upstream.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                first_upstream.recv_from(&mut buf)
             )
             .await
             .is_err()
@@ -1839,6 +3785,7 @@ Content-Length: 0\r\n\r\n",
         let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
         let invite = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(invite.contains("CSeq: 1 INVITE"));
+        let invite_via = top_via_line(&invite);
 
         server
             .handle_udp_packet(
@@ -1860,6 +3807,7 @@ Content-Length: 0\r\n\r\n",
         let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
         let cancel = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(cancel.contains("CSeq: 1 CANCEL"));
+        assert_eq!(top_via_line(&cancel), invite_via);
 
         assert!(
             timeout(
@@ -1909,6 +3857,7 @@ Content-Length: 0\r\n\r\n",
         let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
         let invite = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(invite.contains("CSeq: 1 INVITE"));
+        let invite_via = top_via_line(&invite);
 
         server
             .handle_udp_packet(
@@ -1930,6 +3879,7 @@ Content-Length: 0\r\n\r\n",
         let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
         let ack = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(ack.contains("CSeq: 1 ACK"));
+        assert_eq!(top_via_line(&ack), invite_via);
 
         assert!(
             timeout(
@@ -2068,21 +4018,15 @@ Content-Length: 0\r\n\r\n",
     async fn proxy_state_snapshot_restores_contacts_and_affinity() {
         let source = test_server_with_upstream("127.0.0.1:5080".parse().unwrap());
         let target = test_server_with_upstream("127.0.0.1:5080".parse().unwrap());
-        let register = SipMessage::parse(
-            b"REGISTER sip:example.com SIP/2.0\r\n\
-Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK1\r\n\
-From: <sip:100@example.com>;tag=a\r\n\
-To: <sip:100@example.com>\r\n\
-Contact: <sip:100@127.0.0.1:5061>;expires=60\r\n\
-Call-ID: c1\r\n\
-CSeq: 1 REGISTER\r\n\
-Content-Length: 0\r\n\r\n",
-        )
-        .unwrap();
         source
-            .handle_register(register, "127.0.0.1:5061".parse().unwrap())
-            .await
-            .unwrap();
+            .state
+            .apply(ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:100@example.com".to_string(),
+                contact: "<sip:100@127.0.0.1:5061>;expires=60".to_string(),
+                source: "127.0.0.1:5061".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await;
 
         let request = SipMessage::parse(
             b"MESSAGE sip:200@example.com SIP/2.0\r\n\
@@ -2129,15 +4073,212 @@ Content-Length: 0\r\n\r\n",
         assert_eq!(group.select().unwrap(), "127.0.0.1:5081".parse().unwrap());
     }
 
+    #[test]
+    fn upstream_group_applies_health_thresholds() {
+        let group = UpstreamGroupRuntime::new(&UpstreamGroupConfig {
+            name: "default".to_string(),
+            mode: UpstreamMode::RoundRobin,
+            health_check: UpstreamHealthCheckConfig {
+                enabled: true,
+                failure_threshold: 2,
+                success_threshold: 2,
+                ..UpstreamHealthCheckConfig::default()
+            },
+            servers: vec!["127.0.0.1:5080".to_string(), "127.0.0.1:5081".to_string()],
+        })
+        .unwrap();
+
+        group.record_health_result(0, false);
+        assert_eq!(group.select().unwrap(), "127.0.0.1:5080".parse().unwrap());
+        group.record_health_result(0, false);
+        assert_eq!(group.select().unwrap(), "127.0.0.1:5081".parse().unwrap());
+
+        group.record_health_result(0, true);
+        assert_eq!(group.select().unwrap(), "127.0.0.1:5081".parse().unwrap());
+        group.record_health_result(0, true);
+        assert_eq!(group.select().unwrap(), "127.0.0.1:5080".parse().unwrap());
+    }
+
+    #[test]
+    fn passive_health_feedback_is_ignored_when_health_check_disabled() {
+        let group = UpstreamGroupRuntime::new(&UpstreamGroupConfig {
+            name: "default".to_string(),
+            mode: UpstreamMode::RoundRobin,
+            health_check: UpstreamHealthCheckConfig {
+                enabled: false,
+                failure_threshold: 1,
+                ..UpstreamHealthCheckConfig::default()
+            },
+            servers: vec!["127.0.0.1:5080".to_string(), "127.0.0.1:5081".to_string()],
+        })
+        .unwrap();
+
+        group.record_passive_result("127.0.0.1:5080".parse().unwrap(), false);
+
+        assert_eq!(group.select().unwrap(), "127.0.0.1:5080".parse().unwrap());
+    }
+
+    #[test]
+    fn health_options_reuses_call_id_per_backend() {
+        let server = "127.0.0.1:5080".parse().unwrap();
+        let sent_by = "127.0.0.1:5099".parse().unwrap();
+        let first_request = build_health_options_request(
+            server,
+            "sip:healthcheck@example.com",
+            SipTransport::Udp,
+            sent_by,
+        )
+        .unwrap();
+        let second_request = build_health_options_request(
+            server,
+            "sip:healthcheck@example.com",
+            SipTransport::Udp,
+            sent_by,
+        )
+        .unwrap();
+        let first = SipMessage::parse(&first_request.packet).unwrap();
+        let second = SipMessage::parse(&second_request.packet).unwrap();
+
+        assert_eq!(first.header("call-id"), second.header("call-id"));
+        let call_id = first.header("call-id").unwrap();
+        assert!(call_id.ends_with("@sipproxy-rs"));
+        assert_uuid_like(&call_id[..call_id.len() - "@sipproxy-rs".len()]);
+        assert_ne!(first.header("cseq"), second.header("cseq"));
+        assert_ne!(
+            first.top_via_branch().unwrap(),
+            second.top_via_branch().unwrap()
+        );
+    }
+
+    fn assert_uuid_like(value: &str) {
+        assert_eq!(value.len(), 36);
+        for index in [8, 13, 18, 23] {
+            assert_eq!(value.as_bytes()[index], b'-');
+        }
+        assert!(
+            value
+                .chars()
+                .enumerate()
+                .all(|(index, ch)| [8, 13, 18, 23].contains(&index) || ch.is_ascii_hexdigit())
+        );
+    }
+
+    fn top_via_line(message: &str) -> &str {
+        message
+            .lines()
+            .find(|line| line.starts_with("Via:"))
+            .unwrap()
+    }
+
+    fn header_lines<'a>(message: &'a str, name: &str) -> Vec<&'a str> {
+        let prefix = format!("{name}:");
+        message
+            .lines()
+            .filter(|line| line.starts_with(&prefix))
+            .collect()
+    }
+
+    #[test]
+    fn advertised_addr_auto_detection_only_replaces_local_bindings() {
+        assert!(advertised_addr_needs_auto("127.0.0.1:5060"));
+        assert!(advertised_addr_needs_auto("0.0.0.0:5060"));
+        assert!(advertised_addr_needs_auto("[::]:5060"));
+        assert!(!advertised_addr_needs_auto("198.51.100.10:5060"));
+        assert!(!advertised_addr_needs_auto("sip.example.com:5060"));
+    }
+
+    #[test]
+    fn udp_keepalive_and_stun_packets_are_classified() {
+        assert!(is_crlf_keepalive(b""));
+        assert!(is_crlf_keepalive(b"\r\n\r\n"));
+        assert!(!is_crlf_keepalive(b"REGISTER sip:example.com SIP/2.0\r\n"));
+
+        let mut request = Vec::new();
+        request.extend_from_slice(&0x0001_u16.to_be_bytes());
+        request.extend_from_slice(&0_u16.to_be_bytes());
+        request.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        request.extend_from_slice(b"abcdefghijkl");
+
+        let peer = "127.0.0.1:62607".parse().unwrap();
+        let response = stun_binding_success_response(&request, peer).unwrap();
+        assert_eq!(&response[0..2], &0x0101_u16.to_be_bytes());
+        assert_eq!(&response[2..4], &12_u16.to_be_bytes());
+        assert_eq!(&response[4..8], &STUN_MAGIC_COOKIE.to_be_bytes());
+        assert_eq!(&response[8..20], b"abcdefghijkl");
+        assert_eq!(&response[20..22], &0x0020_u16.to_be_bytes());
+    }
+
     #[tokio::test]
-    async fn health_probe_marks_parseable_non_5xx_response_healthy() {
+    async fn public_addr_can_be_discovered_with_stun() {
+        let stun = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stun_addr = stun.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0_u8; 1500];
+            let (len, peer) = stun.recv_from(&mut buf).await.unwrap();
+            let response = stun_binding_success_response(&buf[..len], peer).unwrap();
+            stun.send_to(&response, peer).await.unwrap();
+        });
+
+        let ip = discover_public_ip(&stun_addr.to_string()).await.unwrap();
+
+        assert_eq!(ip, IpAddr::from([127, 0, 0, 1]));
+    }
+
+    #[tokio::test]
+    async fn udp_health_probe_reuses_local_socket() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let server_peers = peers.clone();
+        tokio::spawn(async move {
+            let mut buf = [0; 4096];
+            for _ in 0..2 {
+                let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+                server_peers.lock().await.push(peer);
+                let request = String::from_utf8(buf[..len].to_vec()).unwrap();
+                let via = request
+                    .lines()
+                    .find(|line| line.starts_with("Via:"))
+                    .unwrap();
+                let response = format!("SIP/2.0 200 OK\r\n{via}\r\nContent-Length: 0\r\n\r\n");
+                upstream.send_to(response.as_bytes(), peer).await.unwrap();
+            }
+        });
+
+        let socket = Arc::new(bind_health_probe_udp_socket(upstream_addr).await.unwrap());
+        for _ in 0..2 {
+            assert!(
+                probe_sip_options(
+                    upstream_addr,
+                    SipTransport::Udp,
+                    "sip:healthcheck@localhost",
+                    Duration::from_millis(500),
+                    &[200],
+                    Some(socket.clone()),
+                    None,
+                )
+                .await
+                .healthy
+            );
+        }
+
+        let peers = peers.lock().await;
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0], peers[1]);
+    }
+
+    #[tokio::test]
+    async fn health_probe_uses_configured_success_codes() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         tokio::spawn(async move {
             let mut buf = [0; 2048];
             let (_, peer) = socket.recv_from(&mut buf).await.unwrap();
             socket
-                .send_to(b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n", peer)
+                .send_to(
+                    b"SIP/2.0 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                    peer,
+                )
                 .await
                 .unwrap();
         });
@@ -2147,10 +4288,113 @@ Content-Length: 0\r\n\r\n",
                 addr,
                 SipTransport::Udp,
                 "sip:healthcheck@localhost",
-                Duration::from_millis(500)
+                Duration::from_millis(500),
+                &[200, 405],
+                Some(Arc::new(bind_health_probe_udp_socket(addr).await.unwrap())),
+                None,
             )
             .await
+            .healthy
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_health_probe_reuses_connection() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let server_peers = peers.clone();
+        tokio::spawn(async move {
+            let (mut stream, peer) = upstream.accept().await.unwrap();
+            server_peers.lock().await.push(peer);
+            let mut reader = TcpSipReader::new(4096);
+            for _ in 0..2 {
+                let request = reader.read_message(&mut stream).await.unwrap().unwrap();
+                let request = String::from_utf8(request).unwrap();
+                let via = request
+                    .lines()
+                    .find(|line| line.starts_with("Via:"))
+                    .unwrap();
+                let response = format!("SIP/2.0 200 OK\r\n{via}\r\nContent-Length: 0\r\n\r\n");
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let stream_slot = Arc::new(Mutex::new(None));
+        for _ in 0..2 {
+            assert!(
+                probe_sip_options(
+                    upstream_addr,
+                    SipTransport::Tcp,
+                    "sip:healthcheck@localhost",
+                    Duration::from_millis(500),
+                    &[200],
+                    None,
+                    Some(stream_slot.clone()),
+                )
+                .await
+                .healthy
+            );
+        }
+
+        let peers = peers.lock().await;
+        assert_eq!(peers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_connect_health_probe_marks_open_port_healthy() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+        });
+
+        assert!(
+            probe_tcp_connect(addr, Duration::from_millis(500))
+                .await
+                .healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_runs_before_first_interval() {
+        let unavailable = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let group = Arc::new(
+            UpstreamGroupRuntime::new(&UpstreamGroupConfig {
+                name: "default".to_string(),
+                mode: UpstreamMode::RoundRobin,
+                health_check: UpstreamHealthCheckConfig {
+                    enabled: true,
+                    interval_ms: 60_000,
+                    timeout_ms: 100,
+                    failure_threshold: 1,
+                    probe: UpstreamHealthProbeConfig::TcpConnect,
+                    ..UpstreamHealthCheckConfig::default()
+                },
+                servers: vec![unavailable.to_string()],
+            })
+            .unwrap(),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_health_checks(group.clone(), shutdown_rx));
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !group.health_snapshots()[0].healthy {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
     }
 
     #[test]
@@ -2386,6 +4630,79 @@ Content-Length: 0\r\n\r\n",
             assert!(response.starts_with(&format!("SIP/2.0 {code}")));
             assert!(!response.contains(PROXY_BRANCH_PREFIX));
             assert!(response.contains("z9hG4bK-client"));
+        }
+
+        drop(client);
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_proxy_keeps_branch_until_final_response_for_non_invite() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let server = Arc::new(test_server_with_upstream(upstream_addr));
+        let listener = test_tcp_listener();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut reader = TcpSipReader::new(4096);
+            let request = reader.read_message(&mut stream).await.unwrap().unwrap();
+            let request = String::from_utf8(request).unwrap();
+            let vias = request
+                .lines()
+                .filter(|line| line.starts_with("Via:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(vias.len(), 2);
+
+            for code in ["100 Trying", "200 OK"] {
+                let response = format!(
+                    "SIP/2.0 {code}\r\n\
+{proxy_via}\r\n\
+{client_via}\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>;tag=b\r\n\
+Call-ID: non-invite-1xx\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Length: 0\r\n\r\n",
+                    proxy_via = vias[0],
+                    client_via = vias[1],
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let client_task = tokio::spawn(async move {
+            let (stream, peer) = client_listener.accept().await.unwrap();
+            server
+                .handle_tcp_client(stream, peer, listener)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(client_addr).await.unwrap();
+        client
+            .write_all(
+                b"MESSAGE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 127.0.0.1:5061;branch=z9hG4bK-client-message\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: non-invite-1xx\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut reader = TcpSipReader::new(4096);
+        for code in ["100 Trying", "200 OK"] {
+            let response = reader.read_message(&mut client).await.unwrap().unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with(&format!("SIP/2.0 {code}")));
+            assert!(!response.contains(PROXY_BRANCH_PREFIX));
+            assert!(response.contains("z9hG4bK-client-message"));
         }
 
         drop(client);

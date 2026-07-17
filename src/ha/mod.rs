@@ -23,7 +23,6 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct HaContext {
     pub node_id: NodeId,
-    pub advertise_addr: String,
     pub role: ClusterRole,
 }
 
@@ -31,7 +30,6 @@ impl HaContext {
     pub fn from_node(node: &NodeConfig, role: ClusterRole) -> Self {
         Self {
             node_id: node.id,
-            advertise_addr: node.advertise_addr.clone(),
             role,
         }
     }
@@ -600,10 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn observes_leader_promotion_and_step_down() {
-        let node = NodeConfig {
-            id: 1,
-            advertise_addr: "127.0.0.1".to_string(),
-        };
+        let node = NodeConfig { id: 1 };
         let addon = Arc::new(RecordingAddon::default());
         let addon_ref: HaAddonRef = addon.clone();
         let mut state = HaMonitorState::default();
@@ -668,11 +663,9 @@ mod tests {
         let replicator: Arc<dyn ClusterReplicator> = Arc::new(FixedRoleReplicator {
             role: ClusterRole::Follower,
         });
-        let server = Arc::new(ProxyServer::new(
-            Config::default(),
-            state.clone(),
-            replicator.clone(),
-        ));
+        let server = Arc::new(
+            ProxyServer::new(Config::default(), state.clone(), replicator.clone()).unwrap(),
+        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let pull_task = tokio::spawn(run_snapshot_pull(
             HaReplicationConfig {
@@ -789,7 +782,6 @@ async fn run_hook(command: &str, ctx: &HaContext, limit: Duration) -> Result<()>
         .arg("-c")
         .arg(command)
         .env("SIGPROXY_NODE_ID", ctx.node_id.to_string())
-        .env("SIGPROXY_ADVERTISE_ADDR", &ctx.advertise_addr)
         .env("SIGPROXY_ROLE", format!("{:?}", ctx.role));
 
     let output = timeout(limit, child.output())

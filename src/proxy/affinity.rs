@@ -129,9 +129,15 @@ impl AffinityTable {
         *self.bindings.lock().await = bindings;
     }
 
+    pub async fn active_len(&self) -> usize {
+        let mut bindings = self.bindings.lock().await;
+        prune_affinity(&mut bindings, Instant::now());
+        bindings.len()
+    }
+
     #[cfg(test)]
     async fn len(&self) -> usize {
-        self.bindings.lock().await.len()
+        self.active_len().await
     }
 }
 
@@ -168,8 +174,18 @@ fn dialog_key(message: &SipMessage) -> Result<Option<AffinityKey>> {
         .as_request()
         .context("dialog affinity key requires a SIP request")?;
     let call_id = request.call_id_header()?.value().trim();
-    let from = rsipstack::sip::typed::From::parse(request.from_header()?.value())?;
-    let to = rsipstack::sip::typed::To::parse(request.to_header()?.value())?;
+    let Ok(from_header) = request.from_header() else {
+        return Ok(None);
+    };
+    let Ok(to_header) = request.to_header() else {
+        return Ok(None);
+    };
+    let Ok(from) = rsipstack::sip::typed::From::parse(from_header.value()) else {
+        return Ok(None);
+    };
+    let Ok(to) = rsipstack::sip::typed::To::parse(to_header.value()) else {
+        return Ok(None);
+    };
     let Some(from_tag) = from.tag() else {
         return Ok(None);
     };

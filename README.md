@@ -17,8 +17,10 @@ Implemented mainline behavior:
 - Static route overrides by listener, domain, and URI prefix.
 - SIP-aware affinity / session persistence by `dialog-id`, `call-id`, or
   `request-uri`.
-- REGISTER handling with an in-memory location registry.
-- Upstream health checks using SIP `OPTIONS`.
+- Transparent forwarding for SIP requests including REGISTER and OPTIONS.
+- Upstream health checks using SIP `OPTIONS` or TCP connect probes.
+- UDP SIP port compatibility for softphone STUN Binding Requests and CRLF
+  keepalives.
 - Stateless forwarding with proxy `Via` insertion and response `Via` removal.
 - UDP response routing through a stable listener socket.
 - TCP downstream framing and upstream connection reuse.
@@ -36,11 +38,12 @@ Out of current mainline scope:
 - RTP / media proxy.
 - Full SIP transaction state machine.
 - Full SIP dialog ownership.
-- Raft or active-standby HA as a production main path.
-- EIP / VIP floating endpoint control.
+- Active-active multi-writer clustering.
+- Built-in cloud EIP / VIP provider integrations.
 
-HA and Raft-related modules may exist in the tree as future addon boundaries,
-but the current deliverable is the stateless SIP-aware proxy.
+Active-standby HA and snapshot replication are available as optional deployment
+building blocks. Floating endpoint movement is delegated to the configured HA
+addon hook.
 
 ## Quick Start
 
@@ -77,14 +80,18 @@ to an upstream group.
 ```toml
 [node]
 id = 1
-advertise_addr = "127.0.0.1"
 
 [sip]
-external_addr = "sip.example.com:5060"
+public_addr = "95.40.96.117"
+internal_addr = "172.30.0.101"
+public_stun_server = ""
+internal_probe_addr = "8.8.8.8:53"
 max_message_bytes = 65535
 
 [proxy]
 record_route = true
+# Rewrite REGISTER Contact to the proxy address for NAT/public-upstream tests.
+rewrite_register_contact = false
 
 [proxy.socket]
 reuse_port = false
@@ -109,10 +116,16 @@ servers = ["127.0.0.1:5080", "127.0.0.1:5081"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-transport = "udp"
 interval_ms = 5000
 timeout_ms = 1000
-options_uri = "sip:healthcheck@pbx-a"
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@pbx-a"
+success_codes = [200, 202, 405, 481]
 
 [[proxy.listeners]]
 bind = "0.0.0.0:5060"
@@ -123,11 +136,6 @@ upstream_group = "pbx-a"
 bind = "0.0.0.0:5060"
 transport = "tcp"
 upstream_group = "pbx-a"
-
-[cluster]
-mode = "standalone"
-bind_addr = "127.0.0.1:7000"
-data_dir = "./data/node-1"
 
 [ha]
 leader_check_interval_ms = 1000
@@ -142,7 +150,93 @@ enabled = false
 type = "noop"
 ```
 
+Use `public_addr` for the address public SIP clients can reach, and
+`internal_addr` for the address upstream PBX servers can reach. `Via` and
+`Path` use the address for the next hop. Dialog-forming requests crossing
+between public and internal sides get two `Record-Route` headers so each side
+keeps a reachable route.
+
+`public_addr` and `internal_addr` may be just a host/IP; when the port is
+omitted, sigproxy uses the port from the matching SIP listener.
+
+If `internal_addr` is empty or omitted, sigproxy probes `internal_probe_addr`
+with a UDP socket and advertises that local address. If `public_addr` is empty
+or omitted, set `public_stun_server` so sigproxy can discover the public IP with
+STUN; the advertised port still comes from the SIP listener.
+
+`external_addr` is still accepted as a legacy single advertised address and is
+used as a fallback when `public_addr` or `internal_addr` is not set. When no
+usable advertised address is set, or it is loopback/unspecified such as
+`127.0.0.1:5060` or `0.0.0.0:5060`, the proxy derives an upstream-facing local
+address automatically.
+
 Use `examples/single-node.toml` for a fuller local example.
+
+Configuration files support environment placeholders before TOML parsing:
+`${VAR}`, `$VAR`, and `${VAR:-default}`. Keep quotes around values that expand
+to TOML strings, for example `public_addr = "${SIP_PUBLIC_ADDR}"`.
+
+## Examples
+
+The repository keeps only the main deployment shapes:
+
+- `examples/single-node.toml`: local single-node stateless SIP-aware proxy.
+- `examples/active-standby-node1.toml`: two-node active-standby, node 1 starts active.
+- `examples/active-standby-node2.toml`: two-node active-standby, node 2 starts standby.
+
+For a commented template that lists every supported configuration field, see
+`docs/config-template.toml`.
+
+The active-standby examples use the `noop` HA addon, so they do not move SIP
+traffic by themselves. Production active-standby deployments still need a
+VIP/EIP/LB hook or equivalent traffic steering so only the active node receives
+client SIP traffic.
+
+## Upstream Health Checks
+
+Health checks are configured per upstream group. The default active mode is
+`options`, which sends SIP `OPTIONS` and treats configured SIP response codes as
+successful. `tcp-connect` is also available for lightweight TCP port checks.
+
+```toml
+[proxy.upstream_groups.health_check]
+enabled = true
+interval_ms = 5000
+timeout_ms = 1000
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@pbx-a"
+success_codes = [200, 202, 405, 481]
+```
+
+`OPTIONS` is useful because it checks the SIP application path, but it still
+does not prove that all real call flows are healthy. When health checks are
+enabled, the proxy also applies passive health feedback from real forwarding:
+upstream send/connect failures and `5xx` responses count as failures; non-`5xx`
+upstream responses count as successes.
+
+The first active probe runs immediately when the proxy starts. Servers in the
+same group are probed concurrently, and each OPTIONS Via uses the probe
+socket's actual local address with `rport` so standards-compliant upstreams can
+return the response to the correct socket.
+
+For TCP-only upstream groups, a lightweight check can be expressed as:
+
+```toml
+[proxy.upstream_groups.health_check]
+enabled = true
+interval_ms = 5000
+timeout_ms = 1000
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "tcp-connect"
+```
 
 ## Routing Model
 
@@ -199,14 +293,11 @@ The proxy also records a lightweight INVITE transaction route:
 This improves SIP-aware session persistence without turning the proxy into a
 stateful SIP transaction proxy.
 
-## REGISTER / Location
+## REGISTER / OPTIONS
 
-`REGISTER` is handled locally:
-
-- The AOR is extracted from `To`, falling back to `From`.
-- `Contact` and `expires` are parsed through `rsipstack` typed APIs.
-- The location registry is stored in memory.
-- Requests to a registered AOR may be routed to that registered contact.
+`REGISTER` and downstream `OPTIONS` requests are forwarded to the selected
+upstream like other SIP requests. The proxy does not act as a registrar or
+local OPTIONS responder on the normal signaling path.
 
 ## Response Path
 
@@ -220,8 +311,9 @@ For forwarded requests, the proxy:
 6. Sends the response back to the original client side.
 
 INVITE responses may include multiple provisional responses before a final
-response. UDP uses a stable socket for upstream responses; TCP uses message
-framing and upstream connection reuse.
+response. UDP uses a stable socket for UDP upstream responses; TCP upstream
+responses are dispatched by proxy branch through the reused upstream connection,
+including UDP client to TCP upstream forwarding.
 
 ## Metrics
 
@@ -240,7 +332,10 @@ curl http://127.0.0.1:9100/metrics
 ```
 
 Current counters cover SIP requests, local responses, upstream responses,
-forwarded requests, forwarding errors, and affinity lookups.
+forwarded requests, forwarding errors, and affinity lookups. Runtime gauges
+cover UDP branch routes, TCP upstream connections, TCP branch routes, INVITE
+transaction routes, affinity bindings, location bindings, and per-upstream
+health state with consecutive success/failure counters.
 
 ## Benchmark
 
@@ -266,7 +361,7 @@ cargo test
 
 The project currently has focused unit tests for configuration validation, SIP
 message wrapping, registry parsing, affinity, routing, proxy forwarding, TCP
-framing, metrics, and selected HA/Raft boundary modules.
+framing, metrics, and selected active-standby HA boundary modules.
 
 ## Design Notes
 

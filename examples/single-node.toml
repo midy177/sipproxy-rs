@@ -2,14 +2,21 @@
 
 [node]
 id = 1
-advertise_addr = "127.0.0.1"
 
 [sip]
-external_addr = "127.0.0.1:5060"
+# Address advertised to public SIP clients.
+public_addr = "${PUBLIC_IP:-95.40.96.117}"
+# Address advertised to upstream PBX servers on the private network.
+internal_addr = "${POD_IP:-172.30.0.101}"
+# Used only when public_addr is empty/unset.
+public_stun_server = "${PUBLIC_STUN_SERVER:-}"
+# Used only when internal_addr is empty/unset.
+internal_probe_addr = "${INTERNAL_PROBE_ADDR:-8.8.8.8:53}"
 max_message_bytes = 65535
 
 [proxy]
 record_route = true
+rewrite_register_contact = false
 
 [proxy.socket]
 reuse_port = false
@@ -30,29 +37,30 @@ ttl_seconds = 3600
 [[proxy.upstream_groups]]
 name = "default"
 mode = "round-robin"
-servers = ["127.0.0.1:5080"]
+servers = ["172.30.0.60:5060", "172.30.10.30:5060"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-transport = "udp"
 interval_ms = 5000
-timeout_ms = 1000
-options_uri = "sip:healthcheck@127.0.0.1"
+timeout_ms = 2000
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@${POD_IP:-172.30.0.101}"
+success_codes = [200, 202, 405, 481]
 
 [[proxy.listeners]]
-bind = "127.0.0.1:5060"
+bind = "0.0.0.0:5060"
 transport = "udp"
 upstream_group = "default"
 
-[[proxy.listeners]]
-bind = "127.0.0.1:5060"
-transport = "tcp"
-upstream_group = "default"
-
-[cluster]
-mode = "standalone"
-bind_addr = "127.0.0.1:7000"
-data_dir = "./data/node-1"
+# [[proxy.listeners]]
+# bind = "0.0.0.0:5060"
+# transport = "tcp"
+# upstream_group = "default"
 
 [ha]
 leader_check_interval_ms = 1000

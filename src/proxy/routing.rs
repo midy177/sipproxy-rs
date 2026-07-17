@@ -1,5 +1,6 @@
 use crate::config::{ProxyConfig, RouteConfig};
 use anyhow::Result;
+use rsipstack::sip::Uri;
 
 #[derive(Debug, Clone)]
 pub struct SelectedRoute {
@@ -52,7 +53,7 @@ impl RouteEntry {
         let domain_match = self
             .domain
             .as_ref()
-            .is_none_or(|domain| uri.contains(domain));
+            .is_none_or(|domain| uri_host_matches(uri, domain));
         let prefix_match = self
             .prefix
             .as_ref()
@@ -65,6 +66,13 @@ impl RouteEntry {
             + usize::from(self.domain.is_some())
             + usize::from(self.prefix.is_some())
     }
+}
+
+fn uri_host_matches(uri: &str, domain: &str) -> bool {
+    let Ok(uri) = uri.parse::<Uri>() else {
+        return false;
+    };
+    uri.host().to_string().eq_ignore_ascii_case(domain)
 }
 
 impl TryFrom<&RouteConfig> for RouteEntry {
@@ -89,6 +97,7 @@ mod tests {
     fn route_selection_prefers_matching_domain_and_prefix() {
         let table = RouteTable::new(&ProxyConfig {
             record_route: true,
+            rewrite_register_contact: false,
             socket: Default::default(),
             metrics: Default::default(),
             affinity: Default::default(),
@@ -113,6 +122,19 @@ mod tests {
         assert!(
             table
                 .select("udp/127.0.0.1:5080", "sip:100@tenant-a.example.com")
+                .is_none()
+        );
+        assert!(
+            table
+                .select(
+                    "udp/127.0.0.1:5060",
+                    "sip:100@tenant-a.example.com.evil.test"
+                )
+                .is_none()
+        );
+        assert!(
+            table
+                .select("udp/127.0.0.1:5060", "sip:tenant-a.example.com@evil.test")
                 .is_none()
         );
     }

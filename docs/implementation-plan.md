@@ -16,7 +16,7 @@
 - 不做完整 PBX。
 - 不做 B2BUA。
 - 不默认维护 SIP transaction。
-- 当前范围不做 HA 选主和漂移。
+- 高可用只保留最简单的 active-standby，可选启用。
 
 ## 目标
 
@@ -26,6 +26,7 @@
 4. 支持 REGISTER/location 状态维护，用于 AOR 亲和和后续路由。
 5. 支持 INVITE/ACK/BYE/CANCEL/OPTIONS/MESSAGE 等常见 SIP 方法转发，并让相关消息尽量命中同一 upstream。
 6. 使用 `clap` 提供子命令式配置、校验和启动入口。
+7. 支持可选 active-standby：心跳判活、角色切换、snapshot/pull 状态同步，以及 VIP/EIP hook 边界。
 
 ## 非目标
 
@@ -35,16 +36,12 @@
 - 完整 B2BUA。
 - RTP/media proxy。
 - IVR、坐席、录音、计费等业务能力。
-- Raft 选主。
-- active-standby 高可用漂移。
-- floating endpoint / EIP / VIP 绑定。
-- active 到 standby 状态同步。
-- 三节点 witness 架构。
+- active-active 多写集群。
+- 内置云厂商 EIP/VIP API 实现。
 - 默认主路径不维护完整 SIP transaction。
 - 默认主路径不使用完整 `rsipstack::dialog`。
-- 云厂商 EIP API 的具体内置实现。
 
-这些能力后续可以通过 addon 或独立模块扩展。
+云厂商 EIP、内网 VIP、LB target 切换等入口漂移通过 HA addon hook 扩展。
 
 ## 架构
 
@@ -111,9 +108,9 @@
 
 ### `ha`
 
-HA 相关代码保留为后续可选能力，不属于当前 stateless SIP-aware proxy 主线。
+HA 是可选部署能力，不改变 stateless SIP-aware proxy 主路径。
 
-后续如果恢复 HA 范围，再考虑：
+当前 active-standby 范围：
 
 - 节点角色状态机。
 - 心跳收发。
@@ -134,16 +131,16 @@ floating endpoint 不限定实现，可以是：
 
 ### `replication`
 
-状态同步不属于当前 stateless SIP-aware proxy 主线。
+状态同步属于 active-standby 可选能力，不参与单节点主路径。
 
-后续如果恢复 HA 范围，再考虑同步：
+当前同步对象：
 
 - REGISTER location。
 - affinity binding。
 - epoch。
 - active 节点元信息。
 
-后续可扩展：
+后续可增强：
 
 - WAL-like append log。
 - snapshot checksum。
@@ -280,16 +277,15 @@ CANCEL / ACK / BYE / re-INVITE / UPDATE：
 
 ## HA / Replication
 
-当前范围只做 stateless SIP-aware proxy，不继续实现或扩展 HA、Raft、active-standby、floating endpoint 和状态复制。
-
-已存在的 HA 相关代码暂时保留，但不作为当前交付验收项。
+当前范围只做 stateless SIP-aware proxy 和最简单的 active-standby 边界：
+心跳/优先级决定 active，状态通过轻量 snapshot/pull 同步，floating endpoint
+由 addon hook 对接 VIP/EIP/LB target 等外部入口资源。
 
 ## 配置样例
 
 ```toml
 [node]
 id = 1
-advertise_addr = "10.0.0.11"
 
 [sip]
 external_addr = "sip.example.com:5060"
@@ -297,6 +293,7 @@ max_message_bytes = 65535
 
 [proxy]
 record_route = true
+rewrite_register_contact = false
 
 [proxy.socket]
 reuse_port = false
@@ -321,10 +318,16 @@ servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-transport = "udp"
 interval_ms = 5000
 timeout_ms = 1000
-options_uri = "sip:healthcheck@pbx-a"
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@pbx-a"
+success_codes = [200, 202, 405, 481]
 
 [[proxy.listeners]]
 bind = "0.0.0.0:5060"
@@ -400,17 +403,22 @@ upstream_group = "pbx-a"
 - 缺失 `Max-Forwards` 时补 `70`。
 - 关闭 affinity 时，CANCEL 仍能命中原 INVITE upstream。
 
-### 阶段 4：状态复制
+### 阶段 4：Active-standby 状态同步
 
-当前范围不做状态复制。以下内容仅作为未来恢复 HA 范围时的候选项：
+当前实现使用 standby 定期拉取 active snapshot 的方式同步轻量路由状态：
 
-- active -> standby 增量事件：
-  - RegisterContact
-  - UnregisterContact
-  - UpsertAffinity
-  - RemoveAffinity
-  - ExpireAffinity
 - standby 拉取 active snapshot。
+- 同步 REGISTER location。
+- 同步 affinity binding。
+- 同步 active 节点角色元信息。
+
+后续如需要更低延迟，可增加增量事件：
+
+- RegisterContact。
+- UnregisterContact。
+- UpsertAffinity。
+- RemoveAffinity。
+- ExpireAffinity。
 - snapshot checksum。
 - 本地内存状态恢复。
 
@@ -437,8 +445,32 @@ upstream_group = "pbx-a"
 
 ## 当前优先级
 
-1. 继续减少手写 SIP 解析，优先复用 `rsipstack` typed header/URI 能力。
-2. 保持 HA/Raft 为非当前主线能力，不继续扩展。
+1. 修复 code review 已确认的主线正确性问题。
+2. 继续减少手写 SIP 解析，优先复用 `rsipstack` typed header/URI 能力。
+3. 保持 active-standby 为可选能力；生产启用前必须先修复 fencing 与 hook 监督问题。
+
+### Code Review 修复计划
+
+主线必修：
+
+- 路由 `domain` 匹配改为解析 Request-URI host 后精确匹配，避免 `contains()` 导致跨租户误命中。
+- proxy branch id 改为进程内原子唯一生成，不再依赖系统时间纳秒。
+- UDP listener 对单次 `recv_from` 错误记录后继续运行，避免瞬时 IO 错误拖死 listener。
+- app 主循环监督 `server`、HA replication、active-standby、leader monitor 子任务，任一任务异常退出时触发整体 shutdown，避免进程假活。
+- UDP downstream -> TCP upstream 的响应等待放入后台任务，UDP 收包循环不能被长 INVITE 阻塞。
+- TCP upstream 响应等待区分 INVITE 与非 INVITE：INVITE 使用更长 pending timeout，收到 provisional 后继续等待 final；响应超时或 channel closed 计入 passive health failure。
+- UDP branch route 插入后若发送失败必须回滚；非 INVITE 或 final response 命中后删除 branch，INVITE provisional 继续保留。
+- affinity 命中后需要校验目标 upstream 健康；不健康则 fallback 到 upstream group 重新选择。affinity 记录推迟到请求成功送出后。
+
+已确认不按 review 误报修复：
+
+- CANCEL 和非 2xx ACK 按 SIP transaction 规则通常复用原 INVITE 的 top Via branch，当前 lightweight transaction key 包含 branch 是合理的。2xx ACK 走 dialog/affinity 路径，不应强行复用 INVITE transaction key。
+
+Active-standby 生产启用前必修：
+
+- HA command hook 用作 VIP/EIP fencing 时，promotion 不能在 hook 失败后继续宣称 active。
+- HA hook 超时需要确保子进程被终止。
+- 配置校验需要在 `active_standby.enabled`、`replication.enabled` 下强制校验必要 peer 字段。
 
 ## 当前执行状态
 
@@ -450,10 +482,11 @@ upstream_group = "pbx-a"
 - `rsipstack::sip` 已引入，SIP message parser/serializer 已迁移到薄封装。
 - REGISTER AOR/Contact/Expires 解析已使用 `rsipstack` typed header/URI API。
 - UDP/TCP SIP listener 骨架。
-- OPTIONS 本地 `200 OK` 响应。
-- REGISTER 解析和 location 写入。
+- OPTIONS 进入普通转发路径。
+- REGISTER 进入普通转发路径，不在 proxy 本地 registrar 中直接应答。
 - 静态 upstream 路由匹配。
-- upstream group 后端健康检查。
+- upstream group 后端健康检查已支持 `options`、`tcp-connect`、成功码、连续成功/失败阈值和真实转发 passive feedback。
+- 主动健康检查启动后立即执行，同组后端并发探测；OPTIONS 使用 rsipstack typed API 构造并携带实际探测 socket Via 和 `rport`。
 - 上游 UDP/TCP 转发。
 - UDP/TCP 响应路径已按 proxy Via branch 校验并移除 proxy Via。
 - TCP upstream 已支持按后端地址复用长连接。
@@ -467,10 +500,14 @@ upstream_group = "pbx-a"
 - INVITE lightweight transaction route 已支持 CANCEL/ACK 命中原 INVITE upstream。
 - Record-Route 已收窄到 dialog-forming 请求。
 - ACK/CANCEL/BYE/re-INVITE/UPDATE 方法级测试已补充。
-- proxy metrics 已支持 `/metrics` Prometheus text format，覆盖请求、本地响应、上游响应、转发、转发错误和 affinity lookup。
+- proxy metrics 已支持 `/metrics` Prometheus text format，覆盖请求、本地响应、上游响应、转发、转发错误、affinity lookup，以及 UDP/TCP branch route、INVITE transaction route、TCP upstream connection、affinity binding、location binding 等实时 gauge。
 - SIP 压测脚本已支持 UDP OPTIONS、REGISTER、INVITE 和 mock upstream，输出 RPS 与 p50/p95/p99 延迟。
+- upstream 健康检查已支持 OPTIONS 与 TCP connect 两种 probe，支持阈值、可配置成功状态码、被动失败反馈、首轮立即探测和组内并发探测；OPTIONS 请求构造使用 `rsipstack` typed Request/Header/Uri/Via API。
+- UDP downstream 转 TCP upstream 已改为复用 TCP upstream 长连接池，按 proxy branch 分发多个 INVITE provisional/final response，并确保 proxy Via transport 使用实际 upstream transport。
+- code review 主线修复已完成：路由 domain 精确 host 匹配、原子唯一 proxy branch、UDP 收包循环后台处理、listener 瞬时 IO 错误继续运行、app 子任务监督、INVITE upstream 响应长等待、TCP/UDP branch final 后清理、发送失败回滚、affinity 不健康目标回退、active-standby/replication peer 必填校验。
 - 基础测试覆盖配置、SIP 解析、REGISTER、路由和 proxy 处理路径。
 
 待完成：
 
 - 继续审计剩余薄封装，能稳定复用 `rsipstack` typed API 的地方继续替换。
+- 启用 active-standby 生产漂移前修复 HA fencing hook 失败处理和 hook 超时子进程终止。
