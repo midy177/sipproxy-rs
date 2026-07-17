@@ -106,7 +106,7 @@ impl ProxyServer {
 
         let workers_per_listener = this.config.proxy.socket.workers_per_listener;
         for listener in &this.config.proxy.listeners {
-            this.log_listener_advertised_addrs(listener).await;
+            this.log_listener_runtime_config(listener).await;
             for worker in 0..workers_per_listener {
                 match listener.transport {
                     SipTransport::Udp => {
@@ -240,7 +240,7 @@ impl ProxyServer {
         transactions.len()
     }
 
-    async fn log_listener_advertised_addrs(&self, listener: &ProxyListenerConfig) {
+    async fn log_listener_runtime_config(&self, listener: &ProxyListenerConfig) {
         let target = self.first_upstream_for_listener(listener);
         let public = self
             .advertised_sip_addr(AdvertiseSide::Public, listener, target)
@@ -253,7 +253,15 @@ impl ProxyServer {
             transport = %listener.transport.as_str(),
             public_addr = %public,
             internal_addr = %internal,
-            "SIP advertised addresses resolved"
+            upstream_group = %listener.upstream_group,
+            record_route = self.config.proxy.record_route,
+            rewrite_register_contact = self.config.proxy.rewrite_register_contact,
+            affinity_enabled = self.config.proxy.affinity.enabled,
+            affinity_key = ?self.config.proxy.affinity.key,
+            affinity_ttl_seconds = self.config.proxy.affinity.ttl_seconds,
+            reuse_port = self.config.proxy.socket.reuse_port,
+            workers_per_listener = self.config.proxy.socket.workers_per_listener,
+            "SIP listener runtime config resolved"
         );
     }
 
