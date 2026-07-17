@@ -135,6 +135,22 @@ impl SipMessage {
         Ok(Some(top.trim().to_string()))
     }
 
+    pub fn top_header_value(&self, name: &str) -> Result<Option<String>> {
+        let Some(value) = self
+            .inner
+            .headers()
+            .iter()
+            .find(|header| header.name().eq_ignore_ascii_case(name))
+            .map(|header| header.value().to_string())
+        else {
+            return Ok(None);
+        };
+
+        let (top, _) = split_first_header_value(&value)
+            .with_context(|| format!("failed to split top {name}"))?;
+        Ok(Some(top.trim().to_string()))
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.inner
             .headers()

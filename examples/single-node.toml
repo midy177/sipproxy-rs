@@ -5,9 +5,9 @@ id = 1
 
 [sip]
 # Address advertised to public SIP clients.
-public_addr = "${PUBLIC_IP:-95.40.96.117}"
+public_addr = "${PUBLIC_IP:-}"
 # Address advertised to upstream PBX servers on the private network.
-internal_addr = "${POD_IP:-172.30.0.101}"
+internal_addr = "${POD_IP:-}"
 # Used only when public_addr is empty/unset.
 public_stun_server = "${PUBLIC_STUN_SERVER:-}"
 # Used only when internal_addr is empty/unset.

@@ -842,9 +842,8 @@ impl ProxyServer {
             self.select_upstream(&request_uri, listener)
         };
 
-        if self.upstreams.contains(_peer) && !self.upstreams.contains(target.addr) {
-            message.pop_top_header_value("Route")?;
-        }
+        self.pop_own_route_headers(&mut message, listener, target.addr)
+            .await?;
 
         let branch = transaction_route
             .map(|route| route.branch)
@@ -901,6 +900,65 @@ impl ProxyServer {
             .flatten()
             .filter(|target| !self.upstreams.contains(target.addr))
             .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
+    }
+
+    async fn pop_own_route_headers(
+        &self,
+        message: &mut SipMessage,
+        listener: &ProxyListenerConfig,
+        target: SocketAddr,
+    ) -> Result<()> {
+        while let Some(route) = message.top_header_value("Route")? {
+            if !self
+                .route_targets_this_proxy(&route, listener, target)
+                .await
+            {
+                break;
+            }
+            message.pop_top_header_value("Route")?;
+        }
+        Ok(())
+    }
+
+    async fn route_targets_this_proxy(
+        &self,
+        route: &str,
+        listener: &ProxyListenerConfig,
+        target: SocketAddr,
+    ) -> bool {
+        let Some(route_target) = parse_contact_target(route, listener.transport) else {
+            return false;
+        };
+        self.is_advertised_or_listener_addr(route_target.addr, listener)
+            || self
+                .resolved_advertised_addr_matches(
+                    AdvertiseSide::Public,
+                    listener,
+                    target,
+                    route_target.addr,
+                )
+                .await
+            || self
+                .resolved_advertised_addr_matches(
+                    AdvertiseSide::Internal,
+                    listener,
+                    target,
+                    route_target.addr,
+                )
+                .await
+    }
+
+    async fn resolved_advertised_addr_matches(
+        &self,
+        side: AdvertiseSide,
+        listener: &ProxyListenerConfig,
+        target: SocketAddr,
+        route_target: SocketAddr,
+    ) -> bool {
+        self.advertised_sip_addr(side, listener, target)
+            .await
+            .parse::<SocketAddr>()
+            .is_ok_and(|addr| addr == route_target)
     }
 
     fn is_advertised_or_listener_addr(
@@ -3296,6 +3354,74 @@ Content-Length: 0\r\n\r\n"
         let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(forwarded.starts_with(&format!("INVITE sip:6805@{client_addr} SIP/2.0")));
         assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn own_route_set_is_removed_before_forwarding_to_client() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let packet = format!(
+            "ACK sip:6805@{client_addr} SIP/2.0\r\n\
+Route: <sip:172.30.0.101:5060;lr>,<sip:95.40.96.117:5060;lr>\r\n\
+Via: SIP/2.0/UDP 172.30.0.60:5060;branch=z9hG4bK-upstream-ack\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>;tag=b\r\n\
+Call-ID: upstream-ack\r\n\
+CSeq: 1 ACK\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with(&format!("ACK sip:6805@{client_addr} SIP/2.0")));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn own_route_set_is_removed_before_forwarding_to_upstream() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+        let packet = b"ACK sip:3000@example.com SIP/2.0\r\n\
+Route: <sip:95.40.96.117:5060;lr>,<sip:172.30.0.101:5060;lr>\r\n\
+Via: SIP/2.0/UDP 10.10.16.41:57362;branch=z9hG4bK-client-ack\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:3000@example.com>;tag=b\r\n\
+Call-ID: client-ack\r\n\
+CSeq: 1 ACK\r\n\
+Content-Length: 0\r\n\r\n";
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet,
+                "10.10.16.41:57362".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("ACK sip:3000@example.com SIP/2.0"));
         assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
     }
 
