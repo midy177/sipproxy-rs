@@ -403,7 +403,7 @@ impl ProxyServer {
             let response = self
                 .recv_upstream_response(responses, upstream, method)
                 .await?;
-            let response_message = SipMessage::parse(&response)?;
+            let mut response_message = SipMessage::parse(&response)?;
             let is_final = matches!(
                 &response_message.start_line,
                 SipStartLine::Response { code, .. } if *code >= 200
@@ -412,7 +412,10 @@ impl ProxyServer {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams.record_passive_result(upstream, *code < 500);
             }
-            socket.send_to(&response, client_peer).await?;
+            response_message.apply_top_via_received_rport(client_peer)?;
+            socket
+                .send_to(&response_message.to_bytes(), client_peer)
+                .await?;
             if is_final {
                 break;
             }
@@ -562,14 +565,16 @@ impl ProxyServer {
         match decrement_max_forwards(&mut message) {
             Ok(true) => {}
             Ok(false) => {
-                let response = SipMessage::response_like(&message, 483, "Too Many Hops");
+                let mut response = SipMessage::response_like(&message, 483, "Too Many Hops");
+                response.apply_top_via_received_rport(peer)?;
                 self.record_local_response("udp", 483);
                 socket.send_to(&response.to_bytes(), peer).await?;
                 return Ok(());
             }
             Err(err) => {
                 warn!(%peer, error = %err, "invalid Max-Forwards header");
-                let response = SipMessage::response_like(&message, 400, "Bad Request");
+                let mut response = SipMessage::response_like(&message, 400, "Bad Request");
+                response.apply_top_via_received_rport(peer)?;
                 self.record_local_response("udp", 400);
                 socket.send_to(&response.to_bytes(), peer).await?;
                 return Ok(());
@@ -578,8 +583,9 @@ impl ProxyServer {
         if let Err(err) = self.forward_udp(socket, message, peer, listener).await {
             error!(error = %format!("{err:#}"), "failed to forward UDP SIP request");
             self.record_forward_error("udp");
-            let response =
+            let mut response =
                 SipMessage::response_like(&SipMessage::parse(packet)?, 503, "Service Unavailable");
+            response.apply_top_via_received_rport(peer)?;
             self.record_local_response("udp", 503);
             socket.send_to(&response.to_bytes(), peer).await?;
         }
@@ -635,6 +641,7 @@ impl ProxyServer {
         message
             .pop_top_via()?
             .context("upstream response is missing Via")?;
+        message.apply_top_via_received_rport(route.client_peer)?;
         socket
             .send_to(&message.to_bytes(), route.client_peer)
             .await?;
@@ -822,28 +829,43 @@ impl ProxyServer {
         } else {
             None
         };
+        let from_upstream = self.upstreams.contains(_peer);
+        let request_uri_targets_this_proxy =
+            self.request_uri_targets_this_proxy(&request_uri, listener);
         let target = if let Some(route) = transaction_route.as_ref() {
             self.record_affinity_lookup("transaction-hit");
             route.target
-        } else if let Some(binding) = self.lookup_registration_binding(&request_uri).await {
-            self.record_affinity_lookup("location-hit");
-            parse_contact_target(&binding.contact, listener.transport)
-                .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
-        } else if let Some(target) =
-            self.request_uri_target_from_upstream(_peer, &request_uri, listener)
-        {
-            self.record_affinity_lookup("request-uri-target");
-            target
+        } else if from_upstream || request_uri_targets_this_proxy {
+            if let Some(binding) = self.lookup_registration_binding(&request_uri).await {
+                self.record_affinity_lookup("location-hit");
+                target_for_registration_binding(&binding, listener.transport)
+                    .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
+            } else if from_upstream
+                && let Some(target) =
+                    self.request_uri_target_from_upstream(_peer, &request_uri, listener)
+            {
+                self.record_affinity_lookup("request-uri-target");
+                target
+            } else if let Some(target) = self.affinity.lookup(&message).await? {
+                self.record_affinity_lookup("hit");
+                UpstreamTarget {
+                    addr: target.addr,
+                    transport: target.transport,
+                }
+            } else {
+                self.record_affinity_lookup("miss");
+                self.select_upstream(&request_uri, listener)
+            }
         } else if let Some(target) = self.affinity.lookup(&message).await? {
             let target = UpstreamTarget {
                 addr: target.addr,
                 transport: target.transport,
             };
-            if self.upstreams.is_healthy(target.addr) {
+            if self.upstreams.contains(target.addr) && self.upstreams.is_healthy(target.addr) {
                 self.record_affinity_lookup("hit");
                 target
             } else {
-                self.record_affinity_lookup("unhealthy");
+                self.record_affinity_lookup("wrong-side");
                 self.select_upstream(&request_uri, listener)
             }
         } else {
@@ -912,6 +934,15 @@ impl ProxyServer {
             .flatten()
             .filter(|target| !self.upstreams.contains(target.addr))
             .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
+    }
+
+    fn request_uri_targets_this_proxy(
+        &self,
+        request_uri: &str,
+        listener: &ProxyListenerConfig,
+    ) -> bool {
+        parse_contact_target(request_uri, listener.transport)
+            .is_some_and(|target| self.is_advertised_or_listener_addr(target.addr, listener))
     }
 
     async fn pop_own_route_headers(
@@ -2689,6 +2720,27 @@ fn parse_contact_target(contact: &str, default_transport: SipTransport) -> Optio
     Some(UpstreamTarget { addr, transport })
 }
 
+fn target_for_registration_binding(
+    binding: &ContactBinding,
+    default_transport: SipTransport,
+) -> Option<UpstreamTarget> {
+    let contact_target = parse_contact_target(&binding.contact, default_transport);
+    let contact_transport = contact_target
+        .map(|target| target.transport)
+        .unwrap_or(default_transport);
+
+    if contact_transport == SipTransport::Udp
+        && let Ok(addr) = binding.source.parse::<SocketAddr>()
+    {
+        return Some(UpstreamTarget {
+            addr,
+            transport: SipTransport::Udp,
+        });
+    }
+
+    contact_target
+}
+
 fn registration_route_keys(route: &str) -> Vec<String> {
     let mut keys = Vec::new();
     push_unique_key(&mut keys, route.trim().to_string());
@@ -3429,6 +3481,207 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
+    async fn downstream_invite_ignores_registered_location_and_uses_upstream() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caller_peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-3001\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-3001\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"INVITE sip:3001@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-downstream-invite\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: downstream-invite-uses-upstream\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                caller_peer,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3001@example.com SIP/2.0"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                registered_client_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_address_request_uri_from_pbx_alias_routes_to_registered_location() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_alias_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let pbx_alias_addr = pbx_alias_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-3001\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-3001-for-pbx-alias\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+
+        let invite = format!(
+            "INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP {pbx_alias_addr};branch=z9hG4bK-pbx-alias\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: pbx-alias-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3000@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                pbx_alias_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = registered_client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3001@127.0.0.1:5060 SIP/2.0"));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_registration_location_routes_to_observed_source_flow() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_source_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let contact_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_alias_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let registered_source_addr = registered_source_socket.local_addr().unwrap();
+        let contact_addr = contact_socket.local_addr().unwrap();
+        let pbx_alias_addr = pbx_alias_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {contact_addr};branch=z9hG4bK-register-3001-flow;rport\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{contact_addr}>;expires=60\r\n\
+Call-ID: register-3001-flow\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_source_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+
+        let invite = format!(
+            "INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP {pbx_alias_addr};branch=z9hG4bK-pbx-alias-flow\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: pbx-alias-invite-flow\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3000@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                pbx_alias_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = registered_source_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3001@127.0.0.1:5060 SIP/2.0"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                contact_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_request_uri_contact_routes_directly_to_client() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3679,26 +3932,26 @@ Content-Length: 0\r\n\r\n",
 
     #[tokio::test]
     async fn udp_to_tcp_upstream_streams_multiple_invite_responses() {
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let tcp_client_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_client_addr = tcp_client_listener.local_addr().unwrap();
         let proxy_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client_addr = client_socket.local_addr().unwrap();
-        let server = Arc::new(test_server_with_upstream(upstream_addr));
+        let pbx_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pbx_addr = pbx_socket.local_addr().unwrap();
+        let server = Arc::new(test_server_with_upstream(pbx_addr));
         let listener = test_listener();
 
         server
             .state
             .apply(ClusterCommand::RegisterContact(ContactBinding {
                 aor: "sip:200@example.com".to_string(),
-                contact: format!("<sip:200@{upstream_addr};transport=tcp>"),
+                contact: format!("<sip:200@{tcp_client_addr};transport=tcp>"),
                 source: "127.0.0.1:5061".to_string(),
                 expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
             }))
             .await;
 
         tokio::spawn(async move {
-            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let (mut stream, _) = tcp_client_listener.accept().await.unwrap();
             let mut reader = TcpSipReader::new(4096);
             let request = reader.read_message(&mut stream).await.unwrap().unwrap();
             let request = String::from_utf8(request).unwrap();
@@ -3743,7 +3996,7 @@ To: <sip:200@example.com>\r\n\
 Call-ID: udp-tcp-call\r\n\
 CSeq: 1 INVITE\r\n\
 Content-Length: 0\r\n\r\n",
-                        client_addr,
+                        pbx_addr,
                         &listener,
                     )
                     .await
@@ -3753,7 +4006,7 @@ Content-Length: 0\r\n\r\n",
 
         for code in ["100 Trying", "180 Ringing", "200 OK"] {
             let mut client_buf = [0_u8; 4096];
-            let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+            let (len, _) = pbx_socket.recv_from(&mut client_buf).await.unwrap();
             let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
             assert!(response.starts_with(&format!("SIP/2.0 {code}")));
             assert!(!response.contains(PROXY_BRANCH_PREFIX));

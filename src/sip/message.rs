@@ -8,7 +8,7 @@ use rsipstack::sip::{
     param::{Branch, Tag},
     typed::{CSeq, Contact as TypedContact, From as FromHeader, To as ToHeader, Via},
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
@@ -192,6 +192,30 @@ impl SipMessage {
         } else {
             self.inner.headers_mut().push(Header::Other(name, value));
         }
+    }
+
+    pub fn apply_top_via_received_rport(&mut self, peer: SocketAddr) -> Result<()> {
+        let Some((index, value)) = self
+            .inner
+            .headers()
+            .iter()
+            .enumerate()
+            .find(|(_, header)| header.name().eq_ignore_ascii_case("Via"))
+            .map(|(index, header)| (index, header.value().to_string()))
+        else {
+            return Ok(());
+        };
+
+        let (top, rest) = split_first_header_value(&value).context("failed to split top Via")?;
+        let rewritten = rewrite_via_received_rport(top.trim(), peer);
+        let value = match rest {
+            Some(rest) if !rest.trim().is_empty() => {
+                format!("{rewritten}, {}", rest.trim())
+            }
+            _ => rewritten,
+        };
+        self.inner.headers_mut().0[index] = Header::Other("Via".to_string(), value);
+        Ok(())
     }
 
     pub fn rewrite_contact_host(&mut self, sent_by: &str) -> Result<Vec<(String, String)>> {
@@ -404,6 +428,54 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
     Ok((value, None))
 }
 
+fn rewrite_via_received_rport(value: &str, peer: SocketAddr) -> String {
+    let mut parts = value.split(';');
+    let sent_protocol = parts.next().unwrap_or_default().trim();
+    let mut rendered = sent_protocol.to_string();
+    let mut has_received = false;
+    let should_add_received = via_sent_by_ip(sent_protocol).is_none_or(|ip| ip != peer.ip());
+    let peer_ip = peer.ip().to_string();
+    let peer_port = peer.port();
+
+    for param in parts {
+        let param = param.trim();
+        if param.is_empty() {
+            continue;
+        }
+        let (name, _) = param.split_once('=').unwrap_or((param, ""));
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("received") {
+            has_received = true;
+            rendered.push_str(";received=");
+            rendered.push_str(&peer_ip);
+        } else if name.eq_ignore_ascii_case("rport") {
+            rendered.push_str(";rport=");
+            rendered.push_str(&peer_port.to_string());
+        } else {
+            rendered.push(';');
+            rendered.push_str(param);
+        }
+    }
+
+    if !has_received && should_add_received {
+        rendered.push_str(";received=");
+        rendered.push_str(&peer_ip);
+    }
+    rendered
+}
+
+fn via_sent_by_ip(sent_protocol: &str) -> Option<IpAddr> {
+    let sent_by = sent_protocol.split_whitespace().last()?;
+    if let Some((host, _)) = sent_by
+        .strip_prefix('[')
+        .and_then(|value| value.split_once(']'))
+    {
+        return host.parse().ok();
+    }
+    let host = sent_by.split_once(':').map_or(sent_by, |(host, _)| host);
+    host.parse().ok()
+}
+
 fn method_name(method: &Method) -> &str {
     match method {
         Method::Invite => "INVITE",
@@ -519,6 +591,49 @@ Content-Length: 0\r\n\r\n",
         assert!(resp.contains("Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy"));
         assert!(resp.contains("Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK-client"));
         assert!(resp.contains("Content-Length: 0"));
+    }
+
+    #[test]
+    fn fills_top_via_received_and_rport_for_nat_peer() {
+        let mut resp = SipMessage::parse(
+            b"SIP/2.0 180 Ringing\r\n\
+Via: SIP/2.0/UDP 100.105.80.106:56433;branch=z9hG4bK-client;rport\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>;tag=b\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        resp.apply_top_via_received_rport("112.48.56.8:60834".parse().unwrap())
+            .unwrap();
+        let wire = String::from_utf8(resp.to_bytes()).unwrap();
+
+        assert!(wire.contains(
+            "Via: SIP/2.0/UDP 100.105.80.106:56433;branch=z9hG4bK-client;rport=60834;received=112.48.56.8"
+        ));
+    }
+
+    #[test]
+    fn leaves_received_out_when_sent_by_matches_peer() {
+        let mut resp = SipMessage::parse(
+            b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-client;rport\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>;tag=b\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        resp.apply_top_via_received_rport("127.0.0.1:5061".parse().unwrap())
+            .unwrap();
+        let wire = String::from_utf8(resp.to_bytes()).unwrap();
+
+        assert!(wire.contains("rport=5061"));
+        assert!(!wire.contains("received="));
     }
 
     #[test]
