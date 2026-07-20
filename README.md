@@ -145,7 +145,7 @@ upstream_group = "pbx-a"
 leader_check_interval_ms = 1000
 
 [ha.persistence]
-enabled = false
+enabled = true
 path = "/var/lib/sigproxy-rs/ha/state.db"
 required = false
 event_retention_seconds = 3600

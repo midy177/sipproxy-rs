@@ -276,7 +276,7 @@ leader_check_interval_ms = 1000
 # Persist REGISTER location, affinity state, and the HA event log to a local
 # SQLite database. This is local-node storage; do not share the same database
 # file between active and standby nodes.
-enabled = false
+enabled = true
 path = "/var/lib/sigproxy-rs/ha/state.db"
 required = false
 event_retention_seconds = 3600
