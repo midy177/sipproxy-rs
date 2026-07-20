@@ -1,0 +1,202 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sigproxy
+  namespace: middleware
+data:
+  config.toml: |
+    [node]
+    id = 1
+
+    [sip]
+    public_addr = "${PUBLIC_IP:-}"
+    internal_addr = "${POD_IP:-}"
+    public_stun_server = "${PUBLIC_STUN_SERVER:-}"
+    internal_probe_addr = "${INTERNAL_PROBE_ADDR:-8.8.8.8:53}"
+    max_message_bytes = 65535
+
+    [proxy]
+    record_route = true
+    register_routing = "path"
+
+    [proxy.socket]
+    reuse_port = false
+    workers_per_listener = 1
+    recv_buffer_bytes = 4194304
+    send_buffer_bytes = 4194304
+    tcp_nodelay = true
+
+    [proxy.metrics]
+    enabled = false
+    bind_addr = "127.0.0.1:9100"
+
+    [proxy.affinity]
+    enabled = true
+    key = "dialog-id"
+    ttl_seconds = 3600
+
+    [proxy.security]
+    preset = "public"
+    trusted_cidrs = ["172.30.0.0/16"]
+
+    [proxy.security.geo]
+    enabled = true
+    cache_dir = "/var/lib/sigproxy-rs/geo"
+    startup_refresh = "disabled"
+    fail_open = true
+    unknown_country = "allow"
+
+    [proxy.security.geo.deny]
+    countries = ["RU", "IR", "KP"]
+
+    [proxy.security.dynamic_ban]
+    enabled = true
+    ban_seconds = 3600
+    invalid_packets_per_minute = 30
+    parse_errors_per_minute = 20
+    sip_rate_violations_per_minute = 10
+
+    [proxy.security.sip_policy]
+    require_registered_invite_source = true
+    registered_invite_source_match = "ip"
+
+    [proxy.security.xdp]
+    enabled = true
+    interfaces = []
+    detach_stale = true
+    fail_open = true
+    sync_dynamic_ban = true
+    cidr_filter = true
+    geo_filter = true
+    ip_rate_limit = true
+
+    [[proxy.upstream_groups]]
+    name = "default"
+    mode = "round-robin"
+    servers = ["172.30.0.60:5060", "172.30.10.30:5060"]
+
+    [proxy.upstream_groups.health_check]
+    enabled = true
+    interval_ms = 5000
+    timeout_ms = 2000
+    success_threshold = 2
+    failure_threshold = 3
+
+    [proxy.upstream_groups.health_check.probe]
+    mode = "options"
+    transport = "udp"
+    uri = "sip:healthcheck@${POD_IP:-172.30.0.101}"
+    success_codes = [200, 202, 405, 481]
+
+    [[proxy.listeners]]
+    bind = "0.0.0.0:5060"
+    transport = "udp"
+    upstream_group = "default"
+
+    [ha]
+    leader_check_interval_ms = 1000
+
+    [ha.persistence]
+    enabled = true
+    path = "/var/lib/sigproxy-rs/ha/state.db"
+    required = false
+    event_retention_seconds = 3600
+    cleanup_interval_ms = 60000
+
+    [ha.active_standby]
+    enabled = false
+    initial_role = "standby"
+    heartbeat_bind = "127.0.0.1:7900"
+    peer_heartbeat_addr = "127.0.0.1:7900"
+    heartbeat_interval_ms = 1000
+    failover_timeout_ms = 5000
+
+    [ha.replication]
+    enabled = false
+    bind_addr = "127.0.0.1:7901"
+    peer_addr = "127.0.0.1:7902"
+    pull_interval_ms = 10000
+    request_timeout_ms = 2000
+
+    [ha.addon]
+    type = "noop"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sigproxy
+  namespace: middleware
+  labels:
+    app: sigproxy
+    workload.user.cattle.io/workloadselector: apps.deployment-middleware-sigproxy
+spec:
+  progressDeadlineSeconds: 60
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: apps.deployment-middleware-sigproxy
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: sigproxy
+        workload.user.cattle.io/workloadselector: apps.deployment-middleware-sigproxy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        role: rtpengine
+      tolerations:
+        - key: role
+          operator: Equal
+          value: rtpengine
+          effect: NoSchedule
+      containers:
+        - name: sigproxy
+          image: 1228022817/sigproxy-rs:0.1.0
+          imagePullPolicy: Always
+          args: ["run", "--config", "/etc/sigproxy/config.toml"]
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.podIP
+            - name: RUST_LOG
+              value: info
+            - name: PUBLIC_STUN_SERVER
+              value: edge0.cn-1.test.novo-one.com:3478
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            runAsNonRoot: false
+          ports:
+            - name: sip-udp
+              containerPort: 5060
+              hostPort: 5060
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sigproxy/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: ha-state
+              mountPath: /var/lib/sigproxy-rs/ha
+      volumes:
+        - name: config
+          configMap:
+            name: sigproxy
+            defaultMode: 420
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: ha-state
+          hostPath:
+            path: /var/lib/sigproxy-rs/ha
+            type: DirectoryOrCreate

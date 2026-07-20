@@ -1,0 +1,18 @@
+services:
+  sigproxy:
+    image: 1228022817/sigproxy-rs:0.1.0
+    container_name: sigproxy
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    environment:
+      RUST_LOG: info
+      POD_IP: ${POD_IP:-}
+      PUBLIC_IP: ${PUBLIC_IP:-}
+      PUBLIC_STUN_SERVER: ${PUBLIC_STUN_SERVER:-edge0.cn-1.test.novo-one.com:3478}
+      INTERNAL_PROBE_ADDR: ${INTERNAL_PROBE_ADDR:-8.8.8.8:53}
+    volumes:
+      - ./examples/single-node.toml:/etc/sigproxy/config.toml:ro
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /var/lib/sigproxy-rs/ha:/var/lib/sigproxy-rs/ha
+    command: ["run", "--config", "/etc/sigproxy/config.toml"]
