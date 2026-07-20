@@ -102,6 +102,7 @@ mod tests {
             socket: Default::default(),
             metrics: Default::default(),
             affinity: Default::default(),
+            security: Default::default(),
             routes: vec![RouteConfig {
                 name: "tenant-a".to_string(),
                 listener: Some("udp/127.0.0.1:5060".to_string()),

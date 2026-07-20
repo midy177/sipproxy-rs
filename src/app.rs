@@ -5,6 +5,7 @@ use crate::ha::{
     ActiveStandbyReplicator, ActiveStandbyRuntime, build_addon, run_active_standby,
     run_leader_monitor, run_state_replication,
 };
+use crate::persistence::HaPersistence;
 use crate::proxy::ProxyServer;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -14,8 +15,9 @@ use tokio::task::JoinSet;
 use tracing::info;
 
 pub async fn run(config: Config) -> Result<()> {
+    let persistence = HaPersistence::open(&config.ha.persistence)?;
     let state = Arc::new(SharedState::default());
-    let base_replicator = build_replicator(state.clone()).await?;
+    let base_replicator = build_replicator(state.clone(), persistence.clone()).await?;
     let active_standby_config = config.ha.active_standby.clone();
     let active_standby_runtime = active_standby_config
         .enabled
@@ -41,7 +43,12 @@ pub async fn run(config: Config) -> Result<()> {
             Duration::from_millis(config.ha.leader_check_interval_ms),
         ));
     }
-    let server = Arc::new(ProxyServer::new(config, state, replicator.clone())?);
+    let server = Arc::new(ProxyServer::new(
+        config,
+        state,
+        replicator.clone(),
+        persistence.clone(),
+    )?);
 
     if let Some(runtime) = active_standby_runtime {
         tasks.spawn(run_active_standby(
@@ -57,6 +64,10 @@ pub async fn run(config: Config) -> Result<()> {
             replicator.clone(),
             shutdown_rx.clone(),
         ));
+    }
+    if let Some(persistence) = persistence {
+        let interval = Duration::from_millis(server.config().ha.persistence.cleanup_interval_ms);
+        tasks.spawn(persistence.cleanup_loop(interval, shutdown_rx.clone()));
     }
     tasks.spawn(async move { server.run(shutdown_rx).await });
 

@@ -145,7 +145,8 @@ floating endpoint 不限定实现，可以是：
 - WAL-like append log。
 - snapshot checksum。
 - 状态压缩。
-- 持久化存储。
+- SQLite 本地持久化存储。
+- active -> standby 增量事件复制。
 
 ### `config`
 
@@ -427,22 +428,107 @@ upstream_group = "pbx-a"
 
 ### 阶段 4：Active-standby 状态同步
 
-当前实现使用 standby 定期拉取 active snapshot 的方式同步轻量路由状态：
+当前实现使用 event-log 优先、snapshot 兜底的方式同步轻量路由状态：
 
-- standby 拉取 active snapshot。
+- standby 优先拉取 active `/ha/events` 增量事件。
+- event log 缺口、过期或不可用时 fallback `/ha/snapshot`。
 - 同步 REGISTER location。
 - 同步 affinity binding。
 - 同步 active 节点角色元信息。
 
-后续如需要更低延迟，可增加增量事件：
+实现方式为：active 写内存 + SQLite WAL + event log，standby 拉增量事件，
+snapshot 继续作为冷启动、恢复和一致性兜底。SQLite 只作为每个节点的
+本地持久化与复制 checkpoint，不直接跨节点共享文件。
 
-- RegisterContact。
-- UnregisterContact。
-- UpsertAffinity。
-- RemoveAffinity。
-- ExpireAffinity。
-- snapshot checksum。
-- 本地内存状态恢复。
+设计原则：
+
+- SIP 转发热路径仍以内存 lookup 为主。
+- SQLite 写入失败默认 fail-open，只记录 warning/metric；可配置
+  `ha.persistence.required = true` 时 fail-closed。
+- standby 不接受外部写，只应用 active 的 event/snapshot。
+- event 必须幂等，按 key 覆盖同一 contact/affinity binding。
+- event 和 snapshot 都携带绝对 `expires_at_epoch_ms`，standby 不能续满 TTL。
+- event pull 失败不阻塞 active SIP 转发，standby 依赖下一轮 event 或 snapshot 修正。
+- 不同步 in-flight INVITE transaction、TCP 连接、socket/NAT 临时状态、upstream
+  health 和 XDP kernel map；这些仍属于节点本地运行态。
+
+SQLite schema 草案：
+
+- `contacts(aor primary key, contact, source, expires_at_epoch_ms, updated_seq)`。
+- `affinity(key primary key, target_addr, transport, expires_at_epoch_ms, updated_seq)`。
+- `ha_events(seq integer primary key autoincrement, kind, key, payload_json, created_at_epoch_ms)`。
+- `meta(key primary key, value)`，保存 `last_applied_seq`、schema version 等。
+
+阶段 4.1：本地持久化恢复（已实现）
+
+- 增加 `ha.persistence` 配置：
+  - `enabled`。
+  - `path`，默认 `/var/lib/sigproxy-rs/ha/state.db`。
+  - `required`，默认 `false`。
+  - `event_retention_seconds`。
+  - `cleanup_interval_ms`。
+- 启动时打开 SQLite，启用 WAL、busy_timeout、foreign_keys。
+- 从 SQLite 加载未过期 contacts/affinity 到内存。
+- active 写 REGISTER contact 时同步写 SQLite contact 表。
+- affinity 写入先只做低风险持久化，可按现有 TTL 写入 SQLite。
+- 周期清理过期 contact/affinity 与过期 event。
+
+阶段 4.2：增量事件日志（已实现）
+
+- 每次状态变化 append `ha_events`：
+  - `RegisterContact`。
+  - `UnregisterContact`。
+  - `UpsertAffinity`。
+  - `RemoveAffinity`。
+  - `ExpireAffinity`。
+- active 写入顺序：
+  - 内存 apply。
+  - SQLite upsert/delete。
+  - append event。
+- 默认 SQLite/event append 失败不阻断 SIP 转发，但必须打 warning。
+- `required = true` 时，SQLite 写失败返回错误，避免状态未落盘仍继续接写。
+
+阶段 4.3：standby 增量拉取（已实现）
+
+- 增加 `GET /ha/events?after=<seq>&limit=<n>`。
+- 响应包含：
+  - `base_seq`。
+  - `events`。
+  - `latest_seq`。
+  - `snapshot_required`。
+- standby 从本地 SQLite `meta.last_applied_seq` 开始拉事件。
+- standby 检查 seq 连续性；缺口或 active event 已清理时 fallback `/ha/snapshot`。
+- standby apply event 时同时更新内存、SQLite 和 `last_applied_seq`。
+
+阶段 4.4：snapshot 兜底增强（已实现）
+
+- snapshot 增加 `last_seq` 和 checksum。
+- standby 安装 snapshot 时：
+  - 替换内存 contacts/affinity。
+  - SQLite 事务内替换 contact/affinity 表。
+  - 更新 `meta.last_applied_seq = snapshot.last_seq`。
+- standby 会校验 snapshot checksum，校验失败时拒绝安装。
+- snapshot 后继续从 `last_seq` 拉增量。
+
+阶段 4.5：生产化与测试（部分实现）
+
+- metrics：
+  - SQLite 写失败次数。
+  - event append 成功/失败次数。
+  - standby event lag。
+  - snapshot fallback 次数。
+  - event 表大小。
+- 单元测试：
+  - event 幂等 apply。
+  - TTL 不续期。
+  - SQLite 重启恢复。
+  - event retention 后 standby fallback snapshot。
+  - snapshot checksum 拒绝错误快照。
+- 集成测试：
+  - active REGISTER 后 standby 在一个增量周期内 lookup。
+  - active affinity 写入后 standby 在一个增量周期内 lookup。
+  - event pull 失败时 SIP 转发不失败，下一次 snapshot 恢复一致。
+  - `required = true` 时 SQLite 写失败会拒绝写入。
 
 ### 阶段 5：生产化增强
 

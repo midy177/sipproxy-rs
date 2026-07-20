@@ -36,6 +36,43 @@ enabled = true
 key = "dialog-id"
 ttl_seconds = 3600
 
+[proxy.security]
+# Public is the recommended baseline for an internet-facing UDP listener.
+# Use "off" only for private lab deployments.
+preset = "public"
+trusted_cidrs = ["172.30.0.0/16"]
+
+[proxy.security.geo]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/geo"
+startup_refresh = "disabled"
+fail_open = true
+unknown_country = "allow"
+
+[proxy.security.geo.deny]
+countries = ["RU", "IR", "KP"]
+
+[proxy.security.dynamic_ban]
+enabled = true
+ban_seconds = 3600
+invalid_packets_per_minute = 30
+parse_errors_per_minute = 20
+sip_rate_violations_per_minute = 10
+
+[proxy.security.sip_policy]
+require_registered_invite_source = true
+registered_invite_source_match = "ip"
+
+[proxy.security.xdp]
+enabled = true
+interfaces = []
+detach_stale = true
+fail_open = true
+sync_dynamic_ban = true
+cidr_filter = true
+geo_filter = true
+ip_rate_limit = true
+
 [[proxy.upstream_groups]]
 name = "default"
 mode = "round-robin"
@@ -66,6 +103,13 @@ upstream_group = "default"
 
 [ha]
 leader_check_interval_ms = 1000
+
+[ha.persistence]
+enabled = false
+path = "/var/lib/sigproxy-rs/ha/state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
 
 [ha.active_standby]
 enabled = false

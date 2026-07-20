@@ -1,3 +1,4 @@
+use crate::persistence::HaPersistence;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -5,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 pub type NodeId = u64;
 
@@ -27,6 +29,7 @@ pub struct ContactBinding {
     pub aor: String,
     pub contact: String,
     pub source: String,
+    #[serde(with = "crate::serde_u128")]
     pub expires_at_epoch_ms: u128,
 }
 
@@ -124,18 +127,34 @@ impl SharedState {
 
 pub struct StandaloneReplicator {
     state: Arc<SharedState>,
+    persistence: Option<HaPersistence>,
 }
 
 impl StandaloneReplicator {
-    pub fn new(state: Arc<SharedState>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<SharedState>, persistence: Option<HaPersistence>) -> Self {
+        Self { state, persistence }
     }
 }
 
 #[async_trait]
 impl ClusterReplicator for StandaloneReplicator {
     async fn submit(&self, command: ClusterCommand) -> Result<ClusterApplyResult> {
-        Ok(self.state.apply(command).await)
+        if let Some(persistence) = &self.persistence
+            && persistence.required()
+        {
+            persistence.apply_cluster_command(&command).await?;
+            return Ok(self.state.apply(command).await);
+        }
+        let result = self.state.apply(command.clone()).await;
+        if let Some(persistence) = &self.persistence
+            && let Err(err) = persistence.apply_cluster_command(&command).await
+        {
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to persist cluster command; continuing with in-memory state"
+            );
+        }
+        Ok(result)
     }
 
     async fn role(&self) -> ClusterRole {
@@ -147,8 +166,11 @@ impl ClusterReplicator for StandaloneReplicator {
     }
 }
 
-pub async fn build_replicator(state: Arc<SharedState>) -> Result<Arc<dyn ClusterReplicator>> {
-    Ok(Arc::new(StandaloneReplicator::new(state)))
+pub async fn build_replicator(
+    state: Arc<SharedState>,
+    persistence: Option<HaPersistence>,
+) -> Result<Arc<dyn ClusterReplicator>> {
+    Ok(Arc::new(StandaloneReplicator::new(state, persistence)))
 }
 
 pub fn expires_at(ttl: Duration) -> u128 {
@@ -169,7 +191,7 @@ mod tests {
     #[tokio::test]
     async fn standalone_replicator_applies_register_and_unregister() {
         let state = Arc::new(SharedState::default());
-        let replicator = StandaloneReplicator::new(state.clone());
+        let replicator = StandaloneReplicator::new(state.clone(), None);
 
         replicator
             .submit(ClusterCommand::RegisterContact(ContactBinding {

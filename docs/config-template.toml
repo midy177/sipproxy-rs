@@ -55,11 +55,12 @@ register_routing = "path"
 
 [proxy.socket]
 # Enable SO_REUSEPORT for listener sockets. Required when workers_per_listener
-# is greater than 1.
+# is greater than 1 or set to 0 (auto CPU count).
 reuse_port = false
 
 # Number of worker sockets/tasks per listener. Keep 1 unless reuse_port is
-# enabled and the operating system supports it.
+# enabled and the operating system supports it. Set 0 with reuse_port = true
+# to use the host CPU count.
 workers_per_listener = 1
 
 # Optional socket receive buffer size in bytes. Remove or comment out to use
@@ -92,6 +93,75 @@ key = "dialog-id"
 
 # Affinity binding TTL in seconds. Must be greater than 0 when enabled.
 ttl_seconds = 3600
+
+[proxy.security]
+# Listener security defaults. Presets:
+# - "off": preserve legacy behavior.
+# - "trusted": light filtering for controlled networks.
+# - "public": recommended baseline for internet-facing UDP listeners.
+# - "strict": tighter limits for exposed listeners under attack.
+preset = "off"
+
+# CIDR lists are evaluated before rate limits. Exact IPs are allowed too.
+# deny_cidrs = ["203.0.113.10", "198.51.100.0/24"]
+# allow_cidrs = []
+# trusted_cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+# Optional overrides for the selected preset.
+# [proxy.security.geo]
+# enabled = true
+# provider = "ipdeny"
+# provider_base_url = "http://www.ipdeny.com/ipblocks/data/countries/{country}.zone"
+# cache_dir = "/var/lib/sigproxy-rs/geo"
+# refresh_interval_seconds = 86400
+# startup_refresh = "disabled" # "disabled", "background", or "blocking"
+# fail_open = true
+# unknown_country = "allow" # "allow" or "deny"
+# request_timeout_seconds = 10
+#
+# [proxy.security.geo.deny]
+# countries = ["RU", "IR", "KP"]
+#
+# [proxy.security.geo.allow]
+# countries = ["CN", "SG", "US"]
+#
+# Geo uses a binary cache named geo.sgeo inside cache_dir. Container images can
+# ship a prebuilt /var/lib/sigproxy-rs/geo/geo.sgeo. Enable "background" only
+# when the running process should refresh geo data after startup.
+#
+# [proxy.security.dynamic_ban]
+# enabled = true
+# ban_seconds = 3600
+# invalid_packets_per_minute = 30
+# parse_errors_per_minute = 20
+# sip_rate_violations_per_minute = 10
+#
+# [proxy.security.ip_rate_limit]
+# packets_per_second = 50
+# burst = 100
+# parse_errors_per_minute = 20
+# block_seconds = 300
+
+# [proxy.security.sip_rate_limit]
+# register_per_minute_per_aor = 20
+# invite_per_minute_per_aor = 60
+# block_seconds = 300
+#
+# [proxy.security.sip_policy]
+# require_registered_invite_source = false
+# registered_invite_source_match = "ip" # "ip" or "ip-port"
+#
+# Optional XDP offload. This is intentionally limited to L3/L4 checks; SIP
+# semantic limits stay in user space.
+# [proxy.security.xdp]
+# enabled = false
+# interfaces = [] # empty or omitted means auto-select by listener bind/default route
+# detach_stale = true # only detach stale sigproxy_xdp, never third-party XDP
+# fail_open = true
+# sync_dynamic_ban = true
+# cidr_filter = true
+# geo_filter = true
+# ip_rate_limit = true
 
 [[proxy.upstream_groups]]
 # Upstream group name referenced by listeners and routes.
@@ -170,6 +240,11 @@ bind = "0.0.0.0:5060"
 transport = "tcp"
 upstream_group = "pbx-a"
 
+# Listener-local override example. Only fields written here override the
+# global [proxy.security] defaults.
+# [proxy.listeners.security]
+# preset = "trusted"
+
 [[proxy.listeners]]
 bind = "0.0.0.0:5080"
 transport = "tcp"
@@ -197,6 +272,16 @@ upstream_group = "pbx-b"
 # hooks. Must be greater than 0.
 leader_check_interval_ms = 1000
 
+[ha.persistence]
+# Persist REGISTER location, affinity state, and the HA event log to a local
+# SQLite database. This is local-node storage; do not share the same database
+# file between active and standby nodes.
+enabled = false
+path = "/var/lib/sigproxy-rs/ha/state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
+
 [ha.active_standby]
 # Enable the simple two-node active-standby role monitor.
 enabled = false
@@ -218,17 +303,19 @@ heartbeat_interval_ms = 1000
 failover_timeout_ms = 5000
 
 [ha.replication]
-# Enable standby snapshot pull from the active peer.
+# Enable standby state pull from the active peer. When ha.persistence is enabled
+# on both nodes, standby pulls incremental /ha/events first and falls back to
+# /ha/snapshot when the event log has a gap or was already cleaned up.
 enabled = false
 
-# Local HA snapshot HTTP bind address.
+# Local HA replication HTTP bind address.
 bind_addr = "127.0.0.1:7901"
 
-# Optional peer snapshot address. In a two-node pair, point this at the other
+# Optional peer replication address. In a two-node pair, point this at the other
 # node's ha.replication.bind_addr.
 peer_addr = "127.0.0.1:7902"
 
-# Snapshot pull interval in milliseconds. Must be greater than 0 when enabled.
+# Event/snapshot pull interval in milliseconds. Must be greater than 0 when enabled.
 pull_interval_ms = 10000
 
 # Snapshot request timeout in milliseconds. Must be greater than 0 when enabled.

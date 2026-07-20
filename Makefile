@@ -79,6 +79,9 @@ docker-buildx-push: zig-build-all
 .PHONY: docker-run
 docker-run:
 	docker run --rm --name $(CONTAINER_NAME) \
+		--cap-add NET_ADMIN \
+		--cap-add BPF \
+		--mount type=bind,source=/sys/fs/bpf,target=/sys/fs/bpf \
 		-p 5060:5060/udp \
 		-p 5060:5060/tcp \
 		-p 9100:9100/tcp \

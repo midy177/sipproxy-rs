@@ -1,6 +1,6 @@
 use crate::sip::SipMessage;
 use anyhow::{Context, Result};
-use rsipstack::sip::prelude::HeadersExt;
+use rsipstack::sip::{prelude::HeadersExt, typed::Contact as RsipContact};
 use std::time::Duration;
 
 pub fn extract_aor(message: &SipMessage) -> Result<String> {
@@ -25,6 +25,14 @@ pub fn extract_contact(message: &SipMessage) -> Result<Option<String>> {
     Ok(contact.map(|contact| contact.uri.to_string()))
 }
 
+pub fn extract_from_aor(message: &SipMessage) -> Result<String> {
+    let request = message
+        .as_request()
+        .context("From parsing requires a SIP request")?;
+    let from = rsipstack::sip::typed::From::parse(request.from_header()?.value())?;
+    Ok(from.uri.to_string())
+}
+
 pub fn extract_expires(message: &SipMessage) -> Duration {
     let Some(request) = message.as_request() else {
         return Duration::from_secs(3600);
@@ -40,6 +48,14 @@ pub fn extract_expires(message: &SipMessage) -> Duration {
         return Duration::from_secs(seconds);
     }
     Duration::from_secs(3600)
+}
+
+pub fn extract_response_contact_expires(message: &SipMessage) -> Option<Duration> {
+    message
+        .headers("Contact")
+        .filter_map(|value| RsipContact::parse(value).ok()?.expires())
+        .max()
+        .map(|seconds| Duration::from_secs(u64::from(seconds)))
 }
 
 #[cfg(test)]
@@ -64,5 +80,22 @@ CSeq: 1 REGISTER\r\n\r\n",
             "sip:100@127.0.0.1:5062"
         );
         assert_eq!(extract_expires(&msg), Duration::from_secs(120));
+        assert_eq!(extract_from_aor(&msg).unwrap(), "sip:100@example.com");
+    }
+
+    #[test]
+    fn extracts_response_contact_expires() {
+        let msg = SipMessage::parse(
+            b"SIP/2.0 200 OK\r\n\
+Contact: <sip:100@127.0.0.1:5062>;expires=300\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 REGISTER\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_response_contact_expires(&msg),
+            Some(Duration::from_secs(300))
+        );
     }
 }

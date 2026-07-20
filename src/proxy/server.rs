@@ -1,13 +1,20 @@
 use crate::cluster::{ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at};
 use crate::config::{
-    Config, ProxyListenerConfig, ProxyMetricsConfig, ProxySocketConfig, RegisterRoutingMode,
-    SipTransport, UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
+    Config, EffectiveProxySecurityConfig, ProxyConfig, ProxyListenerConfig, ProxyMetricsConfig,
+    ProxyRegisteredInviteSourceMatch, ProxySocketConfig, RegisterRoutingMode, SipTransport,
+    UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
 };
 use crate::ha::HaStateSnapshot;
+use crate::persistence::{HaEventPayload, HaEventRecord, HaEventsResponse, HaPersistence};
 use crate::proxy::affinity::{AffinityTable, AffinityTarget};
+use crate::proxy::geo::{GeoDecision, GeoPolicy, GeoRuntime, evaluate_geo_policy};
 use crate::proxy::metrics::ProxyMetrics;
-use crate::proxy::registry::{extract_aor, extract_contact, extract_expires};
+use crate::proxy::registry::{
+    extract_aor, extract_contact, extract_expires, extract_from_aor,
+    extract_response_contact_expires,
+};
 use crate::proxy::routing::RouteTable;
+use crate::proxy::xdp::XdpRuntime;
 use crate::sip::{SipMessage, SipStartLine};
 use anyhow::{Context, Result, bail};
 use axum::{Router, extract::State, routing::get};
@@ -18,8 +25,9 @@ use rsipstack::sip::{
 };
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::fmt::Write as _;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
@@ -38,7 +46,12 @@ const INVITE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_BRANCH_TTL: Duration = Duration::from_secs(300);
 const UDP_BRANCH_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const TCP_BRANCH_TTL: Duration = Duration::from_secs(300);
+const PENDING_REGISTER_TTL: Duration = Duration::from_secs(300);
 const INVITE_TRANSACTION_TTL: Duration = Duration::from_secs(300);
+const LOCAL_INVITE_REJECTION_TTL: Duration = Duration::from_secs(300);
+const SECURITY_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+const SECURITY_BUCKET_IDLE_TTL: Duration = Duration::from_secs(600);
+const SECURITY_MAP_SHARDS: usize = 64;
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -46,13 +59,18 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct ProxyServer {
     config: Config,
     state: Arc<SharedState>,
+    replicator: Arc<dyn ClusterReplicator>,
+    persistence: Option<HaPersistence>,
     routes: RouteTable,
     upstreams: UpstreamGroups,
     affinity: AffinityTable,
+    security: Arc<SecurityRuntime>,
     metrics: Arc<ProxyMetrics>,
     udp_branches: Mutex<HashMap<String, UdpBranchRoute>>,
     udp_branch_last_prune: Mutex<Instant>,
+    pending_registers: Mutex<HashMap<String, PendingRegister>>,
     invite_transactions: Mutex<HashMap<String, InviteTransactionRoute>>,
+    local_invite_rejections: Mutex<HashMap<String, Instant>>,
     tcp_upstreams: TcpUpstreamPool,
     advertised_addrs: Mutex<HashMap<String, String>>,
 }
@@ -61,31 +79,54 @@ impl ProxyServer {
     pub fn new(
         config: Config,
         state: Arc<SharedState>,
-        _replicator: Arc<dyn ClusterReplicator>,
+        replicator: Arc<dyn ClusterReplicator>,
+        persistence: Option<HaPersistence>,
     ) -> Result<Self> {
         let routes = RouteTable::new(&config.proxy).context("failed to build proxy route table")?;
         let upstreams = UpstreamGroups::new(&config.proxy.upstream_groups)
             .context("failed to build upstream groups")?;
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
+        let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
         Ok(Self {
             config,
             state,
+            replicator,
+            persistence,
             routes,
             upstreams,
             affinity: AffinityTable::new(affinity_config),
+            security,
             metrics: Arc::new(ProxyMetrics::default()),
             udp_branches: Mutex::new(HashMap::new()),
             udp_branch_last_prune: Mutex::new(Instant::now()),
+            pending_registers: Mutex::new(HashMap::new()),
             invite_transactions: Mutex::new(HashMap::new()),
+            local_invite_rejections: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
             advertised_addrs: Mutex::new(HashMap::new()),
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    pub fn has_ha_persistence(&self) -> bool {
+        self.persistence.is_some()
+    }
+
     pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
         let this = self;
         let mut tasks = Vec::new();
+        this.restore_persistent_state().await?;
+
+        if let Some(task) = this.security.spawn_geo_refresh(shutdown.clone()).await {
+            tasks.push(task);
+        }
+        tasks.push(tokio::spawn(
+            this.security.clone().run_prune_loop(shutdown.clone()),
+        ));
 
         for group in this.upstreams.groups.values() {
             if group.health_check.enabled {
@@ -104,7 +145,7 @@ impl ProxyServer {
             )));
         }
 
-        let workers_per_listener = this.config.proxy.socket.workers_per_listener;
+        let workers_per_listener = this.config.proxy.socket.resolved_workers_per_listener();
         for listener in &this.config.proxy.listeners {
             this.log_listener_runtime_config(listener).await;
             for worker in 0..workers_per_listener {
@@ -150,15 +191,138 @@ impl ProxyServer {
     }
 
     pub async fn snapshot_state(&self) -> HaStateSnapshot {
+        let last_seq = match &self.persistence {
+            Some(persistence) => match persistence.latest_event_seq().await {
+                Ok(seq) => seq,
+                Err(err) => {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "failed to read HA persistence latest event sequence for snapshot"
+                    );
+                    0
+                }
+            },
+            None => 0,
+        };
         HaStateSnapshot {
+            last_seq,
+            checksum: String::new(),
             contacts: self.state.snapshot().await,
             affinity: self.affinity.snapshot().await,
         }
+        .with_checksum()
     }
 
     pub async fn install_state_snapshot(&self, snapshot: HaStateSnapshot) {
+        if !snapshot.checksum_is_valid() {
+            warn!(
+                last_seq = snapshot.last_seq,
+                checksum = %snapshot.checksum,
+                "refusing to install HA state snapshot with invalid checksum"
+            );
+            return;
+        }
+        let persist_snapshot = snapshot.clone();
         self.state.install_snapshot(snapshot.contacts).await;
         self.affinity.install_snapshot(snapshot.affinity).await;
+        if let Some(persistence) = &self.persistence
+            && let Err(err) = persistence.install_snapshot(&persist_snapshot).await
+        {
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to persist installed HA state snapshot"
+            );
+        }
+    }
+
+    async fn restore_persistent_state(&self) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let snapshot = persistence.load_snapshot().await?;
+        let contact_count = snapshot.contacts.contacts.len();
+        let affinity_count = snapshot.affinity.bindings.len();
+        self.state.install_snapshot(snapshot.contacts).await;
+        self.affinity.install_snapshot(snapshot.affinity).await;
+        info!(
+            contacts = contact_count,
+            affinity_bindings = affinity_count,
+            "restored HA state from persistence"
+        );
+        Ok(())
+    }
+
+    pub async fn last_applied_ha_event_seq(&self) -> u64 {
+        let Some(persistence) = &self.persistence else {
+            return 0;
+        };
+        match persistence.last_applied_seq().await {
+            Ok(seq) => seq,
+            Err(err) => {
+                warn!(
+                    error = %format!("{err:#}"),
+                    "failed to read HA persistence last applied sequence"
+                );
+                0
+            }
+        }
+    }
+
+    pub async fn ha_events_after(&self, after: u64, limit: usize) -> HaEventsResponse {
+        let Some(persistence) = &self.persistence else {
+            return HaEventsResponse {
+                base_seq: 0,
+                latest_seq: 0,
+                snapshot_required: true,
+                events: Vec::new(),
+            };
+        };
+        match persistence.events_after(after, limit).await {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    error = %format!("{err:#}"),
+                    after,
+                    limit,
+                    "failed to read HA event log; requiring snapshot"
+                );
+                HaEventsResponse {
+                    base_seq: after,
+                    latest_seq: 0,
+                    snapshot_required: true,
+                    events: Vec::new(),
+                }
+            }
+        }
+    }
+
+    pub async fn apply_ha_event(&self, event: HaEventRecord) -> Result<()> {
+        match &event.payload {
+            HaEventPayload::RegisterContact { binding } => {
+                if !binding.is_expired() {
+                    self.state
+                        .apply(ClusterCommand::RegisterContact(binding.clone()))
+                        .await;
+                }
+            }
+            HaEventPayload::UnregisterContact { aor } => {
+                self.state
+                    .apply(ClusterCommand::UnregisterContact { aor: aor.clone() })
+                    .await;
+            }
+            HaEventPayload::UpsertAffinity { binding } => {
+                self.affinity
+                    .upsert_snapshot_bindings(vec![binding.clone()])
+                    .await;
+            }
+            HaEventPayload::RemoveAffinity { key } => {
+                self.affinity.remove_key(key).await;
+            }
+        }
+        if let Some(persistence) = &self.persistence {
+            persistence.apply_event(&event).await?;
+        }
+        Ok(())
     }
 
     async fn render_metrics(&self) -> String {
@@ -170,6 +334,7 @@ impl ProxyServer {
         let affinity_bindings = self.affinity.active_len().await;
         let location_bindings = self.state.contact_count().await;
         let upstream_health = self.upstreams.health_snapshots();
+        let xdp_stats = self.security.xdp_stats();
 
         append_gauge(
             &mut output,
@@ -225,6 +390,14 @@ impl ProxyServer {
                 health.consecutive_failures as u64,
             );
         }
+        for (action, value) in xdp_stats {
+            append_labeled_counter(
+                &mut output,
+                "proxy_xdp_packets_total",
+                &[("action", action)],
+                value,
+            );
+        }
         output
     }
 
@@ -261,7 +434,7 @@ impl ProxyServer {
             affinity_key = ?self.config.proxy.affinity.key,
             affinity_ttl_seconds = self.config.proxy.affinity.ttl_seconds,
             reuse_port = self.config.proxy.socket.reuse_port,
-            workers_per_listener = self.config.proxy.socket.workers_per_listener,
+            workers_per_listener = self.config.proxy.socket.resolved_workers_per_listener(),
             "SIP listener runtime config resolved"
         );
     }
@@ -344,7 +517,7 @@ impl ProxyServer {
         invite_transaction_key: Option<String>,
         method: &str,
     ) {
-        if let Err(err) = self
+        match self
             .affinity
             .remember(
                 message,
@@ -355,12 +528,33 @@ impl ProxyServer {
             )
             .await
         {
-            warn!(error = %err, "failed to record SIP affinity for forwarded request");
+            Ok(bindings) => {
+                if let Some(persistence) = &self.persistence
+                    && let Err(err) = persistence.upsert_affinity_bindings(bindings).await
+                {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "failed to persist SIP affinity bindings"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to record SIP affinity for forwarded request");
+            }
         }
 
         if method == "INVITE" {
             self.remember_invite_transaction(invite_transaction_key, target, branch.to_string())
                 .await;
+        }
+    }
+
+    async fn submit_cluster_command(&self, command: ClusterCommand) {
+        if let Err(err) = self.replicator.submit(command).await {
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to submit cluster state command"
+            );
         }
     }
 
@@ -397,6 +591,7 @@ impl ProxyServer {
         responses: &mut mpsc::UnboundedReceiver<Vec<u8>>,
         client_peer: SocketAddr,
         upstream: SocketAddr,
+        branch: &str,
         method: &str,
     ) -> Result<()> {
         loop {
@@ -411,6 +606,8 @@ impl ProxyServer {
             if let SipStartLine::Response { code, .. } = &response_message.start_line {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams.record_passive_result(upstream, *code < 500);
+                self.apply_register_response(branch, &response_message, *code)
+                    .await;
             }
             response_message.apply_top_via_received_rport(client_peer)?;
             socket
@@ -482,7 +679,22 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
-        let message = SipMessage::parse(packet)?;
+        match self.security.check_packet(listener, peer, packet).await {
+            SecurityDecision::Allow => {}
+            SecurityDecision::Drop(reason) => {
+                self.handle_security_drop(listener, peer, reason).await;
+                return Ok(());
+            }
+        }
+
+        let message = match SipMessage::parse(packet) {
+            Ok(message) => message,
+            Err(err) if self.security.enabled(listener) => {
+                self.handle_parse_error(listener, peer, packet, err).await;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         if message.is_response() {
             debug!(%peer, "ignoring SIP response received from downstream TCP client");
             return Ok(());
@@ -497,10 +709,55 @@ impl ProxyServer {
         );
 
         let mut message = message;
+        if method == "ACK" && self.consume_local_invite_ack(&message).await {
+            debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
+            return Ok(());
+        }
+        if let Some(reason) = self
+            .security
+            .check_sip_request(listener, peer, &message, method.as_str())
+            .await
+        {
+            self.record_security_drop(listener, reason);
+            if let Some(reason) = self
+                .security
+                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .await
+            {
+                self.record_security_drop(listener, reason);
+            }
+            let response = SipMessage::response_like(&message, 503, "Service Unavailable");
+            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                .await;
+            self.record_local_response("tcp", 503);
+            stream.write_all(&response.to_bytes()).await?;
+            return Ok(());
+        }
+        if let Some(reason) = self
+            .check_sip_policy(listener, peer, &message, method.as_str())
+            .await
+        {
+            self.record_security_drop(listener, reason);
+            if let Some(reason) = self
+                .security
+                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .await
+            {
+                self.record_security_drop(listener, reason);
+            }
+            let response = SipMessage::response_like(&message, 403, "Forbidden");
+            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                .await;
+            self.record_local_response("tcp", 403);
+            stream.write_all(&response.to_bytes()).await?;
+            return Ok(());
+        }
         match decrement_max_forwards(&mut message) {
             Ok(true) => {}
             Ok(false) => {
                 let response = SipMessage::response_like(&message, 483, "Too Many Hops");
+                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                    .await;
                 self.record_local_response("tcp", 483);
                 stream.write_all(&response.to_bytes()).await?;
                 return Ok(());
@@ -508,6 +765,8 @@ impl ProxyServer {
             Err(err) => {
                 warn!(%peer, error = %err, "invalid Max-Forwards header");
                 let response = SipMessage::response_like(&message, 400, "Bad Request");
+                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                    .await;
                 self.record_local_response("tcp", 400);
                 stream.write_all(&response.to_bytes()).await?;
                 return Ok(());
@@ -519,8 +778,10 @@ impl ProxyServer {
         {
             error!(error = %format!("{err:#}"), "failed to forward TCP SIP request");
             self.record_forward_error("tcp");
-            let response =
-                SipMessage::response_like(&SipMessage::parse(packet)?, 503, "Service Unavailable");
+            let request = SipMessage::parse(packet)?;
+            let response = SipMessage::response_like(&request, 503, "Service Unavailable");
+            self.remember_local_invite_rejection_if_needed(&request, method.as_str())
+                .await;
             self.record_local_response("tcp", 503);
             stream.write_all(&response.to_bytes()).await?;
         }
@@ -548,7 +809,22 @@ impl ProxyServer {
             return Ok(());
         }
 
-        let message = SipMessage::parse(packet)?;
+        match self.security.check_packet(listener, peer, packet).await {
+            SecurityDecision::Allow => {}
+            SecurityDecision::Drop(reason) => {
+                self.handle_security_drop(listener, peer, reason).await;
+                return Ok(());
+            }
+        }
+
+        let message = match SipMessage::parse(packet) {
+            Ok(message) => message,
+            Err(err) if self.security.enabled(listener) => {
+                self.handle_parse_error(listener, peer, packet, err).await;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         if message.is_response() {
             return self.handle_udp_response(socket, message, peer).await;
         }
@@ -562,11 +838,58 @@ impl ProxyServer {
         );
 
         let mut message = message;
+        if method == "ACK" && self.consume_local_invite_ack(&message).await {
+            debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
+            return Ok(());
+        }
+        if let Some(reason) = self
+            .security
+            .check_sip_request(listener, peer, &message, method.as_str())
+            .await
+        {
+            self.record_security_drop(listener, reason);
+            if let Some(reason) = self
+                .security
+                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .await
+            {
+                self.record_security_drop(listener, reason);
+            }
+            let mut response = SipMessage::response_like(&message, 503, "Service Unavailable");
+            response.apply_top_via_received_rport(peer)?;
+            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                .await;
+            self.record_local_response("udp", 503);
+            socket.send_to(&response.to_bytes(), peer).await?;
+            return Ok(());
+        }
+        if let Some(reason) = self
+            .check_sip_policy(listener, peer, &message, method.as_str())
+            .await
+        {
+            self.record_security_drop(listener, reason);
+            if let Some(reason) = self
+                .security
+                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .await
+            {
+                self.record_security_drop(listener, reason);
+            }
+            let mut response = SipMessage::response_like(&message, 403, "Forbidden");
+            response.apply_top_via_received_rport(peer)?;
+            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                .await;
+            self.record_local_response("udp", 403);
+            socket.send_to(&response.to_bytes(), peer).await?;
+            return Ok(());
+        }
         match decrement_max_forwards(&mut message) {
             Ok(true) => {}
             Ok(false) => {
                 let mut response = SipMessage::response_like(&message, 483, "Too Many Hops");
                 response.apply_top_via_received_rport(peer)?;
+                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                    .await;
                 self.record_local_response("udp", 483);
                 socket.send_to(&response.to_bytes(), peer).await?;
                 return Ok(());
@@ -575,6 +898,8 @@ impl ProxyServer {
                 warn!(%peer, error = %err, "invalid Max-Forwards header");
                 let mut response = SipMessage::response_like(&message, 400, "Bad Request");
                 response.apply_top_via_received_rport(peer)?;
+                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                    .await;
                 self.record_local_response("udp", 400);
                 socket.send_to(&response.to_bytes(), peer).await?;
                 return Ok(());
@@ -583,9 +908,11 @@ impl ProxyServer {
         if let Err(err) = self.forward_udp(socket, message, peer, listener).await {
             error!(error = %format!("{err:#}"), "failed to forward UDP SIP request");
             self.record_forward_error("udp");
-            let mut response =
-                SipMessage::response_like(&SipMessage::parse(packet)?, 503, "Service Unavailable");
+            let request = SipMessage::parse(packet)?;
+            let mut response = SipMessage::response_like(&request, 503, "Service Unavailable");
             response.apply_top_via_received_rport(peer)?;
+            self.remember_local_invite_rejection_if_needed(&request, method.as_str())
+                .await;
             self.record_local_response("udp", 503);
             socket.send_to(&response.to_bytes(), peer).await?;
         }
@@ -637,6 +964,7 @@ impl ProxyServer {
             self.record_upstream_response("udp", *code);
             self.upstreams
                 .record_passive_result(route.upstream, *code < 500);
+            self.apply_register_response(&branch, &message, *code).await;
         }
         message
             .pop_top_via()?
@@ -646,6 +974,67 @@ impl ProxyServer {
             .send_to(&message.to_bytes(), route.client_peer)
             .await?;
         Ok(())
+    }
+
+    async fn check_sip_policy(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        message: &SipMessage,
+        method: &str,
+    ) -> Option<&'static str> {
+        if method != "INVITE" {
+            return None;
+        }
+        if self.upstreams.contains(peer) || self.security.is_trusted_peer(listener, peer.ip()) {
+            return None;
+        }
+        let policy = self
+            .config
+            .proxy
+            .effective_security_for_listener(listener)
+            .sip_policy;
+        if !policy.require_registered_invite_source {
+            return None;
+        }
+
+        let from_aor = match extract_from_aor(message) {
+            Ok(from_aor) => from_aor,
+            Err(err) => {
+                debug!(
+                    %peer,
+                    listener = %listener.key(),
+                    error = %format!("{err:#}"),
+                    "rejecting INVITE because From AoR could not be parsed"
+                );
+                return Some("sip-invalid-from");
+            }
+        };
+        let Some(binding) = self.lookup_registration_binding(&from_aor).await else {
+            debug!(
+                %peer,
+                listener = %listener.key(),
+                from = %from_aor,
+                "rejecting INVITE because From AoR has no active registration"
+            );
+            return Some("sip-unregistered-invite");
+        };
+        if registered_invite_source_matches(
+            &binding.source,
+            peer,
+            policy.registered_invite_source_match,
+        ) {
+            return None;
+        }
+        debug!(
+            %peer,
+            listener = %listener.key(),
+            from = %from_aor,
+            registered_source = %binding.source,
+            match_mode = ?policy.registered_invite_source_match,
+            "rejecting INVITE because source does not match active registration"
+        );
+        Some("sip-unregistered-invite-source")
     }
 
     async fn forward_udp(
@@ -754,6 +1143,7 @@ impl ProxyServer {
             &mut responses,
             client_peer,
             upstream,
+            &branch,
             method.as_str(),
         )
         .await
@@ -802,6 +1192,8 @@ impl ProxyServer {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams
                     .record_passive_result(target.addr, *code < 500);
+                self.apply_register_response(&branch, &response_message, *code)
+                    .await;
             }
             client_stream.write_all(&response).await?;
             if is_final {
@@ -847,10 +1239,16 @@ impl ProxyServer {
                 self.record_affinity_lookup("request-uri-target");
                 target
             } else if let Some(target) = self.affinity.lookup(&message).await? {
-                self.record_affinity_lookup("hit");
-                UpstreamTarget {
+                let target = UpstreamTarget {
                     addr: target.addr,
                     transport: target.transport,
+                };
+                if self.is_healthy_upstream_target(target) {
+                    self.record_affinity_lookup("hit");
+                    target
+                } else {
+                    self.record_affinity_lookup("wrong-side");
+                    self.select_upstream(&request_uri, listener)
                 }
             } else {
                 self.record_affinity_lookup("miss");
@@ -861,7 +1259,7 @@ impl ProxyServer {
                 addr: target.addr,
                 transport: target.transport,
             };
-            if self.upstreams.contains(target.addr) && self.upstreams.is_healthy(target.addr) {
+            if self.is_healthy_upstream_target(target) {
                 self.record_affinity_lookup("hit");
                 target
             } else {
@@ -906,17 +1304,19 @@ impl ProxyServer {
             }
         }
         if method == "REGISTER" {
-            match self.config.proxy.effective_register_routing() {
+            let pending_register = match self.config.proxy.effective_register_routing() {
                 RegisterRoutingMode::ContactRewrite => {
-                    self.rewrite_and_store_register_contact(&mut message, &via_host, _peer)
-                        .await?;
+                    self.rewrite_register_contact_and_pending(&mut message, &via_host, _peer)?
                 }
                 RegisterRoutingMode::Path => {
-                    self.store_register_contact_routes(&message, &via_host, _peer)
-                        .await?;
+                    let pending =
+                        self.register_contact_routes_pending(&message, &via_host, _peer)?;
                     message.prepend_header("Path", format!("<sip:{via_host};lr>"));
+                    pending
                 }
-            }
+            };
+            self.remember_pending_register(branch.clone(), pending_register)
+                .await;
         }
 
         Ok((message, target, branch, invite_transaction_key))
@@ -1033,7 +1433,7 @@ impl ProxyServer {
         listener: &ProxyListenerConfig,
         target: SocketAddr,
     ) -> String {
-        let cache_key = format!("{}|{}", side.as_str(), listener.key());
+        let cache_key = format!("{}|{}|{}", side.as_str(), listener.key(), target);
         if let Some(addr) = self.advertised_addrs.lock().await.get(&cache_key).cloned() {
             return addr;
         }
@@ -1168,15 +1568,16 @@ impl ProxyServer {
         None
     }
 
-    async fn rewrite_and_store_register_contact(
+    fn rewrite_register_contact_and_pending(
         &self,
         message: &mut SipMessage,
         via_host: &str,
         peer: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<Option<PendingRegister>> {
         let aor = extract_aor(message).ok();
         let original_contact = extract_contact(message).ok().flatten();
         let expires = extract_expires(message);
+        let mut bindings = Vec::new();
         let rewritten_contacts = message.rewrite_contact_host_with_user(
             via_host,
             |original_contact, original_user| {
@@ -1189,68 +1590,48 @@ impl ProxyServer {
             },
         )?;
         for (original, rewritten) in rewritten_contacts {
-            self.store_contact_route_keys(&rewritten, &original, peer, expires)
-                .await;
+            collect_contact_route_bindings(&mut bindings, &rewritten, &original, peer);
         }
         if let (Some(aor), Some(contact)) = (aor, original_contact) {
-            self.state
-                .apply(ClusterCommand::RegisterContact(ContactBinding {
+            push_pending_register_binding(
+                &mut bindings,
+                PendingRegisterBinding {
                     aor,
                     contact,
                     source: peer.to_string(),
-                    expires_at_epoch_ms: expires_at(expires),
-                }))
-                .await;
+                },
+            );
         }
-        Ok(())
+        Ok(pending_register(bindings, expires))
     }
 
-    async fn store_register_contact_routes(
+    fn register_contact_routes_pending(
         &self,
         message: &SipMessage,
         via_host: &str,
         peer: SocketAddr,
-    ) -> Result<()> {
+    ) -> Result<Option<PendingRegister>> {
         let expires = extract_expires(message);
         let mut first_contact = None;
+        let mut bindings = Vec::new();
         let mut rewritten = message.clone();
         for (original, proxy_contact) in rewritten.rewrite_contact_host(via_host)? {
             if first_contact.is_none() {
                 first_contact = Some(original.clone());
             }
-            self.store_contact_route_keys(&proxy_contact, &original, peer, expires)
-                .await;
+            collect_contact_route_bindings(&mut bindings, &proxy_contact, &original, peer);
         }
         if let (Ok(aor), Some(contact)) = (extract_aor(message), first_contact) {
-            self.state
-                .apply(ClusterCommand::RegisterContact(ContactBinding {
+            push_pending_register_binding(
+                &mut bindings,
+                PendingRegisterBinding {
                     aor,
                     contact,
                     source: peer.to_string(),
-                    expires_at_epoch_ms: expires_at(expires),
-                }))
-                .await;
+                },
+            );
         }
-        Ok(())
-    }
-
-    async fn store_contact_route_keys(
-        &self,
-        route: &str,
-        contact: &str,
-        peer: SocketAddr,
-        expires: Duration,
-    ) {
-        for aor in registration_route_keys(route) {
-            self.state
-                .apply(ClusterCommand::RegisterContact(ContactBinding {
-                    aor,
-                    contact: contact.to_string(),
-                    source: peer.to_string(),
-                    expires_at_epoch_ms: expires_at(expires),
-                }))
-                .await;
-        }
+        Ok(pending_register(bindings, expires))
     }
 
     fn record_forwarded_request(
@@ -1297,6 +1678,68 @@ impl ProxyServer {
             .incr("proxy_affinity_lookup_total", &[("result", result)]);
     }
 
+    async fn handle_security_drop(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        reason: &'static str,
+    ) {
+        self.record_security_drop(listener, reason);
+        if let Some(reason) = self
+            .security
+            .record_dynamic_offense(listener, peer, dynamic_offense_for_reason(reason))
+            .await
+        {
+            self.record_security_drop(listener, reason);
+        }
+    }
+
+    async fn handle_parse_error(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        packet: &[u8],
+        err: anyhow::Error,
+    ) {
+        let decision = self.security.record_parse_error(listener, peer).await;
+        self.record_security_drop(
+            listener,
+            match decision {
+                SecurityDecision::Allow => "parse-error",
+                SecurityDecision::Drop(reason) => reason,
+            },
+        );
+        if let Some(reason) = self
+            .security
+            .record_dynamic_offense(listener, peer, Some(DynamicOffense::ParseError))
+            .await
+        {
+            self.record_security_drop(listener, reason);
+        }
+        if self
+            .security
+            .should_log_invalid_packet(listener, peer)
+            .await
+        {
+            debug!(
+                %peer,
+                listener = %listener.key(),
+                bytes = packet.len(),
+                preview = %packet_preview(packet),
+                error = %err,
+                "dropped invalid SIP packet"
+            );
+        }
+    }
+
+    fn record_security_drop(&self, listener: &ProxyListenerConfig, reason: &str) {
+        let listener_key = listener.key();
+        self.metrics.incr(
+            "proxy_security_dropped_packets_total",
+            &[("listener", listener_key.as_str()), ("reason", reason)],
+        );
+    }
+
     async fn lookup_invite_transaction(&self, key: Option<&str>) -> Option<InviteTransactionRoute> {
         let key = key?;
         let mut transactions = self.invite_transactions.lock().await;
@@ -1325,6 +1768,82 @@ impl ProxyServer {
         );
     }
 
+    async fn remember_local_invite_rejection_if_needed(&self, message: &SipMessage, method: &str) {
+        if method != "INVITE" {
+            return;
+        }
+        let key = match invite_transaction_key(message) {
+            Ok(Some(key)) => key,
+            Ok(None) => return,
+            Err(err) => {
+                debug!(
+                    error = %format!("{err:#}"),
+                    "failed to build local INVITE rejection key"
+                );
+                return;
+            }
+        };
+        let mut rejections = self.local_invite_rejections.lock().await;
+        prune_local_invite_rejections(&mut rejections, Instant::now());
+        rejections.insert(key, Instant::now());
+    }
+
+    async fn consume_local_invite_ack(&self, message: &SipMessage) -> bool {
+        let key = match invite_transaction_key(message) {
+            Ok(Some(key)) => key,
+            _ => return false,
+        };
+        let mut rejections = self.local_invite_rejections.lock().await;
+        prune_local_invite_rejections(&mut rejections, Instant::now());
+        rejections.remove(&key).is_some()
+    }
+
+    async fn remember_pending_register(&self, branch: String, pending: Option<PendingRegister>) {
+        let Some(pending) = pending else {
+            return;
+        };
+        let mut registers = self.pending_registers.lock().await;
+        prune_pending_registers(&mut registers, Instant::now());
+        registers.insert(branch, pending);
+    }
+
+    async fn apply_register_response(&self, branch: &str, response: &SipMessage, code: u16) {
+        if code < 200 {
+            return;
+        }
+        let pending = {
+            let mut registers = self.pending_registers.lock().await;
+            prune_pending_registers(&mut registers, Instant::now());
+            registers.remove(branch)
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        if !(200..300).contains(&code) {
+            debug!(
+                branch,
+                code, "discarding pending REGISTER state after non-2xx response"
+            );
+            return;
+        }
+
+        let expires = extract_response_contact_expires(response).unwrap_or(pending.request_expires);
+        for binding in pending.bindings {
+            if expires.is_zero() {
+                self.submit_cluster_command(ClusterCommand::UnregisterContact { aor: binding.aor })
+                    .await;
+            } else {
+                self.submit_cluster_command(ClusterCommand::RegisterContact(ContactBinding {
+                    aor: binding.aor,
+                    contact: binding.contact,
+                    source: binding.source,
+                    expires_at_epoch_ms: expires_at(expires),
+                }))
+                .await;
+            }
+        }
+    }
+
     fn select_upstream(&self, uri: &str, listener: &ProxyListenerConfig) -> UpstreamTarget {
         let group = self
             .routes
@@ -1339,6 +1858,10 @@ impl ProxyServer {
             addr,
             transport: listener.transport,
         }
+    }
+
+    fn is_healthy_upstream_target(&self, target: UpstreamTarget) -> bool {
+        self.upstreams.contains(target.addr) && self.upstreams.is_healthy(target.addr)
     }
 }
 
@@ -1436,10 +1959,24 @@ fn append_gauge(output: &mut String, name: &str, value: u64) {
 }
 
 fn append_labeled_gauge(output: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    append_labeled_metric(output, name, "gauge", labels, value);
+}
+
+fn append_labeled_counter(output: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    append_labeled_metric(output, name, "counter", labels, value);
+}
+
+fn append_labeled_metric(
+    output: &mut String,
+    name: &str,
+    metric_type: &str,
+    labels: &[(&str, &str)],
+    value: u64,
+) {
     if !output.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
-    let type_line = format!("# TYPE {name} gauge\n");
+    let type_line = format!("# TYPE {name} {metric_type}\n");
     if !output.contains(&type_line) {
         output.push_str(&type_line);
     }
@@ -1514,6 +2051,705 @@ struct InviteTransactionRoute {
     target: UpstreamTarget,
     branch: String,
     created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRegister {
+    bindings: Vec<PendingRegisterBinding>,
+    request_expires: Duration,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRegisterBinding {
+    aor: String,
+    contact: String,
+    source: String,
+}
+
+enum SecurityDecision {
+    Allow,
+    Drop(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DynamicOffense {
+    InvalidPacket,
+    ParseError,
+    SipRateViolation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityBanAction {
+    Installed,
+    Extended,
+    Retained,
+}
+
+struct SecurityRuntime {
+    listeners: HashMap<String, ListenerSecurityRuntime>,
+    geo: Option<Arc<GeoRuntime>>,
+    xdp: XdpRuntime,
+    buckets: ShardedSecurityMap<TokenBucket>,
+    blocks: ShardedSecurityMap<Instant>,
+}
+
+impl SecurityRuntime {
+    fn new(config: &ProxyConfig) -> Result<Self> {
+        let mut listeners = HashMap::new();
+        let mut effective_configs = Vec::new();
+        for listener in &config.listeners {
+            let effective = config.effective_security_for_listener(listener);
+            effective_configs.push(effective.clone());
+            listeners.insert(listener.key(), ListenerSecurityRuntime::new(effective)?);
+        }
+        let geo = GeoRuntime::new(&effective_configs)?;
+        let xdp = XdpRuntime::new(config, geo.as_ref())?;
+        Ok(Self {
+            listeners,
+            geo,
+            xdp,
+            buckets: ShardedSecurityMap::new(SECURITY_MAP_SHARDS),
+            blocks: ShardedSecurityMap::new(SECURITY_MAP_SHARDS),
+        })
+    }
+
+    async fn spawn_geo_refresh(
+        &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        self.geo.as_ref()?.spawn_refresh_task(shutdown).await
+    }
+
+    fn xdp_stats(&self) -> Vec<(&'static str, u64)> {
+        self.xdp.stats()
+    }
+
+    async fn run_prune_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                _ = tokio::time::sleep(SECURITY_PRUNE_INTERVAL) => {
+                    self.prune_expired().await;
+                    self.xdp.sync_static_policy(self.geo.as_ref());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn enabled(&self, listener: &ProxyListenerConfig) -> bool {
+        self.listener(listener)
+            .is_some_and(|runtime| runtime.config.enabled())
+    }
+
+    fn is_trusted_peer(&self, listener: &ProxyListenerConfig, ip: IpAddr) -> bool {
+        self.listener(listener)
+            .is_some_and(|runtime| runtime.is_trusted(ip))
+    }
+
+    async fn check_packet(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        packet: &[u8],
+    ) -> SecurityDecision {
+        let Some(runtime) = self.listener(listener) else {
+            return SecurityDecision::Allow;
+        };
+        if !runtime.config.enabled() {
+            return SecurityDecision::Allow;
+        }
+        if runtime.is_denied(peer.ip()) {
+            return SecurityDecision::Drop("denied-cidr");
+        }
+        if !runtime.is_allowed(peer.ip()) {
+            return SecurityDecision::Drop("not-allowed-cidr");
+        }
+        if runtime.is_trusted(peer.ip()) {
+            return SecurityDecision::Allow;
+        }
+
+        let listener_key = listener.key();
+        let block_key = ip_security_key("block", listener_key.as_str(), peer.ip());
+        if self.is_blocked(&block_key).await {
+            return SecurityDecision::Drop("ip-blocked");
+        }
+
+        match evaluate_geo_policy(&runtime.geo_policy, self.geo.as_ref(), peer.ip()) {
+            GeoDecision::Allow => {}
+            GeoDecision::Drop(reason) => return SecurityDecision::Drop(reason),
+        }
+
+        let ip_rate = &runtime.config.ip_rate_limit;
+        if ip_rate.enabled && ip_rate.packets_per_second > 0 && ip_rate.burst > 0 {
+            let bucket_key = ip_security_key("packets", listener_key.as_str(), peer.ip());
+            if !self
+                .allow_bucket(
+                    bucket_key,
+                    ip_rate.packets_per_second as f64,
+                    ip_rate.burst as f64,
+                )
+                .await
+            {
+                let subject = peer.ip().to_string();
+                self.block_for(
+                    &block_key,
+                    ip_rate.block_seconds,
+                    listener_key.as_str(),
+                    "ip",
+                    subject.as_str(),
+                    "ip-rate-limit",
+                )
+                .await;
+                return SecurityDecision::Drop("ip-rate-limit");
+            }
+        }
+
+        let prefilter = &runtime.config.prefilter;
+        if prefilter.enabled
+            && prefilter.drop_invalid_start_line
+            && !is_probable_sip_start_line(packet, prefilter.drop_non_sip_methods)
+        {
+            return SecurityDecision::Drop("invalid-start-line");
+        }
+
+        SecurityDecision::Allow
+    }
+
+    async fn record_parse_error(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+    ) -> SecurityDecision {
+        let Some(runtime) = self.listener(listener) else {
+            return SecurityDecision::Allow;
+        };
+        if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
+            return SecurityDecision::Allow;
+        }
+
+        let ip_rate = &runtime.config.ip_rate_limit;
+        if !ip_rate.enabled || ip_rate.parse_errors_per_minute == 0 {
+            return SecurityDecision::Allow;
+        }
+
+        let listener_key = listener.key();
+        let bucket_key = ip_security_key("parse-errors", listener_key.as_str(), peer.ip());
+        if self
+            .allow_bucket(
+                bucket_key,
+                ip_rate.parse_errors_per_minute as f64 / 60.0,
+                ip_rate.parse_errors_per_minute as f64,
+            )
+            .await
+        {
+            return SecurityDecision::Allow;
+        }
+
+        let block_key = ip_security_key("block", listener_key.as_str(), peer.ip());
+        let subject = peer.ip().to_string();
+        self.block_for(
+            &block_key,
+            ip_rate.block_seconds,
+            listener_key.as_str(),
+            "ip",
+            subject.as_str(),
+            "parse-error-rate-limit",
+        )
+        .await;
+        SecurityDecision::Drop("parse-error-rate-limit")
+    }
+
+    async fn record_dynamic_offense(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        offense: Option<DynamicOffense>,
+    ) -> Option<&'static str> {
+        let offense = offense?;
+        let runtime = self.listener(listener)?;
+        if !runtime.config.dynamic_ban.enabled || runtime.is_trusted(peer.ip()) {
+            return None;
+        }
+        let dynamic_ban = &runtime.config.dynamic_ban;
+        let per_minute = match offense {
+            DynamicOffense::InvalidPacket => dynamic_ban.invalid_packets_per_minute,
+            DynamicOffense::ParseError => dynamic_ban.parse_errors_per_minute,
+            DynamicOffense::SipRateViolation => dynamic_ban.sip_rate_violations_per_minute,
+        };
+        if per_minute == 0 {
+            return None;
+        }
+        let listener_key = listener.key();
+        let bucket_key = format!(
+            "dynamic-ban|{}|{}|{}",
+            dynamic_offense_key(offense),
+            listener_key,
+            peer.ip()
+        );
+        if self
+            .allow_bucket(bucket_key, per_minute as f64 / 60.0, per_minute as f64)
+            .await
+        {
+            return None;
+        }
+        let block_key = ip_security_key("block", listener_key.as_str(), peer.ip());
+        let subject = peer.ip().to_string();
+        self.block_for(
+            &block_key,
+            dynamic_ban.ban_seconds,
+            listener_key.as_str(),
+            "ip",
+            subject.as_str(),
+            "dynamic-ban",
+        )
+        .await;
+        Some("dynamic-ban")
+    }
+
+    async fn should_log_invalid_packet(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+    ) -> bool {
+        let Some(runtime) = self.listener(listener) else {
+            return false;
+        };
+        let prefilter = &runtime.config.prefilter;
+        if !prefilter.enabled || !prefilter.log_invalid_packets {
+            return false;
+        }
+        let per_minute = prefilter.invalid_log_sample_per_minute;
+        if per_minute == 0 {
+            return false;
+        }
+        let listener_key = listener.key();
+        self.allow_bucket(
+            ip_security_key("invalid-log", listener_key.as_str(), peer.ip()),
+            per_minute as f64 / 60.0,
+            per_minute as f64,
+        )
+        .await
+    }
+
+    async fn check_sip_request(
+        &self,
+        listener: &ProxyListenerConfig,
+        peer: SocketAddr,
+        message: &SipMessage,
+        method: &str,
+    ) -> Option<&'static str> {
+        if matches!(method, "ACK" | "CANCEL") {
+            return None;
+        }
+        let runtime = self.listener(listener)?;
+        if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
+            return None;
+        }
+        let sip_rate = &runtime.config.sip_rate_limit;
+        if !sip_rate.enabled {
+            return None;
+        }
+
+        let (per_minute, reason) = match method {
+            "REGISTER" if sip_rate.register_per_minute_per_aor > 0 => (
+                sip_rate.register_per_minute_per_aor,
+                "sip-register-rate-limit",
+            ),
+            "INVITE" if sip_rate.invite_per_minute_per_aor > 0 => {
+                (sip_rate.invite_per_minute_per_aor, "sip-invite-rate-limit")
+            }
+            _ => return None,
+        };
+
+        let listener_key = listener.key();
+        let identity = sip_rate_identity(message, method, peer);
+        let block_key = format!("sip-block|{listener_key}|{method}|{identity}");
+        if self.is_blocked(&block_key).await {
+            return Some("sip-blocked");
+        }
+        let bucket_key = format!("sip-rate|{listener_key}|{method}|{identity}");
+        if self
+            .allow_bucket(bucket_key, per_minute as f64 / 60.0, per_minute as f64)
+            .await
+        {
+            return None;
+        }
+
+        self.block_for(
+            &block_key,
+            sip_rate.block_seconds,
+            listener_key.as_str(),
+            method,
+            identity.as_str(),
+            reason,
+        )
+        .await;
+        Some(reason)
+    }
+
+    fn listener(&self, listener: &ProxyListenerConfig) -> Option<&ListenerSecurityRuntime> {
+        self.listeners.get(&listener.key())
+    }
+
+    async fn allow_bucket(&self, key: String, rate_per_second: f64, burst: f64) -> bool {
+        if rate_per_second <= 0.0 || burst <= 0.0 {
+            return true;
+        }
+        let now = Instant::now();
+        let mut buckets = self.buckets.shard_for_key(&key).lock().await;
+        let bucket = buckets
+            .entry(key)
+            .or_insert_with(|| TokenBucket::new(rate_per_second, burst, now));
+        bucket.allow(now, rate_per_second, burst)
+    }
+
+    async fn is_blocked(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut blocks = self.blocks.shard_for_key(key).lock().await;
+        match blocks.get(key).copied() {
+            Some(until) if until > now => true,
+            Some(_) => {
+                blocks.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    async fn block_for(
+        &self,
+        key: &str,
+        seconds: u64,
+        listener_key: &str,
+        subject_kind: &str,
+        subject: &str,
+        reason: &str,
+    ) {
+        if seconds == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let Some(until) = now.checked_add(Duration::from_secs(seconds)) else {
+            warn!(
+                listener = %listener_key,
+                subject_kind,
+                subject,
+                reason,
+                ban_seconds = seconds,
+                "security ban duration overflow; skipping ban"
+            );
+            return;
+        };
+        let action = {
+            let mut blocks = self.blocks.shard_for_key(key).lock().await;
+            match blocks.get(key).copied() {
+                Some(existing) if existing > now && existing >= until => {
+                    SecurityBanAction::Retained
+                }
+                Some(existing) if existing > now => {
+                    blocks.insert(key.to_string(), until);
+                    SecurityBanAction::Extended
+                }
+                _ => {
+                    blocks.insert(key.to_string(), until);
+                    SecurityBanAction::Installed
+                }
+            }
+        };
+        match action {
+            SecurityBanAction::Installed => info!(
+                listener = %listener_key,
+                subject_kind,
+                subject,
+                reason,
+                ban_seconds = seconds,
+                "security ban installed"
+            ),
+            SecurityBanAction::Extended => info!(
+                listener = %listener_key,
+                subject_kind,
+                subject,
+                reason,
+                ban_seconds = seconds,
+                "security ban extended"
+            ),
+            SecurityBanAction::Retained => debug!(
+                listener = %listener_key,
+                subject_kind,
+                subject,
+                reason,
+                ban_seconds = seconds,
+                "security ban retained"
+            ),
+        }
+        if matches!(
+            action,
+            SecurityBanAction::Installed | SecurityBanAction::Extended
+        ) && subject_kind == "ip"
+            && let Ok(ip) = subject.parse::<IpAddr>()
+        {
+            self.xdp
+                .sync_ip_block(listener_key, ip, until, reason)
+                .await;
+        }
+    }
+
+    async fn prune_expired(&self) {
+        let now = Instant::now();
+        self.blocks.retain(|_, until| *until > now).await;
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.updated_at) <= SECURITY_BUCKET_IDLE_TTL)
+            .await;
+        self.xdp.prune_expired().await;
+    }
+}
+
+struct ShardedSecurityMap<V> {
+    shards: Vec<Mutex<HashMap<String, V>>>,
+}
+
+impl<V> ShardedSecurityMap<V> {
+    fn new(shards: usize) -> Self {
+        let shard_count = shards.max(1);
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard_for_key(&self, key: &str) -> &Mutex<HashMap<String, V>> {
+        &self.shards[security_shard_index(key, self.shards.len())]
+    }
+
+    async fn retain<F>(&self, mut f: F)
+    where
+        F: FnMut(&String, &mut V) -> bool,
+    {
+        for shard in &self.shards {
+            shard.lock().await.retain(|key, value| f(key, value));
+        }
+    }
+
+    #[cfg(test)]
+    async fn is_empty(&self) -> bool {
+        for shard in &self.shards {
+            if !shard.lock().await.is_empty() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn security_shard_index(key: &str, shards: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() as usize) % shards
+}
+
+struct ListenerSecurityRuntime {
+    config: EffectiveProxySecurityConfig,
+    geo_policy: GeoPolicy,
+    trusted_cidrs: Vec<Cidr>,
+    allow_cidrs: Vec<Cidr>,
+    deny_cidrs: Vec<Cidr>,
+}
+
+impl ListenerSecurityRuntime {
+    fn new(config: EffectiveProxySecurityConfig) -> Result<Self> {
+        Ok(Self {
+            geo_policy: GeoPolicy::from_config(&config.geo),
+            trusted_cidrs: parse_cidrs(&config.trusted_cidrs)?,
+            allow_cidrs: parse_cidrs(&config.allow_cidrs)?,
+            deny_cidrs: parse_cidrs(&config.deny_cidrs)?,
+            config,
+        })
+    }
+
+    fn is_trusted(&self, ip: IpAddr) -> bool {
+        self.trusted_cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+
+    fn is_allowed(&self, ip: IpAddr) -> bool {
+        self.allow_cidrs.is_empty() || self.allow_cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+
+    fn is_denied(&self, ip: IpAddr) -> bool {
+        self.deny_cidrs.iter().any(|cidr| cidr.contains(ip))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Cidr {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl Cidr {
+    fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let (addr, prefix) = if let Some((addr, prefix)) = value.split_once('/') {
+            (
+                addr.parse::<IpAddr>()
+                    .with_context(|| format!("invalid CIDR address '{value}'"))?,
+                Some(
+                    prefix
+                        .parse::<u8>()
+                        .with_context(|| format!("invalid CIDR prefix '{value}'"))?,
+                ),
+            )
+        } else {
+            (
+                value
+                    .parse::<IpAddr>()
+                    .with_context(|| format!("invalid CIDR address '{value}'"))?,
+                None,
+            )
+        };
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        let prefix = prefix.unwrap_or(max_prefix);
+        if prefix > max_prefix {
+            bail!("CIDR prefix in '{value}' must be at most {max_prefix}");
+        }
+        Ok(Self { addr, prefix })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(network), IpAddr::V4(ip)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u32::MAX << (32 - self.prefix);
+                (u32::from(network) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(network), IpAddr::V6(ip)) => {
+                if self.prefix == 0 {
+                    return true;
+                }
+                let mask = u128::MAX << (128 - self.prefix);
+                (u128::from(network) & mask) == (u128::from(ip) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn parse_cidrs(values: &[String]) -> Result<Vec<Cidr>> {
+    values.iter().map(|value| Cidr::parse(value)).collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TokenBucket {
+    tokens: f64,
+    updated_at: Instant,
+}
+
+impl TokenBucket {
+    fn new(_rate_per_second: f64, burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            updated_at: now,
+        }
+    }
+
+    fn allow(&mut self, now: Instant, rate_per_second: f64, burst: f64) -> bool {
+        let elapsed = now.duration_since(self.updated_at).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * rate_per_second).min(burst);
+        self.updated_at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn ip_security_key(kind: &str, listener_key: &str, ip: IpAddr) -> String {
+    format!("{kind}|{listener_key}|{ip}")
+}
+
+fn dynamic_offense_for_reason(reason: &str) -> Option<DynamicOffense> {
+    match reason {
+        "invalid-start-line" => Some(DynamicOffense::InvalidPacket),
+        "parse-error" | "parse-error-rate-limit" => Some(DynamicOffense::ParseError),
+        "sip-register-rate-limit"
+        | "sip-invite-rate-limit"
+        | "sip-blocked"
+        | "sip-invalid-from"
+        | "sip-unregistered-invite"
+        | "sip-unregistered-invite-source" => Some(DynamicOffense::SipRateViolation),
+        _ => None,
+    }
+}
+
+fn dynamic_offense_key(offense: DynamicOffense) -> &'static str {
+    match offense {
+        DynamicOffense::InvalidPacket => "invalid-packet",
+        DynamicOffense::ParseError => "parse-error",
+        DynamicOffense::SipRateViolation => "sip-rate-violation",
+    }
+}
+
+fn is_probable_sip_start_line(packet: &[u8], require_known_method: bool) -> bool {
+    let end = packet
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .unwrap_or(packet.len());
+    let Ok(line) = std::str::from_utf8(&packet[..end]) else {
+        return false;
+    };
+    let line = line.trim();
+    if line.starts_with("SIP/2.0 ") {
+        return true;
+    }
+    if !line.contains(" SIP/2.0") {
+        return false;
+    }
+    let Some(method) = line.split_ascii_whitespace().next() else {
+        return false;
+    };
+    !require_known_method || is_known_sip_method(method)
+}
+
+fn is_known_sip_method(method: &str) -> bool {
+    matches!(
+        method,
+        "INVITE"
+            | "ACK"
+            | "BYE"
+            | "CANCEL"
+            | "OPTIONS"
+            | "REGISTER"
+            | "MESSAGE"
+            | "INFO"
+            | "UPDATE"
+            | "REFER"
+            | "NOTIFY"
+            | "PUBLISH"
+            | "SUBSCRIBE"
+            | "PRACK"
+    )
+}
+
+fn sip_rate_identity(message: &SipMessage, method: &str, peer: SocketAddr) -> String {
+    if method == "REGISTER"
+        && let Ok(aor) = extract_aor(message)
+    {
+        return aor;
+    }
+    message
+        .top_header_value("From")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| peer.ip().to_string())
 }
 
 struct TcpUpstreamPool {
@@ -2370,6 +3606,15 @@ fn prune_udp_branches(branches: &mut HashMap<String, UdpBranchRoute>, now: Insta
     branches.retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL);
 }
 
+fn prune_pending_registers(registers: &mut HashMap<String, PendingRegister>, now: Instant) {
+    registers.retain(|_, pending| now.duration_since(pending.created_at) <= PENDING_REGISTER_TTL);
+}
+
+fn prune_local_invite_rejections(rejections: &mut HashMap<String, Instant>, now: Instant) {
+    rejections
+        .retain(|_, created_at| now.duration_since(*created_at) <= LOCAL_INVITE_REJECTION_TTL);
+}
+
 fn is_crlf_keepalive(packet: &[u8]) -> bool {
     packet.is_empty() || packet.iter().all(|byte| matches!(byte, b'\r' | b'\n'))
 }
@@ -2741,6 +3986,20 @@ fn target_for_registration_binding(
     contact_target
 }
 
+fn registered_invite_source_matches(
+    registered_source: &str,
+    peer: SocketAddr,
+    mode: ProxyRegisteredInviteSourceMatch,
+) -> bool {
+    let Ok(registered) = registered_source.parse::<SocketAddr>() else {
+        return false;
+    };
+    match mode {
+        ProxyRegisteredInviteSourceMatch::Ip => registered.ip() == peer.ip(),
+        ProxyRegisteredInviteSourceMatch::IpPort => registered == peer,
+    }
+}
+
 fn registration_route_keys(route: &str) -> Vec<String> {
     let mut keys = Vec::new();
     push_unique_key(&mut keys, route.trim().to_string());
@@ -2752,19 +4011,57 @@ fn registration_route_keys(route: &str) -> Vec<String> {
     keys
 }
 
+fn collect_contact_route_bindings(
+    bindings: &mut Vec<PendingRegisterBinding>,
+    route: &str,
+    contact: &str,
+    peer: SocketAddr,
+) {
+    for aor in registration_route_keys(route) {
+        push_pending_register_binding(
+            bindings,
+            PendingRegisterBinding {
+                aor,
+                contact: contact.to_string(),
+                source: peer.to_string(),
+            },
+        );
+    }
+}
+
+fn pending_register(
+    bindings: Vec<PendingRegisterBinding>,
+    request_expires: Duration,
+) -> Option<PendingRegister> {
+    (!bindings.is_empty()).then_some(PendingRegister {
+        bindings,
+        request_expires,
+        created_at: Instant::now(),
+    })
+}
+
+fn push_pending_register_binding(
+    bindings: &mut Vec<PendingRegisterBinding>,
+    binding: PendingRegisterBinding,
+) {
+    if bindings.iter().any(|existing| existing.aor == binding.aor) {
+        return;
+    }
+    bindings.push(binding);
+}
+
 fn rewritten_register_contact_user(
     aor: Option<&str>,
     original_contact: &str,
-    peer: SocketAddr,
+    _peer: SocketAddr,
     original_user: &str,
 ) -> String {
     let key = format!(
-        "register-contact|{}|{}|{}",
+        "register-contact|{}|{}",
         aor.unwrap_or_default(),
-        original_contact,
-        peer
+        original_contact
     );
-    let token = compact_uuid_token(&uuid_like_id(&key), 16);
+    let token = compact_uuid_token(&uuid_like_id(&key), 32);
     let user = if original_user.is_empty() {
         "contact"
     } else {
@@ -2940,10 +4237,14 @@ mod tests {
     use super::*;
     use crate::cluster::{ClusterCommand, ContactBinding, StandaloneReplicator, expires_at};
     use crate::config::{
-        Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyListenerConfig,
-        ProxySocketConfig, RouteConfig, SipConfig, SipTransport, UpstreamGroupConfig,
-        UpstreamHealthCheckConfig, UpstreamMode,
+        Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyDynamicBanConfig,
+        ProxyGeoCountryListConfig, ProxyGeoSecurityConfig, ProxyGeoStartupRefresh,
+        ProxyListenerConfig, ProxyRegisteredInviteSourceMatch, ProxySecurityConfig,
+        ProxySecurityPrefilterConfig, ProxySecurityPreset, ProxySipPolicyConfig,
+        ProxySipRateLimitConfig, ProxySocketConfig, ProxyXdpSecurityConfig, RouteConfig, SipConfig,
+        SipTransport, UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamMode,
     };
+    use crate::proxy::geo::test_cache_bytes;
     use tokio::net::UdpSocket;
 
     fn test_listener() -> ProxyListenerConfig {
@@ -2951,6 +4252,7 @@ mod tests {
             bind: "127.0.0.1:5060".to_string(),
             transport: SipTransport::Udp,
             upstream_group: "default".to_string(),
+            security: None,
         }
     }
 
@@ -2959,6 +4261,7 @@ mod tests {
             bind: "127.0.0.1:5060".to_string(),
             transport: SipTransport::Tcp,
             upstream_group: "default".to_string(),
+            security: None,
         }
     }
 
@@ -2971,7 +4274,7 @@ mod tests {
         rewrite_register_contact: bool,
     ) -> ProxyServer {
         let state = Arc::new(SharedState::default());
-        let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
         ProxyServer::new(
             Config {
                 sip: SipConfig {
@@ -2986,6 +4289,7 @@ mod tests {
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
+                    security: Default::default(),
                     listeners: vec![test_listener()],
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
@@ -3005,13 +4309,14 @@ mod tests {
             },
             state,
             replicator,
+            None,
         )
         .unwrap()
     }
 
     fn test_server_with_dual_advertise(upstream: SocketAddr) -> ProxyServer {
         let state = Arc::new(SharedState::default());
-        let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
         ProxyServer::new(
             Config {
                 sip: SipConfig {
@@ -3026,6 +4331,7 @@ mod tests {
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
+                    security: Default::default(),
                     listeners: vec![test_listener()],
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
@@ -3039,13 +4345,14 @@ mod tests {
             },
             state,
             replicator,
+            None,
         )
         .unwrap()
     }
 
     fn test_server_with_upstreams(upstreams: Vec<SocketAddr>) -> ProxyServer {
         let state = Arc::new(SharedState::default());
-        let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
         ProxyServer::new(
             Config {
                 sip: SipConfig {
@@ -3063,6 +4370,7 @@ mod tests {
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
+                    security: Default::default(),
                     listeners: vec![test_listener()],
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
@@ -3076,6 +4384,7 @@ mod tests {
             },
             state,
             replicator,
+            None,
         )
         .unwrap()
     }
@@ -3085,7 +4394,7 @@ mod tests {
         affinity: ProxyAffinityConfig,
     ) -> ProxyServer {
         let state = Arc::new(SharedState::default());
-        let replicator = Arc::new(StandaloneReplicator::new(state.clone()));
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
         ProxyServer::new(
             Config {
                 sip: SipConfig {
@@ -3103,6 +4412,7 @@ mod tests {
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity,
+                    security: Default::default(),
                     listeners: vec![test_listener()],
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
@@ -3116,6 +4426,54 @@ mod tests {
             },
             state,
             replicator,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn test_server_with_security(
+        upstream: SocketAddr,
+        security: ProxySecurityConfig,
+    ) -> ProxyServer {
+        test_server_with_listener_and_security(upstream, test_listener(), security)
+    }
+
+    fn test_server_with_listener_and_security(
+        upstream: SocketAddr,
+        listener: ProxyListenerConfig,
+        security: ProxySecurityConfig,
+    ) -> ProxyServer {
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        ProxyServer::new(
+            Config {
+                sip: SipConfig {
+                    external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstream.to_string(),
+                    ..SipConfig::default()
+                },
+                proxy: ProxyConfig {
+                    record_route: true,
+                    register_routing: None,
+                    rewrite_register_contact: false,
+                    socket: ProxySocketConfig::default(),
+                    metrics: Default::default(),
+                    affinity: Default::default(),
+                    security,
+                    listeners: vec![listener],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream.to_string()],
+                    }],
+                    routes: vec![],
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            None,
         )
         .unwrap()
     }
@@ -3148,6 +4506,666 @@ CSeq: 1 OPTIONS\r\n\r\n",
     }
 
     #[tokio::test]
+    async fn udp_security_prefilter_drops_invalid_start_line() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                preset: Some(ProxySecurityPreset::Public),
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"GET / HTTP/1.0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_security_invite_rate_limit_returns_503() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                preset: Some(ProxySecurityPreset::Public),
+                sip_rate_limit: ProxySipRateLimitConfig {
+                    invite_per_minute_per_aor: Some(1),
+                    ..ProxySipRateLimitConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        for branch in ["z9hG4bK-security-invite-a", "z9hG4bK-security-invite-b"] {
+            let invite = format!(
+                "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch={branch};rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: {branch}\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+            );
+            server
+                .handle_udp_packet(
+                    &proxy_socket,
+                    invite.as_bytes(),
+                    client_addr,
+                    &test_listener(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut upstream_buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+        let forwarded = String::from_utf8(upstream_buf[..len].to_vec()).unwrap();
+        assert!(forwarded.contains("z9hG4bK-security-invite-a"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut upstream_buf)
+            )
+            .await
+            .is_err()
+        );
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 503 Service Unavailable"));
+        assert!(response.contains(&format!("rport={}", client_addr.port())));
+    }
+
+    #[tokio::test]
+    async fn udp_sip_policy_rejects_unregistered_invite_source() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                sip_policy: ProxySipPolicyConfig {
+                    require_registered_invite_source: Some(true),
+                    ..ProxySipPolicyConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        let invite = format!(
+            "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-unregistered-invite;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: unregistered-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut upstream_buf = [0_u8; 4096];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut upstream_buf)
+            )
+            .await
+            .is_err()
+        );
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 403 Forbidden"));
+        assert!(response.contains(&format!("rport={}", client_addr.port())));
+
+        let ack = format!(
+            "ACK sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-unregistered-invite;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: unregistered-invite\r\n\
+CSeq: 1 ACK\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(&proxy_socket, ack.as_bytes(), client_addr, &test_listener())
+            .await
+            .unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut upstream_buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_sip_policy_allows_registered_invite_source_ip_with_port_drift() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invite_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let invite_client_addr = invite_client_socket.local_addr().unwrap();
+        assert_eq!(registered_client_addr.ip(), invite_client_addr.ip());
+        assert_ne!(registered_client_addr.port(), invite_client_addr.port());
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                sip_policy: ProxySipPolicyConfig {
+                    require_registered_invite_source: Some(true),
+                    registered_invite_source_match: Some(ProxyRegisteredInviteSourceMatch::Ip),
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-policy;rport\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Contact: <sip:100@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-policy\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:100@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let mut registered_client_buf = [0_u8; 4096];
+        let _ = registered_client_socket
+            .recv_from(&mut registered_client_buf)
+            .await
+            .unwrap();
+
+        let invite = format!(
+            "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {invite_client_addr};branch=z9hG4bK-registered-invite;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: registered-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                invite_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:200@example.com SIP/2.0"));
+        assert!(forwarded.contains("From: <sip:100@example.com>;tag=a"));
+    }
+
+    #[tokio::test]
+    async fn register_success_response_controls_invite_policy_after_mixed_contact_expires() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                sip_policy: ProxySipPolicyConfig {
+                    require_registered_invite_source: Some(true),
+                    registered_invite_source_match: Some(ProxyRegisteredInviteSourceMatch::Ip),
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-register-mixed-expires;rport\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{client_addr};ob>\r\n\
+Contact: <sip:3001@{client_addr};ob>;expires=0\r\n\
+Expires: 300\r\n\
+Call-ID: register-mixed-expires\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{client_addr};ob"),
+            300,
+        )
+        .await;
+        let _ = client_socket.recv_from(&mut buf).await.unwrap();
+
+        let invite = format!(
+            "INVITE sip:3000@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-invite-after-mixed-register;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3000@example.com>\r\n\
+Call-ID: invite-after-mixed-register\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_invite = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded_invite.starts_with("INVITE sip:3000@example.com SIP/2.0"));
+    }
+
+    #[tokio::test]
+    async fn udp_geo_deny_country_drops_before_forwarding() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cache_dir.path().join("geo.sgeo"),
+            test_cache_bytes("US", "127.0.0.0/8\n"),
+        )
+        .unwrap();
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                geo: ProxyGeoSecurityConfig {
+                    enabled: Some(true),
+                    cache_dir: Some(cache_dir.path().to_string_lossy().to_string()),
+                    startup_refresh: Some(ProxyGeoStartupRefresh::Disabled),
+                    deny: ProxyGeoCountryListConfig {
+                        countries: Some(vec!["US".to_string()]),
+                    },
+                    ..ProxyGeoSecurityConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"OPTIONS sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-geo-drop\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:example.com>\r\n\
+Call-ID: geo-drop\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_dynamic_ban_blocks_ip_after_invalid_packets() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                prefilter: ProxySecurityPrefilterConfig {
+                    enabled: Some(true),
+                    drop_invalid_start_line: Some(true),
+                    drop_non_sip_methods: Some(true),
+                    ..ProxySecurityPrefilterConfig::default()
+                },
+                dynamic_ban: ProxyDynamicBanConfig {
+                    enabled: Some(true),
+                    ban_seconds: Some(60),
+                    invalid_packets_per_minute: Some(1),
+                    ..ProxyDynamicBanConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+        let peer = "127.0.0.1:5061".parse().unwrap();
+
+        for _ in 0..2 {
+            server
+                .handle_udp_packet(
+                    &proxy_socket,
+                    b"GET / HTTP/1.0\r\n\r\n",
+                    peer,
+                    &test_listener(),
+                )
+                .await
+                .unwrap();
+        }
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"OPTIONS sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-dynamic-block\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:example.com>\r\n\
+Call-ID: dynamic-block\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+                peer,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_security_prefilter_drops_invalid_start_line() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(tcp_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_stream, peer) = tcp_listener.accept().await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = test_tcp_listener();
+        let server = test_server_with_listener_and_security(
+            upstream_socket.local_addr().unwrap(),
+            listener.clone(),
+            ProxySecurityConfig {
+                prefilter: ProxySecurityPrefilterConfig {
+                    enabled: Some(true),
+                    drop_invalid_start_line: Some(true),
+                    drop_non_sip_methods: Some(true),
+                    ..ProxySecurityPrefilterConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        server
+            .handle_tcp_packet(
+                &mut server_stream,
+                b"GET / HTTP/1.0\r\n\r\n",
+                peer,
+                &listener,
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 128];
+        assert!(
+            timeout(Duration::from_millis(100), client.read(&mut buf))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_security_sip_rate_limit_returns_503() {
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(tcp_listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server_stream, peer) = tcp_listener.accept().await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listener = test_tcp_listener();
+        let server = test_server_with_listener_and_security(
+            upstream_socket.local_addr().unwrap(),
+            listener.clone(),
+            ProxySecurityConfig {
+                preset: Some(ProxySecurityPreset::Public),
+                sip_rate_limit: ProxySipRateLimitConfig {
+                    invite_per_minute_per_aor: Some(1),
+                    ..ProxySipRateLimitConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+        server
+            .security
+            .allow_bucket(
+                "sip-rate|tcp/127.0.0.1:5060|INVITE|<sip:100@example.com>;tag=a".to_string(),
+                1.0 / 60.0,
+                1.0,
+            )
+            .await;
+
+        server
+            .handle_tcp_packet(
+                &mut server_stream,
+                b"INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/TCP 127.0.0.1:5061;branch=z9hG4bK-tcp-security\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: tcp-security\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                peer,
+                &listener,
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let len = timeout(Duration::from_millis(500), client.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 503 Service Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn security_prune_removes_expired_blocks_and_idle_buckets() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig::default(),
+        );
+        server
+            .security
+            .blocks
+            .shard_for_key("expired")
+            .lock()
+            .await
+            .insert(
+                "expired".to_string(),
+                Instant::now() - Duration::from_secs(1),
+            );
+        server
+            .security
+            .buckets
+            .shard_for_key("idle")
+            .lock()
+            .await
+            .insert(
+                "idle".to_string(),
+                TokenBucket {
+                    tokens: 1.0,
+                    updated_at: Instant::now() - SECURITY_BUCKET_IDLE_TTL - Duration::from_secs(1),
+                },
+            );
+
+        server.security.prune_expired().await;
+
+        assert!(server.security.blocks.is_empty().await);
+        assert!(server.security.buckets.is_empty().await);
+    }
+
+    #[test]
+    fn rejects_inconsistent_geo_source_config_across_listeners() {
+        let cache_a = tempfile::tempdir().unwrap();
+        let cache_b = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        let config = Config {
+            proxy: ProxyConfig {
+                listeners: vec![
+                    ProxyListenerConfig {
+                        bind: "127.0.0.1:5060".to_string(),
+                        transport: SipTransport::Udp,
+                        upstream_group: "default".to_string(),
+                        security: Some(ProxySecurityConfig {
+                            geo: ProxyGeoSecurityConfig {
+                                enabled: Some(true),
+                                cache_dir: Some(cache_a.path().to_string_lossy().to_string()),
+                                ..ProxyGeoSecurityConfig::default()
+                            },
+                            ..ProxySecurityConfig::default()
+                        }),
+                    },
+                    ProxyListenerConfig {
+                        bind: "127.0.0.1:5061".to_string(),
+                        transport: SipTransport::Udp,
+                        upstream_group: "default".to_string(),
+                        security: Some(ProxySecurityConfig {
+                            geo: ProxyGeoSecurityConfig {
+                                enabled: Some(true),
+                                cache_dir: Some(cache_b.path().to_string_lossy().to_string()),
+                                ..ProxyGeoSecurityConfig::default()
+                            },
+                            ..ProxySecurityConfig::default()
+                        }),
+                    },
+                ],
+                upstream_groups: vec![UpstreamGroupConfig {
+                    name: "default".to_string(),
+                    mode: UpstreamMode::RoundRobin,
+                    health_check: UpstreamHealthCheckConfig::default(),
+                    servers: vec!["127.0.0.1:5080".to_string()],
+                }],
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert!(ProxyServer::new(config, state, replicator, None).is_err());
+    }
+
+    #[test]
+    fn rejects_xdp_fail_closed_when_backend_unavailable() {
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        let config = Config {
+            proxy: ProxyConfig {
+                security: ProxySecurityConfig {
+                    xdp: ProxyXdpSecurityConfig {
+                        enabled: Some(true),
+                        interfaces: Some(vec!["eth0".to_string()]),
+                        fail_open: Some(false),
+                        ..ProxyXdpSecurityConfig::default()
+                    },
+                    ..ProxySecurityConfig::default()
+                },
+                listeners: vec![test_listener()],
+                upstream_groups: vec![UpstreamGroupConfig {
+                    name: "default".to_string(),
+                    mode: UpstreamMode::RoundRobin,
+                    health_check: UpstreamHealthCheckConfig::default(),
+                    servers: vec!["127.0.0.1:5080".to_string()],
+                }],
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        assert!(ProxyServer::new(config, state, replicator, None).is_err());
+    }
+
+    #[tokio::test]
     async fn register_is_forwarded_to_upstream() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -3177,6 +5195,15 @@ Content-Length: 0\r\n\r\n",
         assert!(forwarded.contains("Path: <sip:127.0.0.1:5060;lr>"));
         assert!(forwarded.contains("Contact: <sip:100@127.0.0.1:5061>;expires=60"));
         assert!(forwarded.contains("Call-ID: register-forward"));
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded,
+            "sip:100@127.0.0.1:5061",
+            60,
+        )
+        .await;
         assert_eq!(
             server
                 .state
@@ -3331,6 +5358,16 @@ Content-Length: 0\r\n\r\n",
         assert!(!rewritten_contact.contains(";ob"));
         assert!(!forwarded.contains("Path:"));
 
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded,
+            "sip:6805@10.0.0.10:53109;ob",
+            60,
+        )
+        .await;
+
         let binding = server.state.lookup(&rewritten_contact).await.unwrap();
         assert_eq!(binding.contact, "sip:6805@10.0.0.10:53109;ob");
         let binding = server.state.lookup("sip:6805@example.com").await.unwrap();
@@ -3390,10 +5427,73 @@ Content-Length: 0\r\n\r\n"
         assert!(first_contact.ends_with("@127.0.0.1:5060"));
         assert!(second_contact.ends_with("@127.0.0.1:5060"));
 
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &first,
+            "sip:3001@10.0.0.10:53109;ob",
+            60,
+        )
+        .await;
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &second,
+            "sip:3001@10.0.0.11:53110;ob",
+            60,
+        )
+        .await;
+
         let first_binding = server.state.lookup(&first_contact).await.unwrap();
         let second_binding = server.state.lookup(&second_contact).await.unwrap();
         assert_eq!(first_binding.contact, "sip:3001@10.0.0.10:53109;ob");
         assert_eq!(second_binding.contact, "sip:3001@10.0.0.11:53110;ob");
+    }
+
+    #[tokio::test]
+    async fn rewritten_register_contact_is_stable_when_nat_source_port_changes() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream_config(upstream_socket.local_addr().unwrap(), true);
+        let client_contact = "sip:3001@10.0.0.10:53109;ob";
+
+        for (branch, peer) in [
+            ("z9hG4bK-register-nat-a", "127.0.0.1:53109"),
+            ("z9hG4bK-register-nat-b", "127.0.0.1:62000"),
+        ] {
+            let register = format!(
+                "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch={branch}\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <{client_contact}>;expires=60\r\n\
+Call-ID: {branch}\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+            );
+            server
+                .handle_udp_packet(
+                    &proxy_socket,
+                    register.as_bytes(),
+                    peer.parse().unwrap(),
+                    &test_listener(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let first = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let second = String::from_utf8(buf[..len].to_vec()).unwrap();
+
+        assert_eq!(
+            contact_uri_from_message(&first),
+            contact_uri_from_message(&second)
+        );
     }
 
     #[tokio::test]
@@ -3424,7 +5524,19 @@ Content-Length: 0\r\n\r\n"
             .await
             .unwrap();
         let mut upstream_buf = [0_u8; 4096];
-        let _ = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+        let forwarded_register = String::from_utf8(upstream_buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3000@{client_addr};ob"),
+            60,
+        )
+        .await;
+        let mut client_buf = [0_u8; 4096];
+        let _ = client_socket.recv_from(&mut client_buf).await.unwrap();
 
         let invite = b"INVITE sip:3000@127.0.0.1:5060;ob SIP/2.0\r\n\
 Route: <sip:127.0.0.1:5060;lr>\r\n\
@@ -3446,7 +5558,6 @@ Content-Length: 0\r\n\r\n";
             .await
             .unwrap();
 
-        let mut client_buf = [0_u8; 4096];
         let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
         let forwarded = String::from_utf8(client_buf[..len].to_vec()).unwrap();
         assert!(forwarded.starts_with("INVITE sip:3000@127.0.0.1:5060;ob SIP/2.0"));
@@ -3509,7 +5620,18 @@ Content-Length: 0\r\n\r\n"
             .await
             .unwrap();
         let mut buf = [0_u8; 4096];
-        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_client_socket.recv_from(&mut buf).await.unwrap();
 
         server
             .handle_udp_packet(
@@ -3571,7 +5693,18 @@ Content-Length: 0\r\n\r\n"
             .await
             .unwrap();
         let mut buf = [0_u8; 4096];
-        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_client_socket.recv_from(&mut buf).await.unwrap();
 
         let invite = format!(
             "INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
@@ -3643,7 +5776,18 @@ Content-Length: 0\r\n\r\n"
             .await
             .unwrap();
         let mut buf = [0_u8; 4096];
-        let _ = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{contact_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_source_socket.recv_from(&mut buf).await.unwrap();
 
         let invite = format!(
             "INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
@@ -4138,6 +6282,77 @@ Content-Length: 0\r\n\r\n",
     }
 
     #[tokio::test]
+    async fn proxy_alias_request_ignores_unhealthy_affinity_target() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first_upstream.local_addr().unwrap();
+        let second_addr = second_upstream.local_addr().unwrap();
+        let server = test_server_with_upstreams_and_affinity(
+            vec![first_addr, second_addr],
+            ProxyAffinityConfig {
+                enabled: true,
+                key: ProxyAffinityKey::CallId,
+                ttl_seconds: 3600,
+            },
+        );
+        server
+            .upstreams
+            .groups
+            .get("default")
+            .unwrap()
+            .set_health(0, false);
+        let request = SipMessage::parse(
+            b"MESSAGE sip:127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-affinity-proxy-alias\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: stale-affinity-proxy-alias\r\n\
+CSeq: 1 MESSAGE\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        server
+            .affinity
+            .remember(
+                &request,
+                AffinityTarget {
+                    addr: first_addr,
+                    transport: SipTransport::Udp,
+                },
+            )
+            .await
+            .unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                &request.to_bytes(),
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        timeout(
+            Duration::from_millis(500),
+            second_upstream.recv_from(&mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                first_upstream.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn max_forwards_zero_returns_483_without_forwarding() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -4546,6 +6761,33 @@ Content-Length: 0\r\n\r\n",
         );
     }
 
+    #[tokio::test]
+    async fn proxy_state_snapshot_rejects_invalid_checksum() {
+        let source = test_server_with_upstream("127.0.0.1:5080".parse().unwrap());
+        let target = test_server_with_upstream("127.0.0.1:5080".parse().unwrap());
+        source
+            .state
+            .apply(ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:checksum@example.com".to_string(),
+                contact: "<sip:checksum@127.0.0.1:5061>;expires=60".to_string(),
+                source: "127.0.0.1:5061".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await;
+
+        let mut snapshot = source.snapshot_state().await;
+        snapshot.checksum = "bad-checksum".to_string();
+        target.install_state_snapshot(snapshot).await;
+
+        assert!(
+            target
+                .state
+                .lookup("sip:checksum@example.com")
+                .await
+                .is_none()
+        );
+    }
+
     #[test]
     fn upstream_group_skips_unhealthy_servers_when_possible() {
         let group = UpstreamGroupRuntime::new(&UpstreamGroupConfig {
@@ -4672,6 +6914,38 @@ Content-Length: 0\r\n\r\n",
             .trim_start_matches("Contact:")
             .trim();
         RsipContact::parse(value).unwrap().uri.to_string()
+    }
+
+    async fn complete_register_ok(
+        server: &ProxyServer,
+        proxy_socket: &UdpSocket,
+        upstream: SocketAddr,
+        forwarded_register: &str,
+        contact: &str,
+        expires: u64,
+    ) {
+        let branch = SipMessage::parse(forwarded_register.as_bytes())
+            .unwrap()
+            .top_via_branch()
+            .unwrap()
+            .unwrap();
+        let response = format!(
+            "SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch={branch};rport=5060\r\n\
+Contact: <{contact}>;expires={expires}\r\n\
+Call-ID: register-ok\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                proxy_socket,
+                response.as_bytes(),
+                upstream,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
     }
 
     #[test]

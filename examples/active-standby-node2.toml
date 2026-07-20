@@ -59,6 +59,13 @@ upstream_group = "pbx-a"
 [ha]
 leader_check_interval_ms = 1000
 
+[ha.persistence]
+enabled = true
+path = "/var/lib/sigproxy-rs/ha/state-node2.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
+
 [ha.active_standby]
 enabled = true
 initial_role = "standby"

@@ -95,6 +95,9 @@ record_route = true
 register_routing = "path"
 
 [proxy.socket]
+# Keep reuse_port disabled for simple deployments. Enable it for high PPS UDP
+# listeners before raising workers_per_listener; workers_per_listener = 0 means
+# auto CPU count and requires reuse_port = true.
 reuse_port = false
 workers_per_listener = 1
 recv_buffer_bytes = 4194304
@@ -141,6 +144,13 @@ upstream_group = "pbx-a"
 [ha]
 leader_check_interval_ms = 1000
 
+[ha.persistence]
+enabled = false
+path = "/var/lib/sigproxy-rs/ha/state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
+
 [ha.active_standby]
 enabled = false
 
@@ -159,6 +169,12 @@ keeps a reachable route.
 
 `public_addr` and `internal_addr` may be just a host/IP; when the port is
 omitted, sigproxy uses the port from the matching SIP listener.
+
+When `[ha.persistence]` is enabled, sigproxy stores REGISTER location,
+affinity bindings, and the HA event log in local SQLite WAL mode. In a
+two-node active/standby pair, standby pulls `/ha/events` incrementally and
+falls back to `/ha/snapshot` when its checkpoint is behind the retained event
+log. The SQLite file is node-local and must not be shared between pods.
 
 If `internal_addr` is empty or omitted, sigproxy probes `internal_probe_addr`
 with a UDP socket and advertises that local address. If `public_addr` is empty
@@ -293,6 +309,118 @@ The proxy also records a lightweight INVITE transaction route:
 
 This improves SIP-aware session persistence without turning the proxy into a
 stateful SIP transaction proxy.
+
+## Listener Security
+
+Security is configured globally under `[proxy.security]` and can be overridden
+per listener with `[proxy.listeners.security]`. Dynamic ban is enabled by
+default; set `preset = "off"` to explicitly disable all listener security.
+
+```toml
+[proxy.security]
+preset = "public"
+trusted_cidrs = ["172.30.0.0/16"]
+
+[proxy.security.ip_rate_limit]
+packets_per_second = 50
+burst = 100
+parse_errors_per_minute = 20
+block_seconds = 300
+
+[proxy.security.sip_rate_limit]
+register_per_minute_per_aor = 20
+invite_per_minute_per_aor = 60
+block_seconds = 300
+
+[proxy.security.sip_policy]
+require_registered_invite_source = true
+registered_invite_source_match = "ip"
+
+[proxy.security.geo]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/geo"
+startup_refresh = "disabled"
+
+[proxy.security.geo.deny]
+countries = ["RU", "IR", "KP"]
+
+[proxy.security.dynamic_ban]
+enabled = true
+ban_seconds = 3600
+invalid_packets_per_minute = 30
+parse_errors_per_minute = 20
+sip_rate_violations_per_minute = 10
+```
+
+Presets are `off`, `trusted`, `public`, and `strict`. SIP listeners apply
+CIDR allow/deny checks, listener-scoped geo country checks, packet and
+parse-error rate limits, fail2ban-style dynamic bans, invalid start-line
+prefiltering, and `REGISTER`/`INVITE` SIP identity limits. `ACK` and `CANCEL`
+are not SIP-rate-limited so transaction cleanup is not disrupted. Geo data is
+loaded from a binary `geo.sgeo` cache in `cache_dir`, with an embedded empty
+snapshot as the startup fallback. By default, geo refresh is disabled at runtime
+so container deployments use the cache built into the image.
+
+When `require_registered_invite_source = true`, initial `INVITE` requests from
+client-side peers must use a From AoR that has an active REGISTER binding, and
+the source must match the registered source IP by default. Use
+`registered_invite_source_match = "ip-port"` only for environments where the
+client NAT source port is stable.
+
+Build or preseed the binary geo cache with:
+
+```bash
+sigproxy geo-cache build --countries all --output /var/lib/sigproxy-rs/geo/geo.sgeo --retries 3 --allow-partial
+```
+
+The Dockerfile downloads and builds the full geo cache at image build time by
+default (`GEO_COUNTRIES=all`, `GEO_RETRIES=3`, `GEO_ALLOW_PARTIAL=true`). A
+temporary failure for one country is skipped with a warning so the image can
+still embed the countries that were fetched successfully. Runtime startup does
+not download geo data unless `startup_refresh = "background"` or `"blocking"` is
+explicitly configured.
+
+`all` expands to country and territory zones only; ipdeny aggregate zones such
+as `AP` and `EU` are intentionally excluded because they overlap concrete
+country ranges.
+
+```bash
+docker build -t sigproxy-rs .
+```
+
+Set `startup_refresh = "background"` only when the running process should
+refresh the geo cache after startup.
+
+To skip geo download during image build, pass an empty build arg:
+
+```bash
+docker build --build-arg GEO_COUNTRIES= -t sigproxy-rs .
+```
+
+When `[proxy.security.xdp]` is enabled, the Docker image also builds and ships
+`/usr/local/share/sigproxy/sigproxy_xdp.o`. XDP offloads listener-scoped dynamic
+IP blocklists, CIDR allow/deny rules, geo country allow/deny rules generated
+from `geo.sgeo`, and per-source-IP packet token buckets. SIP semantic checks
+such as REGISTER/INVITE AoR limits and registered-INVITE-source policy remain
+in user space. XDP drop/pass counters are exposed as
+`proxy_xdp_packets_total{action="..."}`. The userspace control plane loads,
+attaches, and updates XDP maps directly through aya; runtime `bpftool` and
+`ip link` shell-outs are not required. Running with XDP requires Linux
+privileges such as `CAP_NET_ADMIN` and `CAP_BPF` plus access to bpffs at
+`/sys/fs/bpf`; otherwise `fail_open = true` falls back to user-space security,
+while `fail_open = false` rejects startup.
+
+On the host, make sure bpffs is mounted before starting the container:
+
+```bash
+mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+docker run --cap-add NET_ADMIN --cap-add BPF \
+  --mount type=bind,source=/sys/fs/bpf,target=/sys/fs/bpf \
+  sigproxy-rs
+```
+
+For Kubernetes, use `hostNetwork: true`, privileged security context, and a
+`hostPath` mount for `/sys/fs/bpf`; see [docs/kubernetes-xdp.md](docs/kubernetes-xdp.md).
 
 ## REGISTER / OPTIONS
 

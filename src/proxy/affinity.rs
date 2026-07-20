@@ -21,6 +21,10 @@ impl AffinityKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_string(value: String) -> Self {
+        Self(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +36,7 @@ pub struct AffinityStateSnapshot {
 pub struct AffinityBindingSnapshot {
     pub key: AffinityKey,
     pub target: AffinityTarget,
+    #[serde(with = "crate::serde_u128")]
     pub expires_at_epoch_ms: u128,
 }
 
@@ -71,20 +76,34 @@ impl AffinityTable {
             .find_map(|key| bindings.get(key).map(|binding| binding.target)))
     }
 
-    pub async fn remember(&self, message: &SipMessage, target: AffinityTarget) -> Result<()> {
+    pub async fn remember(
+        &self,
+        message: &SipMessage,
+        target: AffinityTarget,
+    ) -> Result<Vec<AffinityBindingSnapshot>> {
         if !self.config.enabled {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let keys = affinity_keys(message, self.config.key)?;
         if keys.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let expires_at = Instant::now() + Duration::from_secs(self.config.ttl_seconds);
+        let expires_at_epoch_ms = now_epoch_ms() + u128::from(self.config.ttl_seconds) * 1_000;
+        let snapshots = keys
+            .iter()
+            .cloned()
+            .map(|key| AffinityBindingSnapshot {
+                key,
+                target,
+                expires_at_epoch_ms,
+            })
+            .collect::<Vec<_>>();
         let mut bindings = self.bindings.lock().await;
         for key in keys {
             bindings.insert(key, AffinityBinding { target, expires_at });
         }
-        Ok(())
+        Ok(snapshots)
     }
 
     pub async fn snapshot(&self) -> AffinityStateSnapshot {
@@ -127,6 +146,30 @@ impl AffinityTable {
             );
         }
         *self.bindings.lock().await = bindings;
+    }
+
+    pub async fn upsert_snapshot_bindings(&self, snapshots: Vec<AffinityBindingSnapshot>) {
+        let now_epoch_ms = now_epoch_ms();
+        let now = Instant::now();
+        let mut bindings = self.bindings.lock().await;
+        for snapshot in snapshots {
+            if snapshot.expires_at_epoch_ms <= now_epoch_ms {
+                bindings.remove(&snapshot.key);
+                continue;
+            }
+            let ttl_ms = snapshot.expires_at_epoch_ms - now_epoch_ms;
+            bindings.insert(
+                snapshot.key,
+                AffinityBinding {
+                    target: snapshot.target,
+                    expires_at: now + Duration::from_millis(ttl_ms as u64),
+                },
+            );
+        }
+    }
+
+    pub async fn remove_key(&self, key: &AffinityKey) {
+        self.bindings.lock().await.remove(key);
     }
 
     pub async fn active_len(&self) -> usize {

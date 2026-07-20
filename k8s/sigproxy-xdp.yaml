@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sigproxy-config
+  namespace: default
+data:
+  config.toml: |
+    [proxy]
+    record_route = true
+    register_routing = "path"
+
+    [proxy.affinity]
+    enabled = true
+    key = "dialog-id"
+    ttl_seconds = 3600
+
+    [proxy.security]
+    preset = "public"
+    trusted_cidrs = ["172.30.0.0/16"]
+
+    [proxy.security.geo]
+    enabled = true
+    cache_dir = "/var/lib/sigproxy-rs/geo"
+    startup_refresh = "disabled"
+    fail_open = true
+    unknown_country = "allow"
+
+    [proxy.security.geo.deny]
+    countries = ["RU", "IR", "KP"]
+
+    [proxy.security.dynamic_ban]
+    enabled = true
+    ban_seconds = 3600
+    invalid_packets_per_minute = 30
+    parse_errors_per_minute = 20
+    sip_rate_violations_per_minute = 10
+
+    [proxy.security.sip_policy]
+    require_registered_invite_source = true
+    registered_invite_source_match = "ip"
+
+    [proxy.security.xdp]
+    enabled = true
+    interfaces = []
+    fail_open = false
+    sync_dynamic_ban = true
+    cidr_filter = true
+    geo_filter = true
+    ip_rate_limit = true
+
+    [[proxy.listeners]]
+    bind = "0.0.0.0:5060"
+    transport = "udp"
+    upstream_group = "default"
+
+    [[proxy.upstream_groups]]
+    name = "default"
+    mode = "round-robin"
+    servers = ["172.30.0.60:5060"]
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: sigproxy
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      app: sigproxy
+  template:
+    metadata:
+      labels:
+        app: sigproxy
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: sigproxy
+          image: 1228022817/sigproxy-rs:latest
+          imagePullPolicy: Always
+          args: ["run", "--config", "/etc/sigproxy/config.toml"]
+          securityContext:
+            privileged: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+                - NET_ADMIN
+                - BPF
+                - PERFMON
+                - SYS_ADMIN
+                - SYS_RESOURCE
+          ports:
+            - name: sip-udp
+              containerPort: 5060
+              hostPort: 5060
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/sigproxy/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: bpffs
+              mountPath: /sys/fs/bpf
+            - name: geo-cache
+              mountPath: /var/lib/sigproxy-rs/geo
+      volumes:
+        - name: config
+          configMap:
+            name: sigproxy-config
+        - name: bpffs
+          hostPath:
+            path: /sys/fs/bpf
+            type: Directory
+        - name: geo-cache
+          emptyDir: {}

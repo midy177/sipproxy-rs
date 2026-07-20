@@ -3,10 +3,15 @@ use crate::cluster::{ClusterReplicator, ClusterRole, NodeId};
 use crate::config::{
     HaActiveStandbyConfig, HaAddonConfig, HaInitialRole, HaReplicationConfig, NodeConfig,
 };
+use crate::persistence::{HaEventRecord, HaEventsResponse};
 use crate::proxy::{AffinityStateSnapshot, ProxyServer};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use axum::{Json, Router, extract::State, routing::get};
+use axum::{
+    Json, Router,
+    extract::{Query, State},
+    routing::get,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -37,8 +42,83 @@ impl HaContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HaStateSnapshot {
+    #[serde(default)]
+    pub last_seq: u64,
+    #[serde(default)]
+    pub checksum: String,
     pub contacts: ContactStateSnapshot,
     pub affinity: AffinityStateSnapshot,
+}
+
+impl HaStateSnapshot {
+    pub fn with_checksum(mut self) -> Self {
+        self.checksum = self.compute_checksum();
+        self
+    }
+
+    pub fn checksum_is_valid(&self) -> bool {
+        self.checksum.is_empty() || self.checksum == self.compute_checksum()
+    }
+
+    pub fn compute_checksum(&self) -> String {
+        let mut contacts = self.contacts.contacts.clone();
+        contacts.sort_by(|a, b| {
+            a.aor
+                .cmp(&b.aor)
+                .then_with(|| a.contact.cmp(&b.contact))
+                .then_with(|| a.source.cmp(&b.source))
+                .then_with(|| a.expires_at_epoch_ms.cmp(&b.expires_at_epoch_ms))
+        });
+        let mut affinity = self.affinity.bindings.clone();
+        affinity.sort_by(|a, b| {
+            a.key
+                .as_str()
+                .cmp(b.key.as_str())
+                .then_with(|| a.target.addr.cmp(&b.target.addr))
+                .then_with(|| a.target.transport.as_str().cmp(b.target.transport.as_str()))
+                .then_with(|| a.expires_at_epoch_ms.cmp(&b.expires_at_epoch_ms))
+        });
+
+        let mut hash = FNV_OFFSET_BASIS;
+        hash_u64(&mut hash, self.last_seq);
+        for contact in contacts {
+            hash_str(&mut hash, &contact.aor);
+            hash_str(&mut hash, &contact.contact);
+            hash_str(&mut hash, &contact.source);
+            hash_u128(&mut hash, contact.expires_at_epoch_ms);
+        }
+        for binding in affinity {
+            hash_str(&mut hash, binding.key.as_str());
+            hash_str(&mut hash, &binding.target.addr.to_string());
+            hash_str(&mut hash, binding.target.transport.as_str());
+            hash_u128(&mut hash, binding.expires_at_epoch_ms);
+        }
+        format!("fnv1a64:{hash:016x}")
+    }
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+fn hash_str(hash: &mut u64, value: &str) {
+    hash_bytes(hash, value.as_bytes());
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    hash_bytes(hash, &value.to_be_bytes());
+}
+
+fn hash_u128(hash: &mut u64, value: u128) {
+    hash_bytes(hash, &value.to_be_bytes());
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +425,7 @@ pub async fn run_state_replication(
         .with_context(|| format!("failed to bind HA replication listener {bind_addr}"))?;
     let app = Router::new()
         .route("/ha/snapshot", get(ha_snapshot))
+        .route("/ha/events", get(ha_events))
         .with_state(server.clone());
 
     let pull_task = tokio::spawn(run_snapshot_pull(
@@ -366,6 +447,25 @@ async fn ha_snapshot(State(server): State<Arc<ProxyServer>>) -> Json<HaStateSnap
     Json(server.snapshot_state().await)
 }
 
+#[derive(Debug, Deserialize)]
+struct HaEventsQuery {
+    #[serde(default)]
+    after: u64,
+    #[serde(default = "default_ha_events_limit")]
+    limit: usize,
+}
+
+fn default_ha_events_limit() -> usize {
+    1_000
+}
+
+async fn ha_events(
+    State(server): State<Arc<ProxyServer>>,
+    Query(query): Query<HaEventsQuery>,
+) -> Json<HaEventsResponse> {
+    Json(server.ha_events_after(query.after, query.limit).await)
+}
+
 async fn run_snapshot_pull(
     config: HaReplicationConfig,
     server: Arc<ProxyServer>,
@@ -376,6 +476,7 @@ async fn run_snapshot_pull(
         return wait_for_shutdown(shutdown).await;
     };
     let endpoint = format!("http://{peer_addr}/ha/snapshot");
+    let events_endpoint = format!("http://{peer_addr}/ha/events");
     let client = Client::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(config.pull_interval_ms));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -391,6 +492,15 @@ async fn run_snapshot_pull(
             _ = ticker.tick() => {
                 if replicator.role().await.accepts_writes() {
                     continue;
+                }
+                match pull_ha_events(&client, &events_endpoint, request_timeout, server.clone()).await {
+                    Ok(HaEventPullOutcome::Applied) => {
+                        debug!(peer = %peer_addr, "applied HA event batch from peer");
+                        continue;
+                    }
+                    Ok(HaEventPullOutcome::Idle) => continue,
+                    Ok(HaEventPullOutcome::SnapshotRequired) => {}
+                    Err(err) => warn!(peer = %peer_addr, error = %format!("{err:#}"), "failed to pull HA events; falling back to snapshot"),
                 }
                 match timeout(request_timeout, client.get(&endpoint).send()).await {
                     Ok(Ok(response)) if response.status().is_success() => {
@@ -413,6 +523,61 @@ async fn run_snapshot_pull(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+enum HaEventPullOutcome {
+    Applied,
+    Idle,
+    SnapshotRequired,
+}
+
+async fn pull_ha_events(
+    client: &Client,
+    endpoint: &str,
+    request_timeout: Duration,
+    server: Arc<ProxyServer>,
+) -> Result<HaEventPullOutcome> {
+    if !server.has_ha_persistence() {
+        return Ok(HaEventPullOutcome::SnapshotRequired);
+    }
+    let after = server.last_applied_ha_event_seq().await;
+    let url = format!("{endpoint}?after={after}&limit=1000");
+    let response = timeout(request_timeout, client.get(url).send())
+        .await
+        .context("timed out fetching HA events")??;
+    if !response.status().is_success() {
+        bail!(
+            "HA event peer returned non-success status {}",
+            response.status()
+        );
+    }
+    let events = timeout(request_timeout, response.json::<HaEventsResponse>())
+        .await
+        .context("timed out decoding HA events")??;
+    if events.snapshot_required {
+        return Ok(HaEventPullOutcome::SnapshotRequired);
+    }
+    if events.events.is_empty() {
+        return Ok(HaEventPullOutcome::Idle);
+    }
+    apply_ha_events(server, events.events).await?;
+    Ok(HaEventPullOutcome::Applied)
+}
+
+async fn apply_ha_events(server: Arc<ProxyServer>, events: Vec<HaEventRecord>) -> Result<()> {
+    let mut expected = server.last_applied_ha_event_seq().await + 1;
+    for event in events {
+        if event.seq != expected {
+            bail!(
+                "HA event sequence gap: expected {}, got {}",
+                expected,
+                event.seq
+            );
+        }
+        server.apply_ha_event(event).await?;
+        expected += 1;
     }
     Ok(())
 }
@@ -527,7 +692,8 @@ mod tests {
     use crate::cluster::{
         ClusterApplyResult, ClusterCommand, ContactBinding, SharedState, expires_at,
     };
-    use crate::config::Config;
+    use crate::config::{Config, HaPersistenceConfig};
+    use crate::persistence::HaPersistence;
     use crate::proxy::ProxyServer;
     use std::sync::Mutex;
     use tokio::sync::watch;
@@ -636,6 +802,8 @@ mod tests {
     #[tokio::test]
     async fn standby_pulls_and_installs_peer_snapshot() {
         let snapshot = HaStateSnapshot {
+            last_seq: 0,
+            checksum: String::new(),
             contacts: ContactStateSnapshot {
                 contacts: vec![ContactBinding {
                     aor: "sip:100@example.com".to_string(),
@@ -645,7 +813,8 @@ mod tests {
                 }],
             },
             affinity: AffinityStateSnapshot { bindings: vec![] },
-        };
+        }
+        .with_checksum();
         let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_addr = peer_listener.local_addr().unwrap();
         let peer_app = Router::new().route(
@@ -664,7 +833,7 @@ mod tests {
             role: ClusterRole::Follower,
         });
         let server = Arc::new(
-            ProxyServer::new(Config::default(), state.clone(), replicator.clone()).unwrap(),
+            ProxyServer::new(Config::default(), state.clone(), replicator.clone(), None).unwrap(),
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let pull_task = tokio::spawn(run_snapshot_pull(
@@ -689,6 +858,97 @@ mod tests {
         assert!(state.lookup("sip:100@example.com").await.is_some());
         let _ = shutdown_tx.send(true);
         pull_task.await.unwrap().unwrap();
+        peer_task.abort();
+    }
+
+    #[tokio::test]
+    async fn standby_pulls_and_applies_peer_events() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let source_persistence = HaPersistence::open(&HaPersistenceConfig {
+            enabled: true,
+            path: source_dir
+                .path()
+                .join("source.db")
+                .to_string_lossy()
+                .to_string(),
+            required: false,
+            event_retention_seconds: 3600,
+            cleanup_interval_ms: 60_000,
+        })
+        .unwrap()
+        .unwrap();
+        source_persistence
+            .apply_cluster_command(&ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:200@example.com".to_string(),
+                contact: "sip:200@127.0.0.1:5062".to_string(),
+                source: "127.0.0.1:50000".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await
+            .unwrap();
+
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        let peer_app = Router::new().route(
+            "/ha/events",
+            get({
+                let source_persistence = source_persistence.clone();
+                move |Query(query): Query<HaEventsQuery>| {
+                    let source_persistence = source_persistence.clone();
+                    async move {
+                        Json(
+                            source_persistence
+                                .events_after(query.after, query.limit)
+                                .await
+                                .unwrap(),
+                        )
+                    }
+                }
+            }),
+        );
+        let peer_task = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app).await.unwrap();
+        });
+
+        let target_persistence = HaPersistence::open(&HaPersistenceConfig {
+            enabled: true,
+            path: target_dir
+                .path()
+                .join("target.db")
+                .to_string_lossy()
+                .to_string(),
+            required: false,
+            event_retention_seconds: 3600,
+            cleanup_interval_ms: 60_000,
+        })
+        .unwrap()
+        .unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator: Arc<dyn ClusterReplicator> = Arc::new(FixedRoleReplicator {
+            role: ClusterRole::Follower,
+        });
+        let server = Arc::new(
+            ProxyServer::new(
+                Config::default(),
+                state.clone(),
+                replicator,
+                Some(target_persistence.clone()),
+            )
+            .unwrap(),
+        );
+
+        let outcome = pull_ha_events(
+            &Client::new(),
+            &format!("http://{peer_addr}/ha/events"),
+            Duration::from_millis(500),
+            server,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, HaEventPullOutcome::Applied));
+        assert!(state.lookup("sip:200@example.com").await.is_some());
+        assert_eq!(target_persistence.last_applied_seq().await.unwrap(), 1);
         peer_task.abort();
     }
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,8 +88,8 @@ impl Config {
         if self.proxy.upstream_groups.is_empty() {
             bail!("proxy.upstream_groups must contain at least one backend group");
         }
-        if self.proxy.socket.workers_per_listener == 0 {
-            bail!("proxy.socket.workers_per_listener must be greater than 0");
+        if self.proxy.socket.workers_per_listener == 0 && !self.proxy.socket.reuse_port {
+            bail!("proxy.socket.reuse_port must be true when workers_per_listener is 0 (auto)");
         }
         if self.proxy.socket.workers_per_listener > 1 && !self.proxy.socket.reuse_port {
             bail!(
@@ -112,6 +112,7 @@ impl Config {
         if self.proxy.affinity.enabled && self.proxy.affinity.ttl_seconds == 0 {
             bail!("proxy.affinity.ttl_seconds must be greater than 0 when affinity is enabled");
         }
+        validate_security_config(&self.proxy.security, "proxy.security")?;
         if self.proxy.register_routing == Some(RegisterRoutingMode::Path)
             && self.proxy.rewrite_register_contact
         {
@@ -209,6 +210,16 @@ impl Config {
                     listener.upstream_group
                 );
             }
+            if let Some(security) = &listener.security {
+                validate_security_config(
+                    security,
+                    &format!(
+                        "proxy listener '{} {}' security",
+                        listener.transport.as_str(),
+                        listener.bind
+                    ),
+                )?;
+            }
             let key = listener.key();
             if !listener_keys.insert(key.clone()) {
                 bail!("duplicate proxy listener '{key}'");
@@ -235,6 +246,21 @@ impl Config {
         }
         if self.ha.leader_check_interval_ms == 0 {
             bail!("ha.leader_check_interval_ms must be greater than 0");
+        }
+        if self.ha.persistence.enabled {
+            if self.ha.persistence.path.trim().is_empty() {
+                bail!("ha.persistence.path must not be empty when persistence is enabled");
+            }
+            if self.ha.persistence.cleanup_interval_ms == 0 {
+                bail!(
+                    "ha.persistence.cleanup_interval_ms must be greater than 0 when persistence is enabled"
+                );
+            }
+            if self.ha.persistence.event_retention_seconds == 0 {
+                bail!(
+                    "ha.persistence.event_retention_seconds must be greater than 0 when persistence is enabled"
+                );
+            }
         }
         if self.ha.active_standby.enabled {
             self.ha
@@ -423,6 +449,194 @@ fn split_host_port(value: &str) -> Option<(&str, &str)> {
     }
 }
 
+fn validate_security_config(config: &ProxySecurityConfig, path: &str) -> Result<()> {
+    for (name, cidrs) in [
+        ("trusted_cidrs", config.trusted_cidrs.as_deref()),
+        ("allow_cidrs", config.allow_cidrs.as_deref()),
+        ("deny_cidrs", config.deny_cidrs.as_deref()),
+    ] {
+        if let Some(cidrs) = cidrs {
+            for cidr in cidrs {
+                validate_cidr(cidr).with_context(|| format!("{path}.{name} contains '{cidr}'"))?;
+            }
+        }
+    }
+
+    if config
+        .prefilter
+        .invalid_log_sample_per_minute
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.prefilter.invalid_log_sample_per_minute must be greater than 0 when set");
+    }
+    validate_geo_security_config(&config.geo, &format!("{path}.geo"))?;
+    validate_dynamic_ban_config(&config.dynamic_ban, &format!("{path}.dynamic_ban"))?;
+    validate_xdp_security_config(&config.xdp, &format!("{path}.xdp"))?;
+
+    if config
+        .ip_rate_limit
+        .packets_per_second
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.ip_rate_limit.packets_per_second must be greater than 0 when set");
+    }
+    if config.ip_rate_limit.burst.is_some_and(|value| value == 0) {
+        bail!("{path}.ip_rate_limit.burst must be greater than 0 when set");
+    }
+    if config
+        .ip_rate_limit
+        .parse_errors_per_minute
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.ip_rate_limit.parse_errors_per_minute must be greater than 0 when set");
+    }
+
+    if config
+        .sip_rate_limit
+        .register_per_minute_per_aor
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.sip_rate_limit.register_per_minute_per_aor must be greater than 0 when set");
+    }
+    if config
+        .sip_rate_limit
+        .invite_per_minute_per_aor
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.sip_rate_limit.invite_per_minute_per_aor must be greater than 0 when set");
+    }
+    Ok(())
+}
+
+fn validate_xdp_security_config(config: &ProxyXdpSecurityConfig, path: &str) -> Result<()> {
+    if let Some(interfaces) = config.interfaces.as_deref() {
+        for interface in interfaces {
+            if interface.trim().is_empty() {
+                bail!("{path}.interfaces must not contain empty interface names");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_geo_security_config(config: &ProxyGeoSecurityConfig, path: &str) -> Result<()> {
+    if config
+        .provider_base_url
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("{path}.provider_base_url must not be empty when set");
+    }
+    if config
+        .cache_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("{path}.cache_dir must not be empty when set");
+    }
+    if config
+        .refresh_interval_seconds
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.refresh_interval_seconds must be greater than 0 when set");
+    }
+    if config
+        .request_timeout_seconds
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.request_timeout_seconds must be greater than 0 when set");
+    }
+    for (name, countries) in [
+        ("allow.countries", config.allow.countries.as_deref()),
+        ("deny.countries", config.deny.countries.as_deref()),
+    ] {
+        if let Some(countries) = countries {
+            for country in countries {
+                validate_country_code(country)
+                    .with_context(|| format!("{path}.{name} contains '{country}'"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_dynamic_ban_config(config: &ProxyDynamicBanConfig, path: &str) -> Result<()> {
+    if config.ban_seconds.is_some_and(|value| value == 0) {
+        bail!("{path}.ban_seconds must be greater than 0 when set");
+    }
+    if config
+        .invalid_packets_per_minute
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.invalid_packets_per_minute must be greater than 0 when set");
+    }
+    if config
+        .parse_errors_per_minute
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.parse_errors_per_minute must be greater than 0 when set");
+    }
+    if config
+        .sip_rate_violations_per_minute
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.sip_rate_violations_per_minute must be greater than 0 when set");
+    }
+    Ok(())
+}
+
+fn validate_country_code(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.len() != 2 || !value.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        bail!("country code must contain two ASCII letters");
+    }
+    Ok(())
+}
+
+fn normalize_country_codes(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .collect()
+}
+
+fn default_geo_provider_base_url() -> String {
+    "http://www.ipdeny.com/ipblocks/data/countries/{country}.zone".to_string()
+}
+
+fn default_geo_cache_dir() -> String {
+    "/var/lib/sigproxy-rs/geo".to_string()
+}
+
+fn default_geo_refresh_interval_seconds() -> u64 {
+    86_400
+}
+
+fn default_geo_request_timeout_seconds() -> u64 {
+    10
+}
+
+fn validate_cidr(value: &str) -> Result<()> {
+    let value = value.trim();
+    if value.is_empty() {
+        bail!("CIDR must not be empty");
+    }
+    let Some((addr, prefix)) = value.split_once('/') else {
+        value.parse::<IpAddr>().context("invalid IP address")?;
+        return Ok(());
+    };
+    let addr = addr.parse::<IpAddr>().context("invalid IP address")?;
+    let prefix = prefix.parse::<u8>().context("invalid CIDR prefix")?;
+    let max_prefix = match addr {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    };
+    if prefix > max_prefix {
+        bail!("CIDR prefix must be at most {max_prefix}");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     pub id: u64,
@@ -484,6 +698,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub affinity: ProxyAffinityConfig,
     #[serde(default)]
+    pub security: ProxySecurityConfig,
+    #[serde(default)]
     pub listeners: Vec<ProxyListenerConfig>,
     #[serde(default)]
     pub upstream_groups: Vec<UpstreamGroupConfig>,
@@ -500,10 +716,12 @@ impl Default for ProxyConfig {
             socket: ProxySocketConfig::default(),
             metrics: ProxyMetricsConfig::default(),
             affinity: ProxyAffinityConfig::default(),
+            security: ProxySecurityConfig::default(),
             listeners: vec![ProxyListenerConfig {
                 bind: "0.0.0.0:5060".to_string(),
                 transport: SipTransport::Udp,
                 upstream_group: "default".to_string(),
+                security: None,
             }],
             upstream_groups: vec![UpstreamGroupConfig {
                 name: "default".to_string(),
@@ -525,6 +743,711 @@ impl ProxyConfig {
                 RegisterRoutingMode::Path
             }
         })
+    }
+
+    pub fn effective_security_for_listener(
+        &self,
+        listener: &ProxyListenerConfig,
+    ) -> EffectiveProxySecurityConfig {
+        let mut effective = EffectiveProxySecurityConfig::default_security();
+        self.security.apply_to_effective(&mut effective);
+        if let Some(security) = &listener.security {
+            security.apply_to_effective(&mut effective);
+        }
+        effective
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxySecurityConfig {
+    #[serde(default)]
+    pub preset: Option<ProxySecurityPreset>,
+    #[serde(default)]
+    pub trusted_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub allow_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub deny_cidrs: Option<Vec<String>>,
+    #[serde(default)]
+    pub prefilter: ProxySecurityPrefilterConfig,
+    #[serde(default)]
+    pub geo: ProxyGeoSecurityConfig,
+    #[serde(default)]
+    pub dynamic_ban: ProxyDynamicBanConfig,
+    #[serde(default)]
+    pub ip_rate_limit: ProxyIpRateLimitConfig,
+    #[serde(default)]
+    pub sip_rate_limit: ProxySipRateLimitConfig,
+    #[serde(default)]
+    pub sip_policy: ProxySipPolicyConfig,
+    #[serde(default)]
+    pub xdp: ProxyXdpSecurityConfig,
+}
+
+impl ProxySecurityConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxySecurityConfig) {
+        if let Some(preset) = self.preset {
+            *effective = EffectiveProxySecurityConfig::for_preset(preset);
+        }
+        if let Some(trusted_cidrs) = &self.trusted_cidrs {
+            effective.trusted_cidrs = trusted_cidrs.clone();
+        }
+        if let Some(allow_cidrs) = &self.allow_cidrs {
+            effective.allow_cidrs = allow_cidrs.clone();
+        }
+        if let Some(deny_cidrs) = &self.deny_cidrs {
+            effective.deny_cidrs = deny_cidrs.clone();
+        }
+        self.prefilter.apply_to_effective(&mut effective.prefilter);
+        self.geo.apply_to_effective(&mut effective.geo);
+        self.dynamic_ban
+            .apply_to_effective(&mut effective.dynamic_ban);
+        self.ip_rate_limit
+            .apply_to_effective(&mut effective.ip_rate_limit);
+        self.sip_rate_limit
+            .apply_to_effective(&mut effective.sip_rate_limit);
+        self.sip_policy
+            .apply_to_effective(&mut effective.sip_policy);
+        self.xdp.apply_to_effective(&mut effective.xdp);
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyGeoSecurityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provider: Option<ProxyGeoProvider>,
+    #[serde(default)]
+    pub provider_base_url: Option<String>,
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+    #[serde(default)]
+    pub refresh_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub startup_refresh: Option<ProxyGeoStartupRefresh>,
+    #[serde(default)]
+    pub fail_open: Option<bool>,
+    #[serde(default)]
+    pub unknown_country: Option<ProxyGeoUnknownCountryPolicy>,
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub allow: ProxyGeoCountryListConfig,
+    #[serde(default)]
+    pub deny: ProxyGeoCountryListConfig,
+}
+
+impl ProxyGeoSecurityConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyGeoSecurityConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(provider) = self.provider {
+            effective.provider = provider;
+        }
+        if let Some(provider_base_url) = &self.provider_base_url {
+            effective.provider_base_url = provider_base_url.clone();
+        }
+        if let Some(cache_dir) = &self.cache_dir {
+            effective.cache_dir = cache_dir.clone();
+        }
+        if let Some(refresh_interval_seconds) = self.refresh_interval_seconds {
+            effective.refresh_interval_seconds = refresh_interval_seconds;
+        }
+        if let Some(startup_refresh) = self.startup_refresh {
+            effective.startup_refresh = startup_refresh;
+        }
+        if let Some(fail_open) = self.fail_open {
+            effective.fail_open = fail_open;
+        }
+        if let Some(unknown_country) = self.unknown_country {
+            effective.unknown_country = unknown_country;
+        }
+        if let Some(request_timeout_seconds) = self.request_timeout_seconds {
+            effective.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(countries) = &self.allow.countries {
+            effective.allow_countries = normalize_country_codes(countries);
+        }
+        if let Some(countries) = &self.deny.countries {
+            effective.deny_countries = normalize_country_codes(countries);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyGeoCountryListConfig {
+    #[serde(default)]
+    pub countries: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyGeoProvider {
+    Ipdeny,
+}
+
+impl Default for ProxyGeoProvider {
+    fn default() -> Self {
+        Self::Ipdeny
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyGeoStartupRefresh {
+    Blocking,
+    Background,
+    Disabled,
+}
+
+impl Default for ProxyGeoStartupRefresh {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyGeoUnknownCountryPolicy {
+    Allow,
+    Deny,
+}
+
+impl Default for ProxyGeoUnknownCountryPolicy {
+    fn default() -> Self {
+        Self::Allow
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyDynamicBanConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub ban_seconds: Option<u64>,
+    #[serde(default)]
+    pub invalid_packets_per_minute: Option<u64>,
+    #[serde(default)]
+    pub parse_errors_per_minute: Option<u64>,
+    #[serde(default)]
+    pub sip_rate_violations_per_minute: Option<u64>,
+}
+
+impl ProxyDynamicBanConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyDynamicBanConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(ban_seconds) = self.ban_seconds {
+            effective.ban_seconds = ban_seconds;
+        }
+        if let Some(invalid_packets_per_minute) = self.invalid_packets_per_minute {
+            effective.invalid_packets_per_minute = invalid_packets_per_minute;
+        }
+        if let Some(parse_errors_per_minute) = self.parse_errors_per_minute {
+            effective.parse_errors_per_minute = parse_errors_per_minute;
+        }
+        if let Some(sip_rate_violations_per_minute) = self.sip_rate_violations_per_minute {
+            effective.sip_rate_violations_per_minute = sip_rate_violations_per_minute;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxySecurityPreset {
+    Off,
+    Trusted,
+    Public,
+    Strict,
+}
+
+impl Default for ProxySecurityPreset {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxySecurityPrefilterConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub drop_invalid_start_line: Option<bool>,
+    #[serde(default)]
+    pub drop_non_sip_methods: Option<bool>,
+    #[serde(default)]
+    pub log_invalid_packets: Option<bool>,
+    #[serde(default)]
+    pub invalid_log_sample_per_minute: Option<u64>,
+}
+
+impl ProxySecurityPrefilterConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxySecurityPrefilterConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(drop_invalid_start_line) = self.drop_invalid_start_line {
+            effective.drop_invalid_start_line = drop_invalid_start_line;
+        }
+        if let Some(drop_non_sip_methods) = self.drop_non_sip_methods {
+            effective.drop_non_sip_methods = drop_non_sip_methods;
+        }
+        if let Some(log_invalid_packets) = self.log_invalid_packets {
+            effective.log_invalid_packets = log_invalid_packets;
+        }
+        if let Some(invalid_log_sample_per_minute) = self.invalid_log_sample_per_minute {
+            effective.invalid_log_sample_per_minute = invalid_log_sample_per_minute;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyIpRateLimitConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub burst: Option<u64>,
+    #[serde(default)]
+    pub parse_errors_per_minute: Option<u64>,
+    #[serde(default)]
+    pub block_seconds: Option<u64>,
+}
+
+impl ProxyIpRateLimitConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyIpRateLimitConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(packets_per_second) = self.packets_per_second {
+            effective.packets_per_second = packets_per_second;
+        }
+        if let Some(burst) = self.burst {
+            effective.burst = burst;
+        }
+        if let Some(parse_errors_per_minute) = self.parse_errors_per_minute {
+            effective.parse_errors_per_minute = parse_errors_per_minute;
+        }
+        if let Some(block_seconds) = self.block_seconds {
+            effective.block_seconds = block_seconds;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxySipRateLimitConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub register_per_minute_per_aor: Option<u64>,
+    #[serde(default)]
+    pub invite_per_minute_per_aor: Option<u64>,
+    #[serde(default)]
+    pub block_seconds: Option<u64>,
+}
+
+impl ProxySipRateLimitConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxySipRateLimitConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(register_per_minute_per_aor) = self.register_per_minute_per_aor {
+            effective.register_per_minute_per_aor = register_per_minute_per_aor;
+        }
+        if let Some(invite_per_minute_per_aor) = self.invite_per_minute_per_aor {
+            effective.invite_per_minute_per_aor = invite_per_minute_per_aor;
+        }
+        if let Some(block_seconds) = self.block_seconds {
+            effective.block_seconds = block_seconds;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxySipPolicyConfig {
+    #[serde(default)]
+    pub require_registered_invite_source: Option<bool>,
+    #[serde(default)]
+    pub registered_invite_source_match: Option<ProxyRegisteredInviteSourceMatch>,
+}
+
+impl ProxySipPolicyConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxySipPolicyConfig) {
+        if let Some(require_registered_invite_source) = self.require_registered_invite_source {
+            effective.require_registered_invite_source = require_registered_invite_source;
+        }
+        if let Some(registered_invite_source_match) = self.registered_invite_source_match {
+            effective.registered_invite_source_match = registered_invite_source_match;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyRegisteredInviteSourceMatch {
+    Ip,
+    IpPort,
+}
+
+impl Default for ProxyRegisteredInviteSourceMatch {
+    fn default() -> Self {
+        Self::Ip
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyXdpSecurityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub interfaces: Option<Vec<String>>,
+    #[serde(default)]
+    pub detach_stale: Option<bool>,
+    #[serde(default)]
+    pub fail_open: Option<bool>,
+    #[serde(default)]
+    pub sync_dynamic_ban: Option<bool>,
+    #[serde(default)]
+    pub cidr_filter: Option<bool>,
+    #[serde(default)]
+    pub geo_filter: Option<bool>,
+    #[serde(default)]
+    pub ip_rate_limit: Option<bool>,
+}
+
+impl ProxyXdpSecurityConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyXdpSecurityConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(interfaces) = &self.interfaces {
+            effective.interfaces = interfaces.clone();
+        }
+        if let Some(detach_stale) = self.detach_stale {
+            effective.detach_stale = detach_stale;
+        }
+        if let Some(fail_open) = self.fail_open {
+            effective.fail_open = fail_open;
+        }
+        if let Some(sync_dynamic_ban) = self.sync_dynamic_ban {
+            effective.sync_dynamic_ban = sync_dynamic_ban;
+        }
+        if let Some(cidr_filter) = self.cidr_filter {
+            effective.cidr_filter = cidr_filter;
+        }
+        if let Some(geo_filter) = self.geo_filter {
+            effective.geo_filter = geo_filter;
+        }
+        if let Some(ip_rate_limit) = self.ip_rate_limit {
+            effective.ip_rate_limit = ip_rate_limit;
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxySecurityConfig {
+    pub preset: ProxySecurityPreset,
+    pub trusted_cidrs: Vec<String>,
+    pub allow_cidrs: Vec<String>,
+    pub deny_cidrs: Vec<String>,
+    pub prefilter: EffectiveProxySecurityPrefilterConfig,
+    pub geo: EffectiveProxyGeoSecurityConfig,
+    pub dynamic_ban: EffectiveProxyDynamicBanConfig,
+    pub ip_rate_limit: EffectiveProxyIpRateLimitConfig,
+    pub sip_rate_limit: EffectiveProxySipRateLimitConfig,
+    pub sip_policy: EffectiveProxySipPolicyConfig,
+    pub xdp: EffectiveProxyXdpSecurityConfig,
+}
+
+impl EffectiveProxySecurityConfig {
+    pub fn enabled(&self) -> bool {
+        self.prefilter.enabled
+            || self.geo.enabled
+            || self.dynamic_ban.enabled
+            || self.ip_rate_limit.enabled
+            || self.sip_rate_limit.enabled
+            || self.sip_policy.require_registered_invite_source
+    }
+
+    pub fn for_preset(preset: ProxySecurityPreset) -> Self {
+        match preset {
+            ProxySecurityPreset::Off => Self {
+                preset,
+                trusted_cidrs: Vec::new(),
+                allow_cidrs: Vec::new(),
+                deny_cidrs: Vec::new(),
+                prefilter: EffectiveProxySecurityPrefilterConfig {
+                    enabled: false,
+                    drop_invalid_start_line: false,
+                    drop_non_sip_methods: false,
+                    log_invalid_packets: true,
+                    invalid_log_sample_per_minute: 10,
+                },
+                geo: EffectiveProxyGeoSecurityConfig::default(),
+                dynamic_ban: EffectiveProxyDynamicBanConfig::default(),
+                ip_rate_limit: EffectiveProxyIpRateLimitConfig {
+                    enabled: false,
+                    packets_per_second: 0,
+                    burst: 0,
+                    parse_errors_per_minute: 0,
+                    block_seconds: 0,
+                },
+                sip_rate_limit: EffectiveProxySipRateLimitConfig {
+                    enabled: false,
+                    register_per_minute_per_aor: 0,
+                    invite_per_minute_per_aor: 0,
+                    block_seconds: 0,
+                },
+                sip_policy: EffectiveProxySipPolicyConfig::default(),
+                xdp: EffectiveProxyXdpSecurityConfig::default(),
+            },
+            ProxySecurityPreset::Trusted => Self {
+                preset,
+                trusted_cidrs: Vec::new(),
+                allow_cidrs: Vec::new(),
+                deny_cidrs: Vec::new(),
+                prefilter: EffectiveProxySecurityPrefilterConfig {
+                    enabled: true,
+                    drop_invalid_start_line: true,
+                    drop_non_sip_methods: true,
+                    log_invalid_packets: true,
+                    invalid_log_sample_per_minute: 20,
+                },
+                geo: EffectiveProxyGeoSecurityConfig::default(),
+                dynamic_ban: EffectiveProxyDynamicBanConfig {
+                    enabled: true,
+                    ban_seconds: 60,
+                    invalid_packets_per_minute: 60,
+                    parse_errors_per_minute: 60,
+                    sip_rate_violations_per_minute: 30,
+                },
+                ip_rate_limit: EffectiveProxyIpRateLimitConfig {
+                    enabled: true,
+                    packets_per_second: 200,
+                    burst: 400,
+                    parse_errors_per_minute: 60,
+                    block_seconds: 60,
+                },
+                sip_rate_limit: EffectiveProxySipRateLimitConfig {
+                    enabled: true,
+                    register_per_minute_per_aor: 60,
+                    invite_per_minute_per_aor: 120,
+                    block_seconds: 60,
+                },
+                sip_policy: EffectiveProxySipPolicyConfig::default(),
+                xdp: EffectiveProxyXdpSecurityConfig::default(),
+            },
+            ProxySecurityPreset::Public => Self {
+                preset,
+                trusted_cidrs: Vec::new(),
+                allow_cidrs: Vec::new(),
+                deny_cidrs: Vec::new(),
+                prefilter: EffectiveProxySecurityPrefilterConfig {
+                    enabled: true,
+                    drop_invalid_start_line: true,
+                    drop_non_sip_methods: true,
+                    log_invalid_packets: true,
+                    invalid_log_sample_per_minute: 10,
+                },
+                geo: EffectiveProxyGeoSecurityConfig::default(),
+                dynamic_ban: EffectiveProxyDynamicBanConfig {
+                    enabled: true,
+                    ban_seconds: 300,
+                    invalid_packets_per_minute: 30,
+                    parse_errors_per_minute: 20,
+                    sip_rate_violations_per_minute: 10,
+                },
+                ip_rate_limit: EffectiveProxyIpRateLimitConfig {
+                    enabled: true,
+                    packets_per_second: 50,
+                    burst: 100,
+                    parse_errors_per_minute: 20,
+                    block_seconds: 300,
+                },
+                sip_rate_limit: EffectiveProxySipRateLimitConfig {
+                    enabled: true,
+                    register_per_minute_per_aor: 20,
+                    invite_per_minute_per_aor: 60,
+                    block_seconds: 300,
+                },
+                sip_policy: EffectiveProxySipPolicyConfig::default(),
+                xdp: EffectiveProxyXdpSecurityConfig::default(),
+            },
+            ProxySecurityPreset::Strict => Self {
+                preset,
+                trusted_cidrs: Vec::new(),
+                allow_cidrs: Vec::new(),
+                deny_cidrs: Vec::new(),
+                prefilter: EffectiveProxySecurityPrefilterConfig {
+                    enabled: true,
+                    drop_invalid_start_line: true,
+                    drop_non_sip_methods: true,
+                    log_invalid_packets: true,
+                    invalid_log_sample_per_minute: 5,
+                },
+                geo: EffectiveProxyGeoSecurityConfig::default(),
+                dynamic_ban: EffectiveProxyDynamicBanConfig {
+                    enabled: true,
+                    ban_seconds: 900,
+                    invalid_packets_per_minute: 10,
+                    parse_errors_per_minute: 5,
+                    sip_rate_violations_per_minute: 5,
+                },
+                ip_rate_limit: EffectiveProxyIpRateLimitConfig {
+                    enabled: true,
+                    packets_per_second: 15,
+                    burst: 30,
+                    parse_errors_per_minute: 5,
+                    block_seconds: 900,
+                },
+                sip_rate_limit: EffectiveProxySipRateLimitConfig {
+                    enabled: true,
+                    register_per_minute_per_aor: 10,
+                    invite_per_minute_per_aor: 30,
+                    block_seconds: 900,
+                },
+                sip_policy: EffectiveProxySipPolicyConfig::default(),
+                xdp: EffectiveProxyXdpSecurityConfig::default(),
+            },
+        }
+    }
+
+    pub fn default_security() -> Self {
+        let mut config = Self::for_preset(ProxySecurityPreset::Off);
+        config.dynamic_ban = EffectiveProxyDynamicBanConfig {
+            enabled: true,
+            ban_seconds: 3600,
+            invalid_packets_per_minute: 30,
+            parse_errors_per_minute: 20,
+            sip_rate_violations_per_minute: 10,
+        };
+        config
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyXdpSecurityConfig {
+    pub enabled: bool,
+    pub interfaces: Vec<String>,
+    pub detach_stale: bool,
+    pub fail_open: bool,
+    pub sync_dynamic_ban: bool,
+    pub cidr_filter: bool,
+    pub geo_filter: bool,
+    pub ip_rate_limit: bool,
+}
+
+impl Default for EffectiveProxyXdpSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interfaces: Vec::new(),
+            detach_stale: true,
+            fail_open: true,
+            sync_dynamic_ban: true,
+            cidr_filter: true,
+            geo_filter: true,
+            ip_rate_limit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyGeoSecurityConfig {
+    pub enabled: bool,
+    pub provider: ProxyGeoProvider,
+    pub provider_base_url: String,
+    pub cache_dir: String,
+    pub refresh_interval_seconds: u64,
+    pub startup_refresh: ProxyGeoStartupRefresh,
+    pub fail_open: bool,
+    pub unknown_country: ProxyGeoUnknownCountryPolicy,
+    pub request_timeout_seconds: u64,
+    pub allow_countries: Vec<String>,
+    pub deny_countries: Vec<String>,
+}
+
+impl Default for EffectiveProxyGeoSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: ProxyGeoProvider::default(),
+            provider_base_url: default_geo_provider_base_url(),
+            cache_dir: default_geo_cache_dir(),
+            refresh_interval_seconds: default_geo_refresh_interval_seconds(),
+            startup_refresh: ProxyGeoStartupRefresh::default(),
+            fail_open: true,
+            unknown_country: ProxyGeoUnknownCountryPolicy::default(),
+            request_timeout_seconds: default_geo_request_timeout_seconds(),
+            allow_countries: Vec::new(),
+            deny_countries: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyDynamicBanConfig {
+    pub enabled: bool,
+    pub ban_seconds: u64,
+    pub invalid_packets_per_minute: u64,
+    pub parse_errors_per_minute: u64,
+    pub sip_rate_violations_per_minute: u64,
+}
+
+impl Default for EffectiveProxyDynamicBanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ban_seconds: 0,
+            invalid_packets_per_minute: 0,
+            parse_errors_per_minute: 0,
+            sip_rate_violations_per_minute: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxySecurityPrefilterConfig {
+    pub enabled: bool,
+    pub drop_invalid_start_line: bool,
+    pub drop_non_sip_methods: bool,
+    pub log_invalid_packets: bool,
+    pub invalid_log_sample_per_minute: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyIpRateLimitConfig {
+    pub enabled: bool,
+    pub packets_per_second: u64,
+    pub burst: u64,
+    pub parse_errors_per_minute: u64,
+    pub block_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxySipRateLimitConfig {
+    pub enabled: bool,
+    pub register_per_minute_per_aor: u64,
+    pub invite_per_minute_per_aor: u64,
+    pub block_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxySipPolicyConfig {
+    pub require_registered_invite_source: bool,
+    pub registered_invite_source_match: ProxyRegisteredInviteSourceMatch,
+}
+
+impl Default for EffectiveProxySipPolicyConfig {
+    fn default() -> Self {
+        Self {
+            require_registered_invite_source: false,
+            registered_invite_source_match: ProxyRegisteredInviteSourceMatch::default(),
+        }
     }
 }
 
@@ -639,6 +1562,16 @@ impl Default for ProxySocketConfig {
     }
 }
 
+impl ProxySocketConfig {
+    pub fn resolved_workers_per_listener(&self) -> usize {
+        if self.workers_per_listener == 0 {
+            std::thread::available_parallelism().map_or(1, usize::from)
+        } else {
+            self.workers_per_listener
+        }
+    }
+}
+
 fn default_workers_per_listener() -> usize {
     1
 }
@@ -681,6 +1614,8 @@ pub struct ProxyListenerConfig {
     pub bind: String,
     pub transport: SipTransport,
     pub upstream_group: String,
+    #[serde(default)]
+    pub security: Option<ProxySecurityConfig>,
 }
 
 impl ProxyListenerConfig {
@@ -802,6 +1737,8 @@ pub struct HaConfig {
     #[serde(default = "default_ha_leader_check_interval_ms")]
     pub leader_check_interval_ms: u64,
     #[serde(default)]
+    pub persistence: HaPersistenceConfig,
+    #[serde(default)]
     pub active_standby: HaActiveStandbyConfig,
     #[serde(default)]
     pub replication: HaReplicationConfig,
@@ -813,6 +1750,7 @@ impl Default for HaConfig {
     fn default() -> Self {
         Self {
             leader_check_interval_ms: default_ha_leader_check_interval_ms(),
+            persistence: HaPersistenceConfig::default(),
             active_standby: HaActiveStandbyConfig::default(),
             replication: HaReplicationConfig::default(),
             addon: HaAddonConfig::Noop,
@@ -822,6 +1760,44 @@ impl Default for HaConfig {
 
 fn default_ha_leader_check_interval_ms() -> u64 {
     1_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HaPersistenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ha_persistence_path")]
+    pub path: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "default_ha_persistence_event_retention_seconds")]
+    pub event_retention_seconds: u64,
+    #[serde(default = "default_ha_persistence_cleanup_interval_ms")]
+    pub cleanup_interval_ms: u64,
+}
+
+impl Default for HaPersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_ha_persistence_path(),
+            required: false,
+            event_retention_seconds: default_ha_persistence_event_retention_seconds(),
+            cleanup_interval_ms: default_ha_persistence_cleanup_interval_ms(),
+        }
+    }
+}
+
+fn default_ha_persistence_path() -> String {
+    "/var/lib/sigproxy-rs/ha/state.db".to_string()
+}
+
+fn default_ha_persistence_event_retention_seconds() -> u64 {
+    3_600
+}
+
+fn default_ha_persistence_cleanup_interval_ms() -> u64 {
+    60_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -971,6 +1947,10 @@ enabled = true
 key = "dialog-id"
 ttl_seconds = 3600
 
+[proxy.security]
+# Off by default unless configured. Presets: "off", "trusted", "public", "strict".
+preset = "off"
+
 [[proxy.upstream_groups]]
 name = "default"
 mode = "round-robin"
@@ -1083,6 +2063,248 @@ servers = ["127.0.0.1:5080"]
     }
 
     #[test]
+    fn security_defaults_to_dynamic_ban_enabled() {
+        let config = Config::default();
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+
+        assert_eq!(effective.preset, ProxySecurityPreset::Off);
+        assert!(effective.enabled());
+        assert!(effective.dynamic_ban.enabled);
+        assert_eq!(effective.dynamic_ban.ban_seconds, 3600);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn explicit_off_preset_disables_security() {
+        let config = Config {
+            proxy: ProxyConfig {
+                security: ProxySecurityConfig {
+                    preset: Some(ProxySecurityPreset::Off),
+                    ..ProxySecurityConfig::default()
+                },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+
+        assert!(!effective.enabled());
+        assert!(!effective.dynamic_ban.enabled);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn listener_security_overrides_global_security_partially() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security]
+preset = "public"
+trusted_cidrs = ["10.0.0.0/8"]
+
+[proxy.security.sip_rate_limit]
+invite_per_minute_per_aor = 60
+
+[proxy.security.sip_policy]
+require_registered_invite_source = true
+registered_invite_source_match = "ip"
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[proxy.listeners.security.sip_rate_limit]
+invite_per_minute_per_aor = 12
+
+[proxy.listeners.security.sip_policy]
+registered_invite_source_match = "ip-port"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+        assert_eq!(effective.preset, ProxySecurityPreset::Public);
+        assert_eq!(effective.trusted_cidrs, vec!["10.0.0.0/8"]);
+        assert_eq!(effective.sip_rate_limit.invite_per_minute_per_aor, 12);
+        assert_eq!(effective.sip_rate_limit.register_per_minute_per_aor, 20);
+        assert!(effective.sip_policy.require_registered_invite_source);
+        assert_eq!(
+            effective.sip_policy.registered_invite_source_match,
+            ProxyRegisteredInviteSourceMatch::IpPort
+        );
+    }
+
+    #[test]
+    fn parses_geo_and_dynamic_ban_security_config() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security.geo]
+enabled = true
+cache_dir = "/tmp/sigproxy-geo"
+startup_refresh = "disabled"
+unknown_country = "deny"
+
+[proxy.security.geo.deny]
+countries = ["ru", "ir"]
+
+[proxy.security.dynamic_ban]
+enabled = true
+ban_seconds = 600
+invalid_packets_per_minute = 10
+parse_errors_per_minute = 5
+sip_rate_violations_per_minute = 3
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[proxy.listeners.security.geo.allow]
+countries = ["cn"]
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+        assert!(effective.geo.enabled);
+        assert_eq!(effective.geo.deny_countries, vec!["RU", "IR"]);
+        assert_eq!(effective.geo.allow_countries, vec!["CN"]);
+        assert!(effective.dynamic_ban.enabled);
+        assert_eq!(effective.dynamic_ban.ban_seconds, 600);
+    }
+
+    #[test]
+    fn parses_xdp_security_config() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security.xdp]
+enabled = true
+interfaces = ["eth0"]
+detach_stale = true
+fail_open = true
+sync_dynamic_ban = true
+cidr_filter = true
+geo_filter = false
+ip_rate_limit = true
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[proxy.listeners.security.xdp]
+geo_filter = true
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+        assert!(effective.xdp.enabled);
+        assert_eq!(effective.xdp.interfaces, vec!["eth0"]);
+        assert!(effective.xdp.detach_stale);
+        assert!(effective.xdp.fail_open);
+        assert!(effective.xdp.sync_dynamic_ban);
+        assert!(effective.xdp.cidr_filter);
+        assert!(effective.xdp.geo_filter);
+        assert!(effective.xdp.ip_rate_limit);
+    }
+
+    #[test]
+    fn rejects_invalid_security_cidr() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security]
+preset = "public"
+deny_cidrs = ["10.0.0.0/99"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_geo_country_code() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security.geo.deny]
+countries = ["USA"]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn enabled_xdp_without_interfaces_uses_auto_selection() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security.xdp]
+enabled = true
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let effective = config
+            .proxy
+            .effective_security_for_listener(&config.proxy.listeners[0]);
+        assert!(effective.xdp.enabled);
+        assert!(effective.xdp.interfaces.is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_security_rate() {
+        let config: Config = toml::from_str(
+            r#"
+[proxy.security]
+preset = "public"
+
+[proxy.security.ip_rate_limit]
+packets_per_second = 0
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn rejects_conflicting_register_routing_config() {
         let config: Config = toml::from_str(
             r#"
@@ -1148,6 +2370,39 @@ literal = "$-not-a-placeholder"
             proxy: ProxyConfig {
                 socket: ProxySocketConfig {
                     workers_per_listener: 2,
+                    reuse_port: false,
+                    ..ProxySocketConfig::default()
+                },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn allows_auto_listener_workers_with_reuse_port() {
+        let config = Config {
+            proxy: ProxyConfig {
+                socket: ProxySocketConfig {
+                    workers_per_listener: 0,
+                    reuse_port: true,
+                    ..ProxySocketConfig::default()
+                },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        assert!(config.proxy.socket.resolved_workers_per_listener() >= 1);
+    }
+
+    #[test]
+    fn rejects_auto_listener_workers_without_reuse_port() {
+        let config = Config {
+            proxy: ProxyConfig {
+                socket: ProxySocketConfig {
+                    workers_per_listener: 0,
                     reuse_port: false,
                     ..ProxySocketConfig::default()
                 },
