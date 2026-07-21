@@ -17,6 +17,7 @@ use crate::proxy::routing::RouteTable;
 use crate::proxy::xdp::XdpRuntime;
 use crate::sip::{SipMessage, SipStartLine};
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use axum::{Router, extract::State, routing::get};
 use bytes::BytesMut;
 use rsipstack::sip::prelude::HeadersExt;
@@ -63,7 +64,7 @@ pub struct ProxyServer {
     state: Arc<SharedState>,
     replicator: Arc<dyn ClusterReplicator>,
     persistence: Option<Persistence>,
-    routes: RouteTable,
+    routes: ArcSwap<RouteTable>,
     upstreams: UpstreamGroups,
     affinity: AffinityTable,
     security: Arc<SecurityRuntime>,
@@ -94,7 +95,7 @@ impl ProxyServer {
             state,
             replicator,
             persistence,
-            routes,
+            routes: ArcSwap::from_pointee(routes),
             upstreams,
             affinity: AffinityTable::new(affinity_config),
             security,
@@ -2018,6 +2019,7 @@ impl ProxyServer {
     fn select_upstream(&self, uri: &str, listener: &ProxyListenerConfig) -> UpstreamTarget {
         let group = self
             .routes
+            .load()
             .select(&listener.key(), uri)
             .map(|route| route.upstream_group)
             .unwrap_or_else(|| listener.upstream_group.clone());
@@ -2259,7 +2261,7 @@ enum SecurityBanAction {
 }
 
 struct SecurityRuntime {
-    listeners: HashMap<String, ListenerSecurityRuntime>,
+    listeners: ArcSwap<HashMap<String, Arc<ListenerSecurityRuntime>>>,
     geo: Option<Arc<GeoRuntime>>,
     xdp: XdpRuntime,
     buckets: ShardedSecurityMap<TokenBucket>,
@@ -2273,12 +2275,15 @@ impl SecurityRuntime {
         for listener in &config.listeners {
             let effective = config.effective_security_for_listener(listener);
             effective_configs.push(effective.clone());
-            listeners.insert(listener.key(), ListenerSecurityRuntime::new(effective)?);
+            listeners.insert(
+                listener.key(),
+                Arc::new(ListenerSecurityRuntime::new(effective)?),
+            );
         }
         let geo = GeoRuntime::new(&effective_configs)?;
         let xdp = XdpRuntime::new(config, geo.as_ref())?;
         Ok(Self {
-            listeners,
+            listeners: ArcSwap::from_pointee(listeners),
             geo,
             xdp,
             buckets: ShardedSecurityMap::new(SECURITY_MAP_SHARDS),
@@ -2561,12 +2566,12 @@ impl SecurityRuntime {
         Some(reason)
     }
 
-    fn listener(&self, listener: &ProxyListenerConfig) -> Option<&ListenerSecurityRuntime> {
-        self.listeners.get(listener.key().as_str())
+    fn listener(&self, listener: &ProxyListenerConfig) -> Option<Arc<ListenerSecurityRuntime>> {
+        self.listener_by_key(&listener.key())
     }
 
-    fn listener_by_key(&self, listener_key: &str) -> Option<&ListenerSecurityRuntime> {
-        self.listeners.get(listener_key)
+    fn listener_by_key(&self, listener_key: &str) -> Option<Arc<ListenerSecurityRuntime>> {
+        self.listeners.load().get(listener_key).cloned()
     }
 
     async fn allow_bucket(&self, key: String, rate_per_second: f64, burst: f64) -> bool {
