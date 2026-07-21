@@ -983,6 +983,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standby_falls_back_to_snapshot_when_event_log_requires_snapshot() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let snapshot = HaStateSnapshot {
+            last_seq: 9,
+            checksum: String::new(),
+            contacts: ContactStateSnapshot {
+                contacts: vec![ContactBinding {
+                    aor: "sip:300@example.com".to_string(),
+                    contact: "sip:300@127.0.0.1:5063".to_string(),
+                    source: "127.0.0.1:50000".to_string(),
+                    expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+                }],
+            },
+            affinity: AffinityStateSnapshot { bindings: vec![] },
+        }
+        .with_checksum();
+        let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_listener.local_addr().unwrap();
+        let peer_app = Router::new()
+            .route(
+                "/ha/events",
+                get(move |Query(query): Query<HaEventsQuery>| async move {
+                    Json(HaEventsResponse {
+                        base_seq: query.after,
+                        latest_seq: 9,
+                        snapshot_required: true,
+                        events: Vec::new(),
+                    })
+                }),
+            )
+            .route(
+                "/ha/snapshot",
+                get({
+                    let snapshot = snapshot.clone();
+                    move || async move { Json(snapshot.clone()) }
+                }),
+            );
+        let peer_task = tokio::spawn(async move {
+            axum::serve(peer_listener, peer_app).await.unwrap();
+        });
+
+        let target_persistence = HaPersistence::open(&HaPersistenceConfig {
+            enabled: true,
+            path: target_dir
+                .path()
+                .join("target.db")
+                .to_string_lossy()
+                .to_string(),
+            required: false,
+            event_retention_seconds: 3600,
+            cleanup_interval_ms: 60_000,
+        })
+        .unwrap()
+        .unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator: Arc<dyn ClusterReplicator> = Arc::new(FixedRoleReplicator {
+            role: ClusterRole::Follower,
+        });
+        let server = Arc::new(
+            ProxyServer::new(
+                Config::default(),
+                state.clone(),
+                replicator.clone(),
+                Some(target_persistence.clone()),
+            )
+            .unwrap(),
+        );
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let pull_task = tokio::spawn(run_snapshot_pull(
+            HaReplicationConfig {
+                enabled: true,
+                bind_addr: "127.0.0.1:0".to_string(),
+                peer_addr: Some(peer_addr.to_string()),
+                pull_interval_ms: 10,
+                request_timeout_ms: 500,
+            },
+            server,
+            replicator,
+            shutdown_rx,
+        ));
+
+        for _ in 0..50 {
+            if state.lookup("sip:300@example.com").await.is_some()
+                && target_persistence.last_applied_seq().await.unwrap() == 9
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(state.lookup("sip:300@example.com").await.is_some());
+        assert_eq!(target_persistence.last_applied_seq().await.unwrap(), 9);
+        let _ = shutdown_tx.send(true);
+        pull_task.await.unwrap().unwrap();
+        peer_task.abort();
+    }
+
+    #[tokio::test]
     async fn active_standby_replicator_rejects_writes_until_promoted() {
         let runtime = ActiveStandbyRuntime::new(2, HaInitialRole::Standby);
         let inner: Arc<dyn ClusterReplicator> = Arc::new(FixedRoleReplicator {

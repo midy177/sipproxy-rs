@@ -381,6 +381,10 @@ impl ProxyServer {
             location_bindings as u64,
         );
         if let Some(stats) = persistence_stats {
+            let role = format!("{:?}", self.replicator.role().await).to_ascii_lowercase();
+            let event_lag = stats
+                .latest_event_seq
+                .saturating_sub(stats.last_applied_seq);
             append_gauge(
                 &mut output,
                 "proxy_ha_persistence_latest_event_seq",
@@ -395,6 +399,12 @@ impl ProxyServer {
                 &mut output,
                 "proxy_ha_persistence_event_rows",
                 stats.event_rows,
+            );
+            append_labeled_gauge(
+                &mut output,
+                "proxy_ha_persistence_event_lag",
+                &[("role", role.as_str())],
+                event_lag,
             );
             append_labeled_counter(
                 &mut output,
@@ -6116,6 +6126,7 @@ Content-Length: 0\r\n\r\n",
         assert!(metrics.contains("proxy_ha_persistence_latest_event_seq 1"));
         assert!(metrics.contains("proxy_ha_persistence_last_applied_seq 0"));
         assert!(metrics.contains("proxy_ha_persistence_event_rows 1"));
+        assert!(metrics.contains("proxy_ha_persistence_event_lag{role=\"standalone\"} 1"));
         assert!(metrics.contains("proxy_ha_persistence_event_appends_total{result=\"success\"} 1"));
         assert!(metrics.contains("proxy_ha_persistence_sqlite_write_failures_total 0"));
         assert!(metrics.contains("proxy_ha_event_pulls_total{result=\"applied\"} 1"));

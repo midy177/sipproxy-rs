@@ -512,7 +512,7 @@ SQLite schema 草案：
 
 阶段 4.5：生产化与测试（部分实现）
 
-- metrics：
+- metrics（已实现）：
   - SQLite 写失败次数。
   - event append 成功/失败次数。
   - standby event lag。
@@ -522,11 +522,12 @@ SQLite schema 草案：
   - event 幂等 apply。
   - TTL 不续期。
   - SQLite 重启恢复。
-  - event retention 后 standby fallback snapshot。
+  - event retention 后 standby fallback snapshot（已覆盖 event log gap fallback）。
   - snapshot checksum 拒绝错误快照。
 - 集成测试：
   - active REGISTER 后 standby 在一个增量周期内 lookup。
   - active affinity 写入后 standby 在一个增量周期内 lookup。
+  - event log 缺口时 standby fallback snapshot 并对齐 `last_applied_seq`。
   - event pull 失败时 SIP 转发不失败，下一次 snapshot 恢复一致。
   - `required = true` 时 SQLite 写失败会拒绝写入。
 
