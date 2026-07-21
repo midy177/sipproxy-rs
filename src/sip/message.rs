@@ -101,11 +101,9 @@ impl SipMessage {
         let (top, rest) = split_first_header_value(&value).context("failed to split top Via")?;
         let headers = self.inner.headers_mut();
         match rest {
-            Some(rest) if !rest.trim().is_empty() => match &mut headers.0[index] {
-                Header::Via(via) => via.replace(rest.trim().to_string()),
-                Header::Other(_, value) => *value = rest.trim().to_string(),
-                _ => unreachable!("Via header index changed while popping top Via"),
-            },
+            Some(rest) if !rest.trim().is_empty() => {
+                headers.0[index] = header_from_name_value("Via", rest.trim());
+            }
             _ => {
                 headers.0.remove(index);
             }
@@ -781,6 +779,10 @@ Content-Length: 0\r\n\r\n",
             resp.top_via_branch().unwrap().as_deref(),
             Some("z9hG4bK-client")
         );
+        assert!(matches!(
+            resp.inner.headers().iter().next(),
+            Some(Header::Via(_))
+        ));
     }
 
     #[test]
