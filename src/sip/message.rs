@@ -444,6 +444,7 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
 
     let mut in_quotes = false;
     let mut escaped = false;
+    let mut angle_depth = 0usize;
     for (index, ch) in value.char_indices() {
         if escaped {
             escaped = false;
@@ -453,7 +454,11 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
         match ch {
             '\\' if in_quotes => escaped = true,
             '"' => in_quotes = !in_quotes,
-            ',' if !in_quotes => return Ok((&value[..index], Some(&value[index + 1..]))),
+            '<' if !in_quotes => angle_depth += 1,
+            '>' if !in_quotes => angle_depth = angle_depth.saturating_sub(1),
+            ',' if !in_quotes && angle_depth == 0 => {
+                return Ok((&value[..index], Some(&value[index + 1..])));
+            }
             _ => {}
         }
     }
@@ -708,6 +713,34 @@ Content-Length: 0\r\n\r\n",
         assert_eq!(
             resp.top_via_branch().unwrap().as_deref(),
             Some("z9hG4bK-client")
+        );
+    }
+
+    #[test]
+    fn header_list_split_ignores_commas_inside_name_addr() {
+        let mut request = SipMessage::parse(
+            b"INVITE sip:100@example.com SIP/2.0\r\n\
+Route: <sip:proxy.example.com;lr?X-Trace=a,b>, <sip:edge.example.com;lr>\r\n\
+Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK-client\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.top_header_value("Route").unwrap().as_deref(),
+            Some("<sip:proxy.example.com;lr?X-Trace=a,b>")
+        );
+        assert_eq!(
+            request.pop_top_header_value("Route").unwrap().as_deref(),
+            Some("<sip:proxy.example.com;lr?X-Trace=a,b>")
+        );
+        assert_eq!(
+            request.top_header_value("Route").unwrap().as_deref(),
+            Some("<sip:edge.example.com;lr>")
         );
     }
 }

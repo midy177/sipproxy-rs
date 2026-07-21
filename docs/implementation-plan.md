@@ -607,6 +607,7 @@ Active-standby 生产启用前必修：
 - INVITE lightweight transaction key 已改用 `rsipstack` typed `Call-ID` / `CSeq` API。
 - proxy Via 与 Record-Route 插入已改用 `rsipstack` typed `Via` / `RecordRoute` API；Path 因当前库仅提供 untyped header，仍保留薄封装写入。
 - response 顶层 Via 的 `received`/`rport` NAT 回填已优先使用 `rsipstack` typed `Via` API；仅在异常不可解析 Via 上保留原字符串 fallback。
+- 通用 header-list 拆分已覆盖引号与 `<...>` name-addr，避免 Route/Contact URI 内逗号被误判为 header-list 分隔符。
 - registered Contact 目标解析已改用 `rsipstack` typed `Contact` / `Uri` / `Transport` API，支持完整 Contact header value 和 SIP 默认端口。
 - REGISTER 成功响应的 Contact expires 提取已改用 `rsipstack` typed Contact header-list 解析，支持逗号合并的多 Contact。
 - Route set 目标判断已改用 `rsipstack` typed `Route` / `Uri` / `Transport` API，避免把 Route 当 Contact 兼容解析。
