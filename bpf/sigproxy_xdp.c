@@ -4,6 +4,8 @@
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/icmp.h>
+#include <linux/icmpv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
@@ -14,6 +16,12 @@
 #define XDP_POLICY_GEO_UNKNOWN_ALLOW (1ULL << 2)
 #define XDP_POLICY_GEO_ALLOW_HAS_ENTRIES (1ULL << 3)
 #define XDP_POLICY_IP_RATE_LIMIT_ENABLED (1ULL << 4)
+#define XDP_POLICY_FLOOD_ENABLED (1ULL << 5)
+#define SIG_RATE_UDP_FLOOD 240
+#define SIG_RATE_TCP_FLOOD 241
+#define SIG_RATE_TCP_SYN_FLOOD 242
+#define SIG_RATE_TCP_ACK_FLOOD 243
+#define SIG_RATE_ICMP_FLOOD 244
 #define MAX_VLAN_DEPTH 4
 #define MAX_IPV6_EXT_HEADERS 6
 
@@ -26,7 +34,12 @@ enum xdp_stat_index {
     XDP_STAT_GEO_DENY_DROP = 5,
     XDP_STAT_GEO_NOT_ALLOWED_DROP = 6,
     XDP_STAT_RATE_LIMIT_DROP = 7,
-    XDP_STAT_MAX = 8,
+    XDP_STAT_UDP_FLOOD_DROP = 8,
+    XDP_STAT_TCP_FLOOD_DROP = 9,
+    XDP_STAT_TCP_SYN_FLOOD_DROP = 10,
+    XDP_STAT_TCP_ACK_FLOOD_DROP = 11,
+    XDP_STAT_ICMP_FLOOD_DROP = 12,
+    XDP_STAT_MAX = 13,
 };
 
 struct listener_key {
@@ -39,6 +52,16 @@ struct listener_policy {
     __u64 flags;
     __u32 packets_per_second;
     __u32 burst;
+    __u32 udp_flood_packets_per_second;
+    __u32 udp_flood_burst;
+    __u32 tcp_flood_packets_per_second;
+    __u32 tcp_flood_burst;
+    __u32 tcp_syn_flood_packets_per_second;
+    __u32 tcp_syn_flood_burst;
+    __u32 tcp_ack_flood_packets_per_second;
+    __u32 tcp_ack_flood_burst;
+    __u32 icmp_flood_packets_per_second;
+    __u32 icmp_flood_burst;
     __u64 geo_allow[COUNTRY_WORDS];
     __u64 geo_deny[COUNTRY_WORDS];
 };
@@ -246,18 +269,16 @@ static __always_inline int country_bit_is_set(__u64 bits[COUNTRY_WORDS], __u16 c
     return (bits[word] & (1ULL << shift)) != 0;
 }
 
-static __always_inline int check_rate_limit(struct listener_policy *policy, struct ip_key *ip_key)
+static __always_inline int check_bucket_rate_limit(struct ip_key *ip_key, __u32 packets_per_second, __u32 burst, int stat_index)
 {
-    if (!(policy->flags & XDP_POLICY_IP_RATE_LIMIT_ENABLED))
-        return XDP_PASS;
-    if (policy->packets_per_second == 0 || policy->burst == 0)
+    if (packets_per_second == 0 || burst == 0)
         return XDP_PASS;
 
     __u64 now = bpf_ktime_get_ns();
     struct rate_bucket *bucket = bpf_map_lookup_elem(&rate_buckets, ip_key);
     if (!bucket) {
         struct rate_bucket initial = {};
-        initial.tokens = policy->burst - 1;
+        initial.tokens = burst - 1;
         initial.updated_ns = now;
         bpf_map_update_elem(&rate_buckets, ip_key, &initial, BPF_ANY);
         return XDP_PASS;
@@ -265,22 +286,69 @@ static __always_inline int check_rate_limit(struct listener_policy *policy, stru
 
     __u64 tokens = bucket->tokens;
     __u64 elapsed = now - bucket->updated_ns;
-    __u64 refill = elapsed * policy->packets_per_second / 1000000000ULL;
+    __u64 refill = elapsed * packets_per_second / 1000000000ULL;
     if (refill > 0) {
         tokens += refill;
-        if (tokens > policy->burst)
-            tokens = policy->burst;
+        if (tokens > burst)
+            tokens = burst;
         bucket->updated_ns = now;
     }
     if (tokens == 0) {
-        incr_stat(XDP_STAT_RATE_LIMIT_DROP);
+        incr_stat(stat_index);
         return XDP_DROP;
     }
     bucket->tokens = tokens - 1;
     return XDP_PASS;
 }
 
-static __always_inline int evaluate_packet(struct listener_key *listener, struct ip_key *ip_key, struct lpm_ip_key *lpm_key)
+static __always_inline int check_rate_limit(struct listener_policy *policy, struct ip_key *ip_key)
+{
+    if (!(policy->flags & XDP_POLICY_IP_RATE_LIMIT_ENABLED))
+        return XDP_PASS;
+    return check_bucket_rate_limit(ip_key, policy->packets_per_second, policy->burst, XDP_STAT_RATE_LIMIT_DROP);
+}
+
+static __always_inline int check_flood_limit(struct listener_policy *policy, struct ip_key *ip_key, __u8 packet_class)
+{
+    if (!(policy->flags & XDP_POLICY_FLOOD_ENABLED))
+        return XDP_PASS;
+
+    struct ip_key rate_key = *ip_key;
+    __u32 packets_per_second = 0;
+    __u32 burst = 0;
+    int stat = XDP_STAT_RATE_LIMIT_DROP;
+
+    if (packet_class == SIG_RATE_UDP_FLOOD) {
+        rate_key.l4_proto = SIG_RATE_UDP_FLOOD;
+        packets_per_second = policy->udp_flood_packets_per_second;
+        burst = policy->udp_flood_burst;
+        stat = XDP_STAT_UDP_FLOOD_DROP;
+    } else if (packet_class == SIG_RATE_TCP_SYN_FLOOD) {
+        rate_key.l4_proto = SIG_RATE_TCP_SYN_FLOOD;
+        packets_per_second = policy->tcp_syn_flood_packets_per_second;
+        burst = policy->tcp_syn_flood_burst;
+        stat = XDP_STAT_TCP_SYN_FLOOD_DROP;
+    } else if (packet_class == SIG_RATE_TCP_ACK_FLOOD) {
+        rate_key.l4_proto = SIG_RATE_TCP_ACK_FLOOD;
+        packets_per_second = policy->tcp_ack_flood_packets_per_second;
+        burst = policy->tcp_ack_flood_burst;
+        stat = XDP_STAT_TCP_ACK_FLOOD_DROP;
+    } else if (packet_class == SIG_RATE_TCP_FLOOD) {
+        rate_key.l4_proto = SIG_RATE_TCP_FLOOD;
+        packets_per_second = policy->tcp_flood_packets_per_second;
+        burst = policy->tcp_flood_burst;
+        stat = XDP_STAT_TCP_FLOOD_DROP;
+    } else if (packet_class == SIG_RATE_ICMP_FLOOD) {
+        rate_key.l4_proto = SIG_RATE_ICMP_FLOOD;
+        packets_per_second = policy->icmp_flood_packets_per_second;
+        burst = policy->icmp_flood_burst;
+        stat = XDP_STAT_ICMP_FLOOD_DROP;
+    }
+
+    return check_bucket_rate_limit(&rate_key, packets_per_second, burst, stat);
+}
+
+static __always_inline int evaluate_packet(struct listener_key *listener, struct ip_key *ip_key, struct lpm_ip_key *lpm_key, __u8 packet_class)
 {
     struct listener_policy *policy = bpf_map_lookup_elem(&listener_policies, listener);
     if (!policy) {
@@ -331,11 +399,15 @@ static __always_inline int evaluate_packet(struct listener_key *listener, struct
     if (rate == XDP_DROP)
         return XDP_DROP;
 
+    int flood = check_flood_limit(policy, ip_key, packet_class);
+    if (flood == XDP_DROP)
+        return XDP_DROP;
+
     incr_stat(XDP_STAT_PASS);
     return XDP_PASS;
 }
 
-static __always_inline int handle_l4(__u8 family, __u8 proto, __be16 dport, __u8 *src)
+static __always_inline int handle_l4(__u8 family, __u8 proto, __be16 dport, __u8 *src, __u8 packet_class)
 {
     struct listener_key listener = {};
     listener.l4_proto = proto;
@@ -354,7 +426,29 @@ static __always_inline int handle_l4(__u8 family, __u8 proto, __be16 dport, __u8
     lpm_key.dport = dport;
     __builtin_memcpy(lpm_key.addr, src, family == 4 ? 4 : 16);
 
-    return evaluate_packet(&listener, &ip_key, &lpm_key);
+    return evaluate_packet(&listener, &ip_key, &lpm_key, packet_class);
+}
+
+static __always_inline int handle_icmp(__u8 family, __u8 *src)
+{
+    struct listener_key listener = {};
+    listener.l4_proto = IPPROTO_ICMP;
+    listener.dport = 0;
+
+    struct ip_key ip_key = {};
+    ip_key.family = family;
+    ip_key.l4_proto = IPPROTO_ICMP;
+    ip_key.dport = 0;
+    __builtin_memcpy(ip_key.src, src, family == 4 ? 4 : 16);
+
+    struct lpm_ip_key lpm_key = {};
+    lpm_key.prefixlen = family == 4 ? 64 : 160;
+    lpm_key.family = family;
+    lpm_key.l4_proto = IPPROTO_ICMP;
+    lpm_key.dport = 0;
+    __builtin_memcpy(lpm_key.addr, src, family == 4 ? 4 : 16);
+
+    return evaluate_packet(&listener, &ip_key, &lpm_key, SIG_RATE_ICMP_FLOOD);
 }
 
 SEC("xdp")
@@ -383,13 +477,24 @@ int sigproxy_xdp(struct xdp_md *ctx)
             struct udphdr *udp = cursor;
             if ((void *)(udp + 1) > data_end)
                 return XDP_PASS;
-            return handle_l4(4, IPPROTO_UDP, udp->dest, (__u8 *)&iph->saddr);
+            return handle_l4(4, IPPROTO_UDP, udp->dest, (__u8 *)&iph->saddr, SIG_RATE_UDP_FLOOD);
         }
         if (iph->protocol == IPPROTO_TCP) {
             struct tcphdr *tcp = cursor;
             if ((void *)(tcp + 1) > data_end)
                 return XDP_PASS;
-            return handle_l4(4, IPPROTO_TCP, tcp->dest, (__u8 *)&iph->saddr);
+            __u8 packet_class = SIG_RATE_TCP_FLOOD;
+            if (tcp->syn && !tcp->ack)
+                packet_class = SIG_RATE_TCP_SYN_FLOOD;
+            else if (tcp->ack && !tcp->syn)
+                packet_class = SIG_RATE_TCP_ACK_FLOOD;
+            return handle_l4(4, IPPROTO_TCP, tcp->dest, (__u8 *)&iph->saddr, packet_class);
+        }
+        if (iph->protocol == IPPROTO_ICMP) {
+            struct icmphdr *icmp = cursor;
+            if ((void *)(icmp + 1) > data_end)
+                return XDP_PASS;
+            return handle_icmp(4, (__u8 *)&iph->saddr);
         }
         return XDP_PASS;
     }
@@ -408,13 +513,24 @@ int sigproxy_xdp(struct xdp_md *ctx)
             struct udphdr *udp = cursor;
             if ((void *)(udp + 1) > data_end)
                 return XDP_PASS;
-            return handle_l4(6, IPPROTO_UDP, udp->dest, (__u8 *)&ip6h->saddr);
+            return handle_l4(6, IPPROTO_UDP, udp->dest, (__u8 *)&ip6h->saddr, SIG_RATE_UDP_FLOOD);
         }
         if (nexthdr == IPPROTO_TCP) {
             struct tcphdr *tcp = cursor;
             if ((void *)(tcp + 1) > data_end)
                 return XDP_PASS;
-            return handle_l4(6, IPPROTO_TCP, tcp->dest, (__u8 *)&ip6h->saddr);
+            __u8 packet_class = SIG_RATE_TCP_FLOOD;
+            if (tcp->syn && !tcp->ack)
+                packet_class = SIG_RATE_TCP_SYN_FLOOD;
+            else if (tcp->ack && !tcp->syn)
+                packet_class = SIG_RATE_TCP_ACK_FLOOD;
+            return handle_l4(6, IPPROTO_TCP, tcp->dest, (__u8 *)&ip6h->saddr, packet_class);
+        }
+        if (nexthdr == IPPROTO_ICMPV6) {
+            struct icmp6hdr *icmp6 = cursor;
+            if ((void *)(icmp6 + 1) > data_end)
+                return XDP_PASS;
+            return handle_icmp(6, (__u8 *)&ip6h->saddr);
         }
         return XDP_PASS;
     }

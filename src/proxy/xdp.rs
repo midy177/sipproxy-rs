@@ -32,25 +32,26 @@ use tracing::{debug, info, warn};
 #[cfg(target_os = "linux")]
 const XDP_OBJECT_PATH: &str = "/usr/local/share/sigproxy/sigproxy_xdp.o";
 #[cfg(target_os = "linux")]
-const XDP_PIN_DIR: &str = "/sys/fs/bpf/sigproxy";
+const XDP_PIN_DIR: &str = "/sys/fs/bpf/sigproxy/v2";
 #[cfg(target_os = "linux")]
-const XDP_PROG_DIR: &str = "/sys/fs/bpf/sigproxy/progs";
+const XDP_PROG_DIR: &str = "/sys/fs/bpf/sigproxy/v2/progs";
 #[cfg(target_os = "linux")]
-const XDP_MAP_DIR: &str = "/sys/fs/bpf/sigproxy/maps";
+const XDP_MAP_DIR: &str = "/sys/fs/bpf/sigproxy/v2/maps";
 #[cfg(target_os = "linux")]
-const XDP_BLOCKED_IPS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/blocked_ips";
+const XDP_BLOCKED_IPS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/blocked_ips";
 #[cfg(target_os = "linux")]
-const XDP_LISTENER_POLICIES_MAP: &str = "/sys/fs/bpf/sigproxy/maps/listener_policies";
+const XDP_LISTENER_POLICIES_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/listener_policies";
 #[cfg(target_os = "linux")]
-const XDP_ALLOW_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/allow_cidrs";
+const XDP_ALLOW_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/allow_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_DENY_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/deny_cidrs";
+const XDP_DENY_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/deny_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_TRUSTED_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/trusted_cidrs";
+const XDP_TRUSTED_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/trusted_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_GEO_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/geo_cidrs";
+const XDP_GEO_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/geo_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_STATS_MAP: &str = "/sys/fs/bpf/sigproxy/maps/stats";
+const XDP_STATS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/stats";
+const XDP_PROTO_ICMP: u8 = 1;
 const XDP_PROTO_TCP: u8 = 6;
 const XDP_PROTO_UDP: u8 = 17;
 const XDP_POLICY_CIDR_ALLOW_ENABLED: u64 = 1 << 0;
@@ -58,8 +59,9 @@ const XDP_POLICY_GEO_ENABLED: u64 = 1 << 1;
 const XDP_POLICY_GEO_UNKNOWN_ALLOW: u64 = 1 << 2;
 const XDP_POLICY_GEO_ALLOW_HAS_ENTRIES: u64 = 1 << 3;
 const XDP_POLICY_IP_RATE_LIMIT_ENABLED: u64 = 1 << 4;
+const XDP_POLICY_FLOOD_ENABLED: u64 = 1 << 5;
 const XDP_COUNTRY_WORDS: usize = 11;
-const XDP_STAT_NAMES: [&str; 8] = [
+const XDP_STAT_NAMES: [&str; 13] = [
     "pass",
     "blocklist-drop",
     "deny-cidr-drop",
@@ -68,6 +70,11 @@ const XDP_STAT_NAMES: [&str; 8] = [
     "geo-deny-drop",
     "geo-not-allowed-drop",
     "rate-limit-drop",
+    "udp-flood-drop",
+    "tcp-flood-drop",
+    "tcp-syn-flood-drop",
+    "tcp-ack-flood-drop",
+    "icmp-flood-drop",
 ];
 #[cfg(target_os = "linux")]
 const XDP_GEO_SYNC_PROGRESS_INTERVAL: usize = 10_000;
@@ -113,6 +120,16 @@ struct XdpListenerPolicySpec {
     flags: u64,
     packets_per_second: u32,
     burst: u32,
+    udp_flood_packets_per_second: u32,
+    udp_flood_burst: u32,
+    tcp_flood_packets_per_second: u32,
+    tcp_flood_burst: u32,
+    tcp_syn_flood_packets_per_second: u32,
+    tcp_syn_flood_burst: u32,
+    tcp_ack_flood_packets_per_second: u32,
+    tcp_ack_flood_burst: u32,
+    icmp_flood_packets_per_second: u32,
+    icmp_flood_burst: u32,
     geo_allow: [u64; XDP_COUNTRY_WORDS],
     geo_deny: [u64; XDP_COUNTRY_WORDS],
     trusted_cidrs: Vec<XdpCidrPrefix>,
@@ -146,6 +163,7 @@ impl XdpRuntime {
         let mut interfaces = BTreeSet::new();
         let mut listener_count = 0_usize;
         let mut listeners = Vec::new();
+        let mut icmp_flood_policy: Option<XdpListenerPolicySpec> = None;
 
         for listener in &config.listeners {
             let effective = config.effective_security_for_listener(listener);
@@ -159,6 +177,21 @@ impl XdpRuntime {
             detach_stale &= effective.xdp.detach_stale;
             interfaces.extend(effective.xdp.interfaces.iter().cloned());
             listeners.push(XdpListenerSpec::from_listener(listener, &effective)?);
+            if let Some(policy) = XdpListenerPolicySpec::icmp_flood_from_security(&effective) {
+                if let Some(existing) = &mut icmp_flood_policy {
+                    existing.merge_icmp_flood(policy);
+                } else {
+                    icmp_flood_policy = Some(policy);
+                }
+            }
+        }
+        if let Some(policy) = icmp_flood_policy {
+            listeners.push(XdpListenerSpec {
+                listener_key: "icmp/*:0".to_string(),
+                l4_proto: XDP_PROTO_ICMP,
+                port: 0,
+                policy,
+            });
         }
 
         let backend = if requested {
@@ -409,11 +442,41 @@ impl XdpListenerPolicySpec {
                 .min(u64::from(u32::MAX)) as u32;
             burst = security.ip_rate_limit.burst.min(u64::from(u32::MAX)) as u32;
         }
+        let (
+            udp_flood_packets_per_second,
+            udp_flood_burst,
+            tcp_flood_packets_per_second,
+            tcp_flood_burst,
+            tcp_syn_flood_packets_per_second,
+            tcp_syn_flood_burst,
+            tcp_ack_flood_packets_per_second,
+            tcp_ack_flood_burst,
+            icmp_flood_packets_per_second,
+            icmp_flood_burst,
+        ) = flood_fields(security);
+        if udp_flood_packets_per_second > 0
+            || tcp_flood_packets_per_second > 0
+            || tcp_syn_flood_packets_per_second > 0
+            || tcp_ack_flood_packets_per_second > 0
+            || icmp_flood_packets_per_second > 0
+        {
+            flags |= XDP_POLICY_FLOOD_ENABLED;
+        }
 
         Ok(Self {
             flags,
             packets_per_second,
             burst,
+            udp_flood_packets_per_second,
+            udp_flood_burst,
+            tcp_flood_packets_per_second,
+            tcp_flood_burst,
+            tcp_syn_flood_packets_per_second,
+            tcp_syn_flood_burst,
+            tcp_ack_flood_packets_per_second,
+            tcp_ack_flood_burst,
+            icmp_flood_packets_per_second,
+            icmp_flood_burst,
             geo_allow,
             geo_deny,
             trusted_cidrs,
@@ -422,6 +485,66 @@ impl XdpListenerPolicySpec {
             threat_intel,
         })
     }
+
+    fn icmp_flood_from_security(security: &EffectiveProxySecurityConfig) -> Option<Self> {
+        let (_, _, _, _, _, _, _, _, icmp_flood_packets_per_second, icmp_flood_burst) =
+            flood_fields(security);
+        if icmp_flood_packets_per_second == 0 || icmp_flood_burst == 0 {
+            return None;
+        }
+        Some(Self {
+            flags: XDP_POLICY_FLOOD_ENABLED,
+            packets_per_second: 0,
+            burst: 0,
+            udp_flood_packets_per_second: 0,
+            udp_flood_burst: 0,
+            tcp_flood_packets_per_second: 0,
+            tcp_flood_burst: 0,
+            tcp_syn_flood_packets_per_second: 0,
+            tcp_syn_flood_burst: 0,
+            tcp_ack_flood_packets_per_second: 0,
+            tcp_ack_flood_burst: 0,
+            icmp_flood_packets_per_second,
+            icmp_flood_burst,
+            geo_allow: [0; XDP_COUNTRY_WORDS],
+            geo_deny: [0; XDP_COUNTRY_WORDS],
+            trusted_cidrs: Vec::new(),
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            threat_intel: false,
+        })
+    }
+
+    fn merge_icmp_flood(&mut self, other: Self) {
+        self.icmp_flood_packets_per_second = self
+            .icmp_flood_packets_per_second
+            .max(other.icmp_flood_packets_per_second);
+        self.icmp_flood_burst = self.icmp_flood_burst.max(other.icmp_flood_burst);
+    }
+}
+
+fn flood_fields(
+    security: &EffectiveProxySecurityConfig,
+) -> (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) {
+    if !security.flood.enabled {
+        return (0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+    (
+        limit_u32(security.flood.udp_packets_per_second),
+        limit_u32(security.flood.udp_burst),
+        limit_u32(security.flood.tcp_packets_per_second),
+        limit_u32(security.flood.tcp_burst),
+        limit_u32(security.flood.tcp_syn_packets_per_second),
+        limit_u32(security.flood.tcp_syn_burst),
+        limit_u32(security.flood.tcp_ack_packets_per_second),
+        limit_u32(security.flood.tcp_ack_burst),
+        limit_u32(security.flood.icmp_packets_per_second),
+        limit_u32(security.flood.icmp_burst),
+    )
+}
+
+fn limit_u32(value: u64) -> u32 {
+    value.min(u64::from(u32::MAX)) as u32
 }
 
 fn render_interfaces(interfaces: &BTreeSet<String>) -> String {
@@ -668,6 +791,16 @@ struct XdpListenerPolicy {
     flags: u64,
     packets_per_second: u32,
     burst: u32,
+    udp_flood_packets_per_second: u32,
+    udp_flood_burst: u32,
+    tcp_flood_packets_per_second: u32,
+    tcp_flood_burst: u32,
+    tcp_syn_flood_packets_per_second: u32,
+    tcp_syn_flood_burst: u32,
+    tcp_ack_flood_packets_per_second: u32,
+    tcp_ack_flood_burst: u32,
+    icmp_flood_packets_per_second: u32,
+    icmp_flood_burst: u32,
     geo_allow: [u64; XDP_COUNTRY_WORDS],
     geo_deny: [u64; XDP_COUNTRY_WORDS],
 }
@@ -1274,6 +1407,16 @@ fn encode_listener_policy(policy: &XdpListenerPolicySpec) -> XdpListenerPolicy {
         flags: policy.flags,
         packets_per_second: policy.packets_per_second,
         burst: policy.burst,
+        udp_flood_packets_per_second: policy.udp_flood_packets_per_second,
+        udp_flood_burst: policy.udp_flood_burst,
+        tcp_flood_packets_per_second: policy.tcp_flood_packets_per_second,
+        tcp_flood_burst: policy.tcp_flood_burst,
+        tcp_syn_flood_packets_per_second: policy.tcp_syn_flood_packets_per_second,
+        tcp_syn_flood_burst: policy.tcp_syn_flood_burst,
+        tcp_ack_flood_packets_per_second: policy.tcp_ack_flood_packets_per_second,
+        tcp_ack_flood_burst: policy.tcp_ack_flood_burst,
+        icmp_flood_packets_per_second: policy.icmp_flood_packets_per_second,
+        icmp_flood_burst: policy.icmp_flood_burst,
         geo_allow: policy.geo_allow,
         geo_deny: policy.geo_deny,
     }

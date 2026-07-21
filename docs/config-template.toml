@@ -175,6 +175,12 @@ preset = "off"
 # udp_burst = 400
 # tcp_packets_per_second = 200
 # tcp_burst = 400
+# tcp_syn_packets_per_second = 100
+# tcp_syn_burst = 200
+# tcp_ack_packets_per_second = 200
+# tcp_ack_burst = 400
+# icmp_packets_per_second = 50
+# icmp_burst = 100
 # block_seconds = 300
 #
 # [proxy.security.ip_rate_limit]

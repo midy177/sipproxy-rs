@@ -368,6 +368,12 @@ udp_packets_per_second = 200
 udp_burst = 400
 tcp_packets_per_second = 200
 tcp_burst = 400
+tcp_syn_packets_per_second = 100
+tcp_syn_burst = 200
+tcp_ack_packets_per_second = 200
+tcp_ack_burst = 400
+icmp_packets_per_second = 50
+icmp_burst = 100
 block_seconds = 300
 ```
 
@@ -383,10 +389,10 @@ default, runtime refresh is disabled so container deployments use the caches
 built into the image.
 
 `[proxy.security.flood]` is a raw packet flood guard applied before SIP method
-rate limits. It is listener-scoped and source-IP based. XDP already offloads the
-existing packet token bucket for traffic targeting configured SIP listeners;
-separate SYN/ACK/ICMP classification requires additional BPF policy maps and is
-tracked as the next XDP expansion.
+rate limits. It is listener-scoped and source-IP based. XDP offloads UDP flood,
+TCP flood, TCP SYN flood, TCP ACK flood, and ICMP/ICMPv6 flood token buckets
+when `[proxy.security.xdp]` is enabled. ICMP is enforced as an interface-level
+pseudo listener because ICMP has no SIP listener port.
 
 When `require_registered_invite_source = true`, initial `INVITE` requests from
 client-side peers must use a From AoR that has an active REGISTER binding, and

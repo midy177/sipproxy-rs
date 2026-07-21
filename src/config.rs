@@ -652,6 +652,18 @@ fn validate_flood_security_config(config: &ProxyFloodSecurityConfig, path: &str)
         ("udp_burst", config.udp_burst),
         ("tcp_packets_per_second", config.tcp_packets_per_second),
         ("tcp_burst", config.tcp_burst),
+        (
+            "tcp_syn_packets_per_second",
+            config.tcp_syn_packets_per_second,
+        ),
+        ("tcp_syn_burst", config.tcp_syn_burst),
+        (
+            "tcp_ack_packets_per_second",
+            config.tcp_ack_packets_per_second,
+        ),
+        ("tcp_ack_burst", config.tcp_ack_burst),
+        ("icmp_packets_per_second", config.icmp_packets_per_second),
+        ("icmp_burst", config.icmp_burst),
         ("block_seconds", config.block_seconds),
     ] {
         if value.is_some_and(|value| value == 0) {
@@ -1191,6 +1203,18 @@ pub struct ProxyFloodSecurityConfig {
     #[serde(default)]
     pub tcp_burst: Option<u64>,
     #[serde(default)]
+    pub tcp_syn_packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub tcp_syn_burst: Option<u64>,
+    #[serde(default)]
+    pub tcp_ack_packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub tcp_ack_burst: Option<u64>,
+    #[serde(default)]
+    pub icmp_packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub icmp_burst: Option<u64>,
+    #[serde(default)]
     pub block_seconds: Option<u64>,
 }
 
@@ -1210,6 +1234,24 @@ impl ProxyFloodSecurityConfig {
         }
         if let Some(tcp_burst) = self.tcp_burst {
             effective.tcp_burst = tcp_burst;
+        }
+        if let Some(tcp_syn_packets_per_second) = self.tcp_syn_packets_per_second {
+            effective.tcp_syn_packets_per_second = tcp_syn_packets_per_second;
+        }
+        if let Some(tcp_syn_burst) = self.tcp_syn_burst {
+            effective.tcp_syn_burst = tcp_syn_burst;
+        }
+        if let Some(tcp_ack_packets_per_second) = self.tcp_ack_packets_per_second {
+            effective.tcp_ack_packets_per_second = tcp_ack_packets_per_second;
+        }
+        if let Some(tcp_ack_burst) = self.tcp_ack_burst {
+            effective.tcp_ack_burst = tcp_ack_burst;
+        }
+        if let Some(icmp_packets_per_second) = self.icmp_packets_per_second {
+            effective.icmp_packets_per_second = icmp_packets_per_second;
+        }
+        if let Some(icmp_burst) = self.icmp_burst {
+            effective.icmp_burst = icmp_burst;
         }
         if let Some(block_seconds) = self.block_seconds {
             effective.block_seconds = block_seconds;
@@ -1750,6 +1792,12 @@ pub struct EffectiveProxyFloodSecurityConfig {
     pub udp_burst: u64,
     pub tcp_packets_per_second: u64,
     pub tcp_burst: u64,
+    pub tcp_syn_packets_per_second: u64,
+    pub tcp_syn_burst: u64,
+    pub tcp_ack_packets_per_second: u64,
+    pub tcp_ack_burst: u64,
+    pub icmp_packets_per_second: u64,
+    pub icmp_burst: u64,
     pub block_seconds: u64,
 }
 
@@ -1761,6 +1809,12 @@ impl Default for EffectiveProxyFloodSecurityConfig {
             udp_burst: 0,
             tcp_packets_per_second: 0,
             tcp_burst: 0,
+            tcp_syn_packets_per_second: 0,
+            tcp_syn_burst: 0,
+            tcp_ack_packets_per_second: 0,
+            tcp_ack_burst: 0,
+            icmp_packets_per_second: 0,
+            icmp_burst: 0,
             block_seconds: 0,
         }
     }
