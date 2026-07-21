@@ -1326,6 +1326,11 @@ impl ProxyServer {
                 self.record_affinity_lookup("miss");
                 self.select_upstream(&request_uri, listener)
             }
+        } else if (from_upstream || from_trusted_peer)
+            && let Some(target) = self.direct_request_uri_target(&request_uri, listener)
+        {
+            self.record_affinity_lookup("request-uri-target");
+            target
         } else if let Some(target) = self
             .lookup_registered_upstream_target(&message, &request_uri)
             .await
@@ -6291,6 +6296,80 @@ Content-Length: 0\r\n\r\n"
         assert!(forwarded.starts_with(&format!("INVITE sip:3001@{client_addr};ob SIP/2.0")));
         assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
         assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn trusted_ack_without_route_set_routes_request_uri_contact_directly_to_client() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trusted_peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        let server = ProxyServer::new(
+            Config {
+                sip: SipConfig {
+                    external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstream_socket.local_addr().unwrap().to_string(),
+                    ..SipConfig::default()
+                },
+                proxy: ProxyConfig {
+                    record_route: true,
+                    security: ProxySecurityConfig {
+                        trusted_cidrs: Some(vec!["127.0.0.0/8".to_string()]),
+                        ..ProxySecurityConfig::default()
+                    },
+                    listeners: vec![test_listener()],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream_socket.local_addr().unwrap().to_string()],
+                    }],
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            None,
+        )
+        .unwrap();
+        let packet = format!(
+            "ACK sip:1002@{client_addr};ob SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5088;branch=z9hG4bK-trusted-ack-no-route\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:1000@example.com>;tag=a\r\n\
+To: <sip:1002@example.com>;tag=b\r\n\
+Call-ID: trusted-ack-no-route\r\n\
+CSeq: 1 ACK\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet.as_bytes(),
+                trusted_peer_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with(&format!("ACK sip:1002@{client_addr};ob SIP/2.0")));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
         assert!(
             timeout(
                 Duration::from_millis(100),
