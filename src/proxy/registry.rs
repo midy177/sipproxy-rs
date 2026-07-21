@@ -61,7 +61,9 @@ pub fn extract_expires(message: &SipMessage) -> Duration {
 pub fn extract_response_contact_expires(message: &SipMessage) -> Option<Duration> {
     message
         .headers("Contact")
-        .filter_map(|value| RsipContact::parse(value).ok()?.expires())
+        .filter_map(|value| RsipContact::parse_header_list(value).ok())
+        .flatten()
+        .filter_map(|contact| contact.expires())
         .max()
         .map(|seconds| Duration::from_secs(u64::from(seconds)))
 }
@@ -97,6 +99,22 @@ CSeq: 1 REGISTER\r\n\r\n",
         let msg = SipMessage::parse(
             b"SIP/2.0 200 OK\r\n\
 Contact: <sip:100@127.0.0.1:5062>;expires=300\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 REGISTER\r\n\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            extract_response_contact_expires(&msg),
+            Some(Duration::from_secs(300))
+        );
+    }
+
+    #[test]
+    fn extracts_response_contact_expires_from_comma_separated_contacts() {
+        let msg = SipMessage::parse(
+            b"SIP/2.0 200 OK\r\n\
+Contact: <sip:100@127.0.0.1:5062>;expires=60, <sip:100@127.0.0.1:5063>;expires=300\r\n\
 Call-ID: c1\r\n\
 CSeq: 1 REGISTER\r\n\r\n",
         )
