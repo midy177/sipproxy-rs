@@ -3726,20 +3726,12 @@ fn health_options_response_matches_branch(response: &[u8], branch: &str) -> Resu
     if !matches!(message.start_line, SipStartLine::Response { .. }) {
         return Ok(true);
     }
-    let Some(via) = message.header("Via") else {
+    if message.header("Via").is_none() {
         return Ok(true);
-    };
-    Ok(via_branch_param(via).is_none_or(|response_branch| response_branch == branch))
-}
-
-fn via_branch_param(via: &str) -> Option<&str> {
-    let top_via = via.split(',').next().unwrap_or(via);
-    top_via.split(';').skip(1).find_map(|param| {
-        let (name, value) = param.trim().split_once('=')?;
-        name.trim()
-            .eq_ignore_ascii_case("branch")
-            .then_some(value.trim())
-    })
+    }
+    Ok(message
+        .top_via_branch()?
+        .is_none_or(|response_branch| response_branch == branch))
 }
 
 async fn probe_sip_options_tcp(
@@ -7579,6 +7571,35 @@ Content-Length: 0\r\n\r\n",
         assert_ne!(
             first.top_via_branch().unwrap(),
             second.top_via_branch().unwrap()
+        );
+    }
+
+    #[test]
+    fn health_options_response_branch_matching_uses_typed_via() {
+        assert!(
+            health_options_response_matches_branch(
+                b"SIP/2.0 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                "z9hG4bK-health-1",
+            )
+            .unwrap()
+        );
+        assert!(
+            health_options_response_matches_branch(
+                b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-health-1;rport=5060\r\n\
+Content-Length: 0\r\n\r\n",
+                "z9hG4bK-health-1",
+            )
+            .unwrap()
+        );
+        assert!(
+            !health_options_response_matches_branch(
+                b"SIP/2.0 200 OK\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK-other;rport=5060\r\n\
+Content-Length: 0\r\n\r\n",
+                "z9hG4bK-health-1",
+            )
+            .unwrap()
         );
     }
 
