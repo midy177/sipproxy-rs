@@ -1379,13 +1379,11 @@ impl ProxyServer {
         let via_host = self
             .advertised_sip_addr(target_side, listener, target.addr)
             .await;
-        message.prepend_header(
-            "Via",
-            format!(
-                "SIP/2.0/{} {via_host};branch={branch};rport",
-                target.transport.sip_via_token()
-            ),
-        );
+        message.prepend_via(
+            rsip_transport_from_sip(target.transport),
+            &via_host,
+            branch.clone(),
+        )?;
 
         if self.config.proxy.record_route && should_record_route(&method) {
             for addr in self
@@ -1394,7 +1392,7 @@ impl ProxyServer {
                 .into_iter()
                 .rev()
             {
-                message.prepend_header("Record-Route", format!("<sip:{addr};lr>"));
+                message.prepend_record_route(&addr)?;
             }
         }
         if method == "REGISTER" {
@@ -3635,13 +3633,9 @@ fn build_health_options_request(
     let branch = format!("z9hG4bK-health-{id}");
     let cseq = cseq_from_id(id);
     let call_id = health_options_call_id(server, transport, uri);
-    let transport = match transport {
-        SipTransport::Udp => RsipTransport::Udp,
-        SipTransport::Tcp => RsipTransport::Tcp,
-    };
     let packet = SipMessage::options_request(
         uri,
-        transport,
+        rsip_transport_from_sip(transport),
         sent_by,
         branch.clone(),
         format!("health-{id}"),
@@ -4349,6 +4343,13 @@ fn sip_transport_from_rsip(transport: RsipTransport) -> Option<SipTransport> {
         RsipTransport::Udp => Some(SipTransport::Udp),
         RsipTransport::Tcp => Some(SipTransport::Tcp),
         _ => None,
+    }
+}
+
+fn rsip_transport_from_sip(transport: SipTransport) -> RsipTransport {
+    match transport {
+        SipTransport::Udp => RsipTransport::Udp,
+        SipTransport::Tcp => RsipTransport::Tcp,
     }
 }
 

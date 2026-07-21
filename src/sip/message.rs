@@ -6,7 +6,7 @@ use rsipstack::sip::{
     SipMessage as RsipMessage, StatusCode, Transport, Uri, Version,
     headers::{CallId, UserAgent},
     param::{Branch, Tag},
-    typed::{CSeq, Contact as TypedContact, From as FromHeader, To as ToHeader, Via},
+    typed::{CSeq, Contact as TypedContact, From as FromHeader, RecordRoute, To as ToHeader, Via},
 };
 use std::net::{IpAddr, SocketAddr};
 
@@ -177,6 +177,36 @@ impl SipMessage {
         self.inner
             .headers_mut()
             .push_front(Header::Other(name.into(), value.into()));
+    }
+
+    pub fn prepend_via(
+        &mut self,
+        transport: Transport,
+        sent_by: &str,
+        branch: impl Into<String>,
+    ) -> Result<()> {
+        let sent_by = HostWithPort::try_from(sent_by).context("invalid Via sent-by")?;
+        let via = Via {
+            version: Version::V2,
+            transport,
+            uri: sent_by.into(),
+            params: vec![
+                Param::Branch(Branch::new(branch.into())),
+                Param::Rport(None),
+            ],
+        };
+        self.inner.headers_mut().push_front(via.into());
+        Ok(())
+    }
+
+    pub fn prepend_record_route(&mut self, addr: &str) -> Result<()> {
+        let uri = format!("sip:{addr};lr")
+            .parse::<Uri>()
+            .context("invalid Record-Route URI")?;
+        self.inner
+            .headers_mut()
+            .push_front(RecordRoute::from(uri).into());
+        Ok(())
     }
 
     pub fn set_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
