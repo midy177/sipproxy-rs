@@ -835,7 +835,7 @@ impl ProxyServer {
             }
         }
         if let Err(err) = self
-            .forward_tcp_stream(stream, message, peer, listener)
+            .forward_tcp_stream(stream, message, peer, listener, method.as_str())
             .await
         {
             error!(error = %format!("{err:#}"), "failed to forward TCP SIP request");
@@ -967,7 +967,10 @@ impl ProxyServer {
                 return Ok(());
             }
         }
-        if let Err(err) = self.forward_udp(socket, message, peer, listener).await {
+        if let Err(err) = self
+            .forward_udp(socket, message, peer, listener, method.as_str())
+            .await
+        {
             error!(error = %format!("{err:#}"), "failed to forward UDP SIP request");
             self.record_forward_error("udp");
             let request = SipMessage::parse(packet)?;
@@ -1105,22 +1108,23 @@ impl ProxyServer {
         message: SipMessage,
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
+        method: &str,
     ) -> Result<()> {
-        let (message, target, branch, invite_transaction_key) =
-            self.prepare_forward(message, peer, listener).await?;
-        let method = message.method().unwrap_or_default().to_string();
+        let (message, target, branch, invite_transaction_key) = self
+            .prepare_forward(message, peer, listener, method)
+            .await?;
 
         debug!(
             %peer,
             target = %target.addr,
             transport = %target.transport.as_str(),
-            method = %method,
+            method,
             branch = %branch,
             "forwarding UDP SIP request"
         );
         match target.transport {
             SipTransport::Udp => {
-                self.record_forwarded_request("udp", target.transport, Some(method.as_str()));
+                self.record_forwarded_request("udp", target.transport, Some(method));
                 {
                     let mut branches = self.udp_branches.lock().await;
                     self.prune_udp_branches_if_due(&mut branches, Instant::now())
@@ -1144,13 +1148,13 @@ impl ProxyServer {
                     target,
                     &branch,
                     invite_transaction_key,
-                    method.as_str(),
+                    method,
                 )
                 .await;
                 Ok(())
             }
             SipTransport::Tcp => {
-                self.record_forwarded_request("udp", target.transport, Some(method.as_str()));
+                self.record_forwarded_request("udp", target.transport, Some(method));
                 self.forward_udp_to_tcp_upstream(
                     socket,
                     message.to_bytes(),
@@ -1158,7 +1162,7 @@ impl ProxyServer {
                     target.addr,
                     branch,
                     invite_transaction_key,
-                    method,
+                    method.to_string(),
                 )
                 .await
             }
@@ -1217,11 +1221,12 @@ impl ProxyServer {
         message: SipMessage,
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
+        method: &str,
     ) -> Result<()> {
-        let method = message.method().unwrap_or_default().to_string();
-        let (message, target, branch, invite_transaction_key) =
-            self.prepare_forward(message, peer, listener).await?;
-        self.record_forwarded_request("tcp", target.transport, Some(method.as_str()));
+        let (message, target, branch, invite_transaction_key) = self
+            .prepare_forward(message, peer, listener, method)
+            .await?;
+        self.record_forwarded_request("tcp", target.transport, Some(method));
         let mut responses = match self
             .tcp_upstreams
             .send_request(target.addr, branch.clone(), message.to_bytes())
@@ -1233,17 +1238,11 @@ impl ProxyServer {
                 return Err(err);
             }
         };
-        self.remember_successful_forward(
-            &message,
-            target,
-            &branch,
-            invite_transaction_key,
-            method.as_str(),
-        )
-        .await;
+        self.remember_successful_forward(&message, target, &branch, invite_transaction_key, method)
+            .await;
         loop {
             let response = self
-                .recv_upstream_response(&mut responses, target.addr, method.as_str())
+                .recv_upstream_response(&mut responses, target.addr, method)
                 .await?;
             let response_message = SipMessage::parse(&response)?;
             let is_final = matches!(
@@ -1270,12 +1269,12 @@ impl ProxyServer {
         mut message: SipMessage,
         _peer: SocketAddr,
         listener: &ProxyListenerConfig,
+        method: &str,
     ) -> Result<(SipMessage, UpstreamTarget, String, Option<String>)> {
         let request_uri = message
             .request_uri()
             .context("request forwarding requires a request URI")?
             .to_string();
-        let method = message.method().unwrap_or_default().to_string();
         let from_upstream = self.upstreams.contains(_peer);
         let from_trusted_peer = self.security.is_trusted_peer(listener, _peer.ip());
         let route_set_targets_this_proxy = self
@@ -1386,7 +1385,7 @@ impl ProxyServer {
             branch.clone(),
         )?;
 
-        if self.config.proxy.record_route && should_record_route(&method) {
+        if self.config.proxy.record_route && should_record_route(method) {
             for addr in self
                 .record_route_addrs(_peer, target.addr, listener)
                 .await
