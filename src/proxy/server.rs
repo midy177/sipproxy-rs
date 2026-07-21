@@ -520,6 +520,7 @@ impl ProxyServer {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let mut buf = vec![0; self.config.sip.max_message_bytes];
+        let listener = Arc::new(listener);
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
