@@ -1,8 +1,5 @@
 use anyhow::{Context, Result};
-use rsipstack::sip::headers::{
-    Header, Headers,
-    untyped::{Path as UntypedPath, Route as UntypedRoute},
-};
+use rsipstack::sip::headers::{Header, Headers, make_header, untyped::Path as UntypedPath};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
     Auth, ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
@@ -181,9 +178,10 @@ impl SipMessage {
     }
 
     pub fn prepend_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let name = name.into();
         self.inner
             .headers_mut()
-            .push_front(Header::Other(name.into(), value.into()));
+            .push_front(header_from_name_value(&name, value.into()));
     }
 
     pub fn prepend_via(
@@ -233,9 +231,11 @@ impl SipMessage {
             .iter_mut()
             .find(|header| header.name().eq_ignore_ascii_case(&name))
         {
-            *header = Header::Other(name, value);
+            *header = header_from_name_value(&name, value);
         } else {
-            self.inner.headers_mut().push(Header::Other(name, value));
+            self.inner
+                .headers_mut()
+                .push(header_from_name_value(&name, value));
         }
     }
 
@@ -258,7 +258,7 @@ impl SipMessage {
         match rest {
             Some(rest) if !rest.trim().is_empty() => {
                 self.inner.headers_mut().0[index] =
-                    Header::Other("Via".to_string(), format!("{rewritten}, {}", rest.trim()));
+                    header_from_name_value("Via", format!("{rewritten}, {}", rest.trim()));
             }
             _ => {
                 self.inner.headers_mut().0[index] =
@@ -313,7 +313,7 @@ impl SipMessage {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            *header = Header::Other("Contact".to_string(), rendered);
+            *header = header_from_name_value("Contact", rendered);
         }
         Ok(rewritten)
     }
@@ -483,12 +483,8 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
     Ok((value, None))
 }
 
-fn header_from_name_value(name: &str, value: &str) -> Header {
-    if name.eq_ignore_ascii_case("Route") {
-        Header::Route(UntypedRoute::new(value.to_string()))
-    } else {
-        Header::Other(name.to_string(), value.to_string())
-    }
+fn header_from_name_value(name: &str, value: impl Into<String>) -> Header {
+    make_header(name, value.into())
 }
 
 fn rewrite_via_received_rport(value: &str, peer: SocketAddr) -> String {
@@ -614,6 +610,36 @@ CSeq: 1 OPTIONS\r\n\r\n",
                 .unwrap()
                 .starts_with("SIP/2.0 200 OK")
         );
+    }
+
+    #[test]
+    fn generic_header_helpers_preserve_standard_header_variants() {
+        let mut msg = SipMessage::parse(
+            b"OPTIONS sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1\r\n\
+From: <sip:200@example.com>;tag=a\r\n\
+To: <sip:example.com>\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        msg.set_header("Contact", "<sip:200@127.0.0.1:5060>");
+        msg.prepend_header("Route", "<sip:edge.example.com;lr>");
+        msg.set_header("X-Sigproxy-Test", "ok");
+
+        let headers = msg.inner.headers();
+        assert!(matches!(headers.iter().next(), Some(Header::Route(_))));
+        assert!(
+            headers
+                .iter()
+                .any(|header| matches!(header, Header::Contact(_)))
+        );
+        assert!(headers.iter().any(|header| matches!(
+            header,
+            Header::Other(name, value) if name == "X-Sigproxy-Test" && value == "ok"
+        )));
     }
 
     #[test]

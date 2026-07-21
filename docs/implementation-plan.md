@@ -610,6 +610,7 @@ Active-standby 生产启用前必修：
 - 健康检查 OPTIONS 响应的 Via branch 匹配已改用 `rsipstack` typed top Via branch 提取，同时保留无 Via 简单响应兼容。
 - 通用 header-list 拆分已覆盖引号与 `<...>` name-addr，避免 Route/Contact URI 内逗号被误判为 header-list 分隔符。
 - Route header-list 弹栈后写回剩余 Route 时保留标准 `Header::Route` 变体，减少 `Header::Other` fallback。
+- 通用 `set_header` / `prepend_header` 和 Contact/Via 写回已改用 `rsipstack::sip::headers::make_header`，标准 SIP 头尽量保留 typed/untyped 标准变体，自定义扩展头才回退 `Header::Other`。
 - registered Contact 目标解析已改用 `rsipstack` typed `Contact` / `Uri` / `Transport` API，支持完整 Contact header value 和 SIP 默认端口。
 - REGISTER 成功响应的 Contact expires 提取已改用 `rsipstack` typed Contact header-list 解析，支持逗号合并的多 Contact。
 - Route set 目标判断已改用 `rsipstack` typed `Route` / `Uri` / `Transport` API，避免把 Route 当 Contact 兼容解析。
