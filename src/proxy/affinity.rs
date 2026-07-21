@@ -4,9 +4,13 @@ use anyhow::{Context, Result};
 use rsipstack::sip::prelude::HeadersExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
+
+const AFFINITY_SHARDS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AffinityTarget {
@@ -43,7 +47,7 @@ pub struct AffinityBindingSnapshot {
 #[derive(Debug)]
 pub struct AffinityTable {
     config: ProxyAffinityConfig,
-    bindings: Mutex<HashMap<AffinityKey, AffinityBinding>>,
+    bindings: ShardedAffinityBindings,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -56,7 +60,7 @@ impl AffinityTable {
     pub fn new(config: ProxyAffinityConfig) -> Self {
         Self {
             config,
-            bindings: Mutex::new(HashMap::new()),
+            bindings: ShardedAffinityBindings::new(AFFINITY_SHARDS),
         }
     }
 
@@ -69,18 +73,22 @@ impl AffinityTable {
             return Ok(None);
         }
 
-        let mut bindings = self.bindings.lock().await;
-        prune_affinity(&mut bindings, Instant::now());
-        Ok(keys
-            .iter()
-            .find_map(|key| bindings.get(key).map(|binding| binding.target)))
+        let now = Instant::now();
+        for key in keys {
+            let mut bindings = self.bindings.shard_for_key(&key).lock().await;
+            prune_affinity(&mut bindings, now);
+            if let Some(binding) = bindings.get(&key) {
+                return Ok(Some(binding.target));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn lookup_key(&self, key: &AffinityKey) -> Option<AffinityTarget> {
         if !self.config.enabled {
             return None;
         }
-        let mut bindings = self.bindings.lock().await;
+        let mut bindings = self.bindings.shard_for_key(key).lock().await;
         prune_affinity(&mut bindings, Instant::now());
         bindings.get(key).map(|binding| binding.target)
     }
@@ -108,8 +116,8 @@ impl AffinityTable {
                 expires_at_epoch_ms,
             })
             .collect::<Vec<_>>();
-        let mut bindings = self.bindings.lock().await;
         for key in keys {
+            let mut bindings = self.bindings.shard_for_key(&key).lock().await;
             bindings.insert(key, AffinityBinding { target, expires_at });
         }
         Ok(snapshots)
@@ -132,6 +140,7 @@ impl AffinityTable {
             expires_at_epoch_ms,
         };
         self.bindings
+            .shard_for_key(&key)
             .lock()
             .await
             .insert(key, AffinityBinding { target, expires_at });
@@ -141,13 +150,12 @@ impl AffinityTable {
     pub async fn snapshot(&self) -> AffinityStateSnapshot {
         let now = Instant::now();
         let now_epoch_ms = now_epoch_ms();
-        let mut bindings = self.bindings.lock().await;
-        prune_affinity(&mut bindings, now);
-
-        AffinityStateSnapshot {
-            bindings: bindings
-                .iter()
-                .map(|(key, binding)| AffinityBindingSnapshot {
+        let mut snapshots = Vec::new();
+        for shard in &self.bindings.shards {
+            let mut bindings = shard.lock().await;
+            prune_affinity(&mut bindings, now);
+            snapshots.extend(bindings.iter().map(|(key, binding)| {
+                AffinityBindingSnapshot {
                     key: key.clone(),
                     target: binding.target,
                     expires_at_epoch_ms: now_epoch_ms
@@ -155,21 +163,26 @@ impl AffinityTable {
                             .expires_at
                             .saturating_duration_since(now)
                             .as_millis(),
-                })
-                .collect(),
+                }
+            }));
+        }
+
+        AffinityStateSnapshot {
+            bindings: snapshots,
         }
     }
 
     pub async fn install_snapshot(&self, snapshot: AffinityStateSnapshot) {
         let now_epoch_ms = now_epoch_ms();
         let now = Instant::now();
-        let mut bindings = HashMap::new();
+        let mut sharded_bindings = self.bindings.empty_shards();
         for binding in snapshot.bindings {
             if binding.expires_at_epoch_ms <= now_epoch_ms {
                 continue;
             }
             let ttl_ms = binding.expires_at_epoch_ms - now_epoch_ms;
-            bindings.insert(
+            let shard_index = self.bindings.shard_index(&binding.key);
+            sharded_bindings[shard_index].insert(
                 binding.key,
                 AffinityBinding {
                     target: binding.target,
@@ -177,14 +190,14 @@ impl AffinityTable {
                 },
             );
         }
-        *self.bindings.lock().await = bindings;
+        self.bindings.replace_all(sharded_bindings).await;
     }
 
     pub async fn upsert_snapshot_bindings(&self, snapshots: Vec<AffinityBindingSnapshot>) {
         let now_epoch_ms = now_epoch_ms();
         let now = Instant::now();
-        let mut bindings = self.bindings.lock().await;
         for snapshot in snapshots {
+            let mut bindings = self.bindings.shard_for_key(&snapshot.key).lock().await;
             if snapshot.expires_at_epoch_ms <= now_epoch_ms {
                 bindings.remove(&snapshot.key);
                 continue;
@@ -201,18 +214,62 @@ impl AffinityTable {
     }
 
     pub async fn remove_key(&self, key: &AffinityKey) {
-        self.bindings.lock().await.remove(key);
+        self.bindings.shard_for_key(key).lock().await.remove(key);
     }
 
     pub async fn active_len(&self) -> usize {
-        let mut bindings = self.bindings.lock().await;
-        prune_affinity(&mut bindings, Instant::now());
-        bindings.len()
+        let now = Instant::now();
+        let mut len = 0;
+        for shard in &self.bindings.shards {
+            let mut bindings = shard.lock().await;
+            prune_affinity(&mut bindings, now);
+            len += bindings.len();
+        }
+        len
     }
 
     #[cfg(test)]
     async fn len(&self) -> usize {
         self.active_len().await
+    }
+}
+
+#[derive(Debug)]
+struct ShardedAffinityBindings {
+    shards: Vec<Mutex<HashMap<AffinityKey, AffinityBinding>>>,
+}
+
+impl ShardedAffinityBindings {
+    fn new(shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        Self {
+            shards: (0..shard_count)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard_for_key(&self, key: &AffinityKey) -> &Mutex<HashMap<AffinityKey, AffinityBinding>> {
+        &self.shards[self.shard_index(key)]
+    }
+
+    fn shard_index(&self, key: &AffinityKey) -> usize {
+        affinity_shard_index(key) % self.shards.len()
+    }
+
+    fn empty_shards(&self) -> Vec<HashMap<AffinityKey, AffinityBinding>> {
+        (0..self.shards.len()).map(|_| HashMap::new()).collect()
+    }
+
+    async fn replace_all(&self, sharded_bindings: Vec<HashMap<AffinityKey, AffinityBinding>>) {
+        debug_assert_eq!(self.shards.len(), sharded_bindings.len());
+        let mut guards = Vec::with_capacity(self.shards.len());
+        for shard in &self.shards {
+            guards.push(shard.lock().await);
+        }
+        for (guard, bindings) in guards.iter_mut().zip(sharded_bindings) {
+            **guard = bindings;
+        }
     }
 }
 
@@ -288,6 +345,12 @@ fn call_id_key(message: &SipMessage) -> Result<AffinityKey> {
 
 fn prune_affinity(bindings: &mut HashMap<AffinityKey, AffinityBinding>, now: Instant) {
     bindings.retain(|_, binding| binding.expires_at > now);
+}
+
+fn affinity_shard_index(key: &AffinityKey) -> usize {
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as usize
 }
 
 fn now_epoch_ms() -> u128 {
