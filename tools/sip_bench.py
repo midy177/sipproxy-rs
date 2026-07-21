@@ -16,6 +16,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 
@@ -103,6 +104,20 @@ def build_request(scenario: str, index: int, domain: str, from_user: str, to_use
     ).encode()
 
 
+def payload_metadata(args: argparse.Namespace) -> dict[str, object]:
+    payload = {
+        "command": args.command,
+        "target": args.target,
+        "requests": args.requests,
+        "concurrency": args.concurrency,
+    }
+    if hasattr(args, "scenario"):
+        payload["scenario"] = args.scenario
+    if hasattr(args, "payload"):
+        payload["payload"] = args.payload
+    return payload
+
+
 def run_udp_bench(args: argparse.Namespace) -> int:
     target = parse_addr(args.target)
     jobs: queue.Queue[int] = queue.Queue()
@@ -161,8 +176,65 @@ def run_udp_bench(args: argparse.Namespace) -> int:
         elapsed_s=elapsed_s,
         latencies_ms=latencies,
     )
-    print_report(result, args.json)
+    print_report(result, args.json, args.output, payload_metadata(args))
     return 0 if result.error == 0 and result.timeout == 0 else 1
+
+
+def build_fire_packet(args: argparse.Namespace, index: int) -> bytes:
+    if args.payload == "invalid":
+        return b"OPTIONS"
+    if args.payload == "dtls":
+        return bytes.fromhex("16fefd000000000000000000000d010000010000000000000001fefd")
+    return build_request(args.payload, index, args.domain, args.from_user, args.to_user)
+
+
+def run_udp_fire(args: argparse.Namespace) -> int:
+    target = parse_addr(args.target)
+    jobs: queue.Queue[int] = queue.Queue()
+    for index in range(args.requests):
+        jobs.put(index)
+
+    lock = threading.Lock()
+    counts = {"ok": 0, "error": 0}
+    started = time.perf_counter()
+
+    def worker() -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        while True:
+            try:
+                index = jobs.get_nowait()
+            except queue.Empty:
+                break
+
+            packet = build_fire_packet(args, index)
+            try:
+                sock.sendto(packet, target)
+                with lock:
+                    counts["ok"] += 1
+            except OSError:
+                with lock:
+                    counts["error"] += 1
+            finally:
+                jobs.task_done()
+        sock.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(args.concurrency)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    elapsed_s = time.perf_counter() - started
+    result = BenchResult(
+        sent=args.requests,
+        ok=counts["ok"],
+        timeout=0,
+        error=counts["error"],
+        elapsed_s=elapsed_s,
+        latencies_ms=[],
+    )
+    print_report(result, args.json, args.output, payload_metadata(args))
+    return 0 if result.error == 0 else 1
 
 
 def percentile(values: list[float], pct: float) -> float | None:
@@ -173,9 +245,10 @@ def percentile(values: list[float], pct: float) -> float | None:
     return ordered[index]
 
 
-def print_report(result: BenchResult, as_json: bool) -> None:
+def result_payload(result: BenchResult, metadata: dict[str, object]) -> dict[str, object]:
     rps = result.ok / result.elapsed_s if result.elapsed_s > 0 else 0
-    payload = {
+    return {
+        "metadata": metadata,
         "sent": result.sent,
         "ok": result.ok,
         "timeout": result.timeout,
@@ -199,6 +272,20 @@ def print_report(result: BenchResult, as_json: bool) -> None:
             "max": round(max(result.latencies_ms), 3) if result.latencies_ms else None,
         },
     }
+
+
+def print_report(
+    result: BenchResult,
+    as_json: bool,
+    output: str | None,
+    metadata: dict[str, object],
+) -> None:
+    payload = result_payload(result, metadata)
+
+    if output:
+        path = Path(output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     if as_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
@@ -273,7 +360,28 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--from-user", default="100")
     bench.add_argument("--to-user", default="200")
     bench.add_argument("--json", action="store_true")
+    bench.add_argument("--output", help="write JSON report to this path")
     bench.set_defaults(func=run_udp_bench)
+
+    fire = subcommands.add_parser(
+        "udp-fire",
+        help="send UDP packets without waiting for responses",
+    )
+    fire.add_argument("--target", default="127.0.0.1:5060", help="proxy target host:port")
+    fire.add_argument(
+        "--payload",
+        choices=("invalid", "dtls", "options", "register", "invite"),
+        default="invalid",
+        help="packet payload to send",
+    )
+    fire.add_argument("--requests", type=int, default=10000)
+    fire.add_argument("--concurrency", type=int, default=64)
+    fire.add_argument("--domain", default="example.com")
+    fire.add_argument("--from-user", default="100")
+    fire.add_argument("--to-user", default="200")
+    fire.add_argument("--json", action="store_true")
+    fire.add_argument("--output", help="write JSON report to this path")
+    fire.set_defaults(func=run_udp_fire)
 
     upstream = subcommands.add_parser("mock-upstream", help="run mock UDP SIP upstream")
     upstream.add_argument("--bind", default="127.0.0.1:5080")

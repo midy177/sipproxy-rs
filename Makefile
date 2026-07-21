@@ -9,6 +9,11 @@ ZIG_TARGET_ARM64 ?= aarch64-unknown-linux-musl
 DOCKER_PLATFORM ?= linux/amd64
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 DIST_DIR ?= dist
+BENCH_TARGET ?= 127.0.0.1:5060
+BENCH_UPSTREAM ?= 127.0.0.1:5080
+BENCH_REQUESTS ?= 10000
+BENCH_CONCURRENCY ?= 64
+BENCH_OUT ?= target/bench
 
 .PHONY: build
 build:
@@ -94,3 +99,43 @@ docker-shell:
 		--name $(CONTAINER_NAME)-shell \
 		-v $(PWD)/$(CONFIG):/etc/sigproxy/config.toml:ro \
 		$(IMAGE)
+
+.PHONY: bench-options
+bench-options:
+	python3 tools/sip_bench.py udp \
+		--scenario options \
+		--target $(BENCH_TARGET) \
+		--requests $(BENCH_REQUESTS) \
+		--concurrency $(BENCH_CONCURRENCY) \
+		--output $(BENCH_OUT)/options.json
+
+.PHONY: bench-register
+bench-register:
+	python3 tools/sip_bench.py udp \
+		--scenario register \
+		--target $(BENCH_TARGET) \
+		--requests $(BENCH_REQUESTS) \
+		--concurrency $(BENCH_CONCURRENCY) \
+		--output $(BENCH_OUT)/register.json
+
+.PHONY: bench-invite
+bench-invite:
+	python3 tools/sip_bench.py udp \
+		--scenario invite \
+		--target $(BENCH_TARGET) \
+		--requests $(BENCH_REQUESTS) \
+		--concurrency $(BENCH_CONCURRENCY) \
+		--output $(BENCH_OUT)/invite.json
+
+.PHONY: bench-drop
+bench-drop:
+	python3 tools/sip_bench.py udp-fire \
+		--payload invalid \
+		--target $(BENCH_TARGET) \
+		--requests $(BENCH_REQUESTS) \
+		--concurrency $(BENCH_CONCURRENCY) \
+		--output $(BENCH_OUT)/drop-invalid.json
+
+.PHONY: bench-mock-upstream
+bench-mock-upstream:
+	python3 tools/sip_bench.py mock-upstream --bind $(BENCH_UPSTREAM)
