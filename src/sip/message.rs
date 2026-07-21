@@ -7,6 +7,7 @@ use rsipstack::sip::{
     headers::{CallId, UserAgent},
     param::{Branch, Tag},
     typed::{CSeq, Contact as TypedContact, From as FromHeader, RecordRoute, To as ToHeader, Via},
+    uri::{Host, Received},
 };
 use std::net::{IpAddr, SocketAddr};
 
@@ -237,14 +238,19 @@ impl SipMessage {
         };
 
         let (top, rest) = split_first_header_value(&value).context("failed to split top Via")?;
-        let rewritten = rewrite_via_received_rport(top.trim(), peer);
-        let value = match rest {
+        let top = top.trim();
+        let rewritten = rewrite_via_received_rport_typed(top, peer)
+            .unwrap_or_else(|| rewrite_via_received_rport(top, peer));
+        match rest {
             Some(rest) if !rest.trim().is_empty() => {
-                format!("{rewritten}, {}", rest.trim())
+                self.inner.headers_mut().0[index] =
+                    Header::Other("Via".to_string(), format!("{rewritten}, {}", rest.trim()));
             }
-            _ => rewritten,
-        };
-        self.inner.headers_mut().0[index] = Header::Other("Via".to_string(), value);
+            _ => {
+                self.inner.headers_mut().0[index] =
+                    Header::Via(rsipstack::sip::headers::untyped::Via::new(rewritten));
+            }
+        }
         Ok(())
     }
 
@@ -492,6 +498,18 @@ fn rewrite_via_received_rport(value: &str, peer: SocketAddr) -> String {
         rendered.push_str(&peer_ip);
     }
     rendered
+}
+
+fn rewrite_via_received_rport_typed(value: &str, peer: SocketAddr) -> Option<String> {
+    let mut via = Via::parse(value).ok()?.with_rport(Some(peer.port()));
+    let should_add_received = match &via.sent_by().host {
+        Host::IpAddr(ip) => *ip != peer.ip(),
+        Host::Domain(_) => true,
+    };
+    if should_add_received {
+        via = via.with_received(Received::new(peer.ip().to_string()));
+    }
+    Some(via.to_string())
 }
 
 fn via_sent_by_ip(sent_protocol: &str) -> Option<IpAddr> {

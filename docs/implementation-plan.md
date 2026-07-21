@@ -606,6 +606,7 @@ Active-standby 生产启用前必修：
 - `Max-Forwards` 写入已使用 `rsipstack::sip::MaxForwards` typed header。
 - INVITE lightweight transaction key 已改用 `rsipstack` typed `Call-ID` / `CSeq` API。
 - proxy Via 与 Record-Route 插入已改用 `rsipstack` typed `Via` / `RecordRoute` API；Path 因当前库仅提供 untyped header，仍保留薄封装写入。
+- response 顶层 Via 的 `received`/`rport` NAT 回填已优先使用 `rsipstack` typed `Via` API；仅在异常不可解析 Via 上保留原字符串 fallback。
 - registered Contact 目标解析已改用 `rsipstack` typed `Contact` / `Uri` / `Transport` API，支持完整 Contact header value 和 SIP 默认端口。
 - Route set 目标判断已改用 `rsipstack` typed `Route` / `Uri` / `Transport` API，避免把 Route 当 Contact 兼容解析。
 - INVITE lightweight transaction route 已支持 CANCEL/ACK 命中原 INVITE upstream。
