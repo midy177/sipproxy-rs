@@ -267,54 +267,42 @@ impl Config {
                 );
             }
         }
-        if self.ha.active_standby.enabled {
-            self.ha
-                .active_standby
+        let active_standby = self.ha.active_standby_config();
+        if active_standby.enabled {
+            active_standby
                 .heartbeat_bind
                 .parse::<SocketAddr>()
-                .context("ha.active_standby.heartbeat_bind must be a SocketAddr when enabled")?;
-            self.ha
-                .active_standby
+                .context("ha.heartbeat_bind must be a SocketAddr when HA is enabled")?;
+            active_standby
                 .peer_heartbeat_addr
                 .as_ref()
-                .context("ha.active_standby.peer_heartbeat_addr must be set when enabled")?
+                .context("ha.peer_heartbeat_addr must be set when HA is enabled")?
                 .parse::<SocketAddr>()
-                .context(
-                    "ha.active_standby.peer_heartbeat_addr must be a SocketAddr when enabled",
-                )?;
-            if self.ha.active_standby.heartbeat_interval_ms == 0 {
-                bail!("ha.active_standby.heartbeat_interval_ms must be greater than 0");
+                .context("ha.peer_heartbeat_addr must be a SocketAddr when HA is enabled")?;
+            if active_standby.heartbeat_interval_ms == 0 {
+                bail!("ha.heartbeat_interval_ms must be greater than 0");
             }
-            if self.ha.active_standby.failover_timeout_ms
-                <= self.ha.active_standby.heartbeat_interval_ms
-            {
-                bail!(
-                    "ha.active_standby.failover_timeout_ms must be greater than heartbeat_interval_ms"
-                );
+            if active_standby.failover_timeout_ms <= active_standby.heartbeat_interval_ms {
+                bail!("ha.failover_timeout_ms must be greater than heartbeat_interval_ms");
             }
         }
-        if self.ha.replication.enabled {
-            self.ha
-                .replication
+        let replication = self.ha.replication_config();
+        if replication.enabled {
+            replication
                 .bind_addr
                 .parse::<SocketAddr>()
-                .context(
-                    "ha.replication.bind_addr must be a SocketAddr when replication is enabled",
-                )?;
-            self.ha
-                .replication
+                .context("ha.replication_bind_addr must be a SocketAddr when HA is enabled")?;
+            replication
                 .peer_addr
                 .as_ref()
-                .context("ha.replication.peer_addr must be set when replication is enabled")?
+                .context("ha.peer_replication_addr must be set when HA is enabled")?
                 .parse::<SocketAddr>()
-                .context(
-                    "ha.replication.peer_addr must be a SocketAddr when replication is enabled",
-                )?;
-            if self.ha.replication.pull_interval_ms == 0 {
-                bail!("ha.replication.pull_interval_ms must be greater than 0");
+                .context("ha.peer_replication_addr must be a SocketAddr when HA is enabled")?;
+            if replication.pull_interval_ms == 0 {
+                bail!("ha.replication_pull_interval_ms must be greater than 0");
             }
-            if self.ha.replication.request_timeout_ms == 0 {
-                bail!("ha.replication.request_timeout_ms must be greater than 0");
+            if replication.request_timeout_ms == 0 {
+                bail!("ha.replication_request_timeout_ms must be greater than 0");
             }
         }
         Ok(())
@@ -2143,13 +2131,30 @@ pub struct RouteConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HaConfig {
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default = "default_ha_leader_check_interval_ms")]
     pub leader_check_interval_ms: u64,
     #[serde(default)]
-    pub active_standby: HaActiveStandbyConfig,
+    pub initial_role: HaInitialRole,
+    #[serde(default = "default_ha_heartbeat_bind")]
+    pub heartbeat_bind: String,
     #[serde(default)]
-    pub replication: HaReplicationConfig,
+    pub peer_heartbeat_addr: Option<String>,
+    #[serde(default = "default_ha_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    #[serde(default = "default_ha_failover_timeout_ms")]
+    pub failover_timeout_ms: u64,
+    #[serde(default = "default_ha_replication_bind")]
+    pub replication_bind_addr: String,
+    #[serde(default)]
+    pub peer_replication_addr: Option<String>,
+    #[serde(default = "default_ha_replication_pull_interval_ms")]
+    pub replication_pull_interval_ms: u64,
+    #[serde(default = "default_ha_replication_request_timeout_ms")]
+    pub replication_request_timeout_ms: u64,
     #[serde(default)]
     pub addon: HaAddonConfig,
 }
@@ -2157,10 +2162,41 @@ pub struct HaConfig {
 impl Default for HaConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             leader_check_interval_ms: default_ha_leader_check_interval_ms(),
-            active_standby: HaActiveStandbyConfig::default(),
-            replication: HaReplicationConfig::default(),
+            initial_role: HaInitialRole::default(),
+            heartbeat_bind: default_ha_heartbeat_bind(),
+            peer_heartbeat_addr: None,
+            heartbeat_interval_ms: default_ha_heartbeat_interval_ms(),
+            failover_timeout_ms: default_ha_failover_timeout_ms(),
+            replication_bind_addr: default_ha_replication_bind(),
+            peer_replication_addr: None,
+            replication_pull_interval_ms: default_ha_replication_pull_interval_ms(),
+            replication_request_timeout_ms: default_ha_replication_request_timeout_ms(),
             addon: HaAddonConfig::Noop,
+        }
+    }
+}
+
+impl HaConfig {
+    pub fn active_standby_config(&self) -> HaActiveStandbyConfig {
+        HaActiveStandbyConfig {
+            enabled: self.enabled,
+            initial_role: self.initial_role,
+            heartbeat_bind: self.heartbeat_bind.clone(),
+            peer_heartbeat_addr: self.peer_heartbeat_addr.clone(),
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
+            failover_timeout_ms: self.failover_timeout_ms,
+        }
+    }
+
+    pub fn replication_config(&self) -> HaReplicationConfig {
+        HaReplicationConfig {
+            enabled: self.enabled,
+            bind_addr: self.replication_bind_addr.clone(),
+            peer_addr: self.peer_replication_addr.clone(),
+            pull_interval_ms: self.replication_pull_interval_ms,
+            request_timeout_ms: self.replication_request_timeout_ms,
         }
     }
 }
@@ -2393,27 +2429,6 @@ bind = "127.0.0.1:5060"
 transport = "tcp"
 upstream_group = "default"
 
-[ha]
-leader_check_interval_ms = 1000
-
-[ha.active_standby]
-enabled = false
-initial_role = "standby"
-heartbeat_bind = "127.0.0.1:7900"
-peer_heartbeat_addr = "127.0.0.1:7900"
-heartbeat_interval_ms = 1000
-failover_timeout_ms = 5000
-
-[ha.replication]
-enabled = false
-bind_addr = "127.0.0.1:7901"
-peer_addr = "127.0.0.1:7902"
-pull_interval_ms = 10000
-request_timeout_ms = 2000
-
-[ha.addon]
-type = "noop"
-
 # Command addon example for later EIP binding integration:
 # [ha.addon]
 # type = "command"
@@ -2467,8 +2482,8 @@ servers = ["127.0.0.1:5080"]
     }
 
     #[test]
-    fn legacy_ha_persistence_config_is_ignored() {
-        let config: Config = toml::from_str(
+    fn rejects_legacy_ha_persistence_config() {
+        let err = toml::from_str::<Config>(
             r#"
 [ha.persistence]
 enabled = true
@@ -2487,11 +2502,9 @@ name = "default"
 servers = ["127.0.0.1:5080"]
 "#,
         )
-        .unwrap();
+        .unwrap_err();
 
-        config.validate().unwrap();
-        assert_eq!(config.persistence_config_path(), "persistence");
-        assert!(!config.persistence_config().enabled);
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -2975,11 +2988,9 @@ literal = "$-not-a-placeholder"
     fn rejects_active_standby_without_peer_heartbeat() {
         let config = Config {
             ha: HaConfig {
-                active_standby: HaActiveStandbyConfig {
-                    enabled: true,
-                    peer_heartbeat_addr: None,
-                    ..HaActiveStandbyConfig::default()
-                },
+                enabled: true,
+                peer_heartbeat_addr: None,
+                peer_replication_addr: Some("127.0.0.1:7901".to_string()),
                 ..HaConfig::default()
             },
             ..Config::default()
@@ -2992,16 +3003,56 @@ literal = "$-not-a-placeholder"
     fn rejects_ha_replication_without_peer_addr() {
         let config = Config {
             ha: HaConfig {
-                replication: HaReplicationConfig {
-                    enabled: true,
-                    peer_addr: None,
-                    ..HaReplicationConfig::default()
-                },
+                enabled: true,
+                peer_heartbeat_addr: Some("127.0.0.1:7900".to_string()),
+                peer_replication_addr: None,
                 ..HaConfig::default()
             },
             ..Config::default()
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn flattened_ha_enabled_enables_role_and_replication() {
+        let ha: HaConfig = toml::from_str(
+            r#"
+enabled = true
+initial_role = "active"
+heartbeat_bind = "127.0.0.1:7900"
+peer_heartbeat_addr = "127.0.0.2:7900"
+replication_bind_addr = "127.0.0.1:7901"
+peer_replication_addr = "127.0.0.2:7901"
+replication_pull_interval_ms = 1000
+"#,
+        )
+        .unwrap();
+
+        let active_standby = ha.active_standby_config();
+        let replication = ha.replication_config();
+        assert!(active_standby.enabled);
+        assert_eq!(active_standby.initial_role, HaInitialRole::Active);
+        assert_eq!(
+            active_standby.peer_heartbeat_addr.as_deref(),
+            Some("127.0.0.2:7900")
+        );
+        assert!(replication.enabled);
+        assert_eq!(replication.bind_addr, "127.0.0.1:7901");
+        assert_eq!(replication.peer_addr.as_deref(), Some("127.0.0.2:7901"));
+        assert_eq!(replication.pull_interval_ms, 1000);
+    }
+
+    #[test]
+    fn rejects_legacy_ha_active_standby_subtable() {
+        let err = toml::from_str::<Config>(
+            r#"
+[ha.active_standby]
+enabled = true
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown field"));
     }
 }

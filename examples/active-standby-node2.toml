@@ -57,6 +57,16 @@ transport = "tcp"
 upstream_group = "pbx-a"
 
 [ha]
+enabled = true
+initial_role = "standby"
+heartbeat_bind = "10.0.0.12:7900"
+peer_heartbeat_addr = "10.0.0.11:7900"
+heartbeat_interval_ms = 1000
+failover_timeout_ms = 5000
+replication_bind_addr = "10.0.0.12:7901"
+peer_replication_addr = "10.0.0.11:7901"
+replication_pull_interval_ms = 1000
+replication_request_timeout_ms = 2000
 leader_check_interval_ms = 1000
 
 [persistence]
@@ -65,21 +75,6 @@ path = "/var/lib/sigproxy-rs/ha/state-node2.db"
 required = false
 event_retention_seconds = 3600
 cleanup_interval_ms = 60000
-
-[ha.active_standby]
-enabled = true
-initial_role = "standby"
-heartbeat_bind = "10.0.0.12:7900"
-peer_heartbeat_addr = "10.0.0.11:7900"
-heartbeat_interval_ms = 1000
-failover_timeout_ms = 5000
-
-[ha.replication]
-enabled = true
-bind_addr = "10.0.0.12:7901"
-peer_addr = "10.0.0.11:7901"
-pull_interval_ms = 1000
-request_timeout_ms = 2000
 
 [ha.addon]
 type = "noop"

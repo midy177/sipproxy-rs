@@ -579,7 +579,7 @@ Active-standby 生产启用前必修：
 
 - HA command hook 用作 VIP/EIP fencing 时，promotion 不能在 hook 失败后继续宣称 active。（已实现）
 - HA hook 超时需要确保子进程被终止。（已实现）
-- 配置校验需要在 `active_standby.enabled`、`replication.enabled` 下强制校验必要 peer 字段。
+- 配置校验需要在 `ha.enabled = true` 时强制校验 heartbeat 和 replication 的 peer 字段。
 
 ## 当前执行状态
 

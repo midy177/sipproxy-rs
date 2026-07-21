@@ -19,7 +19,7 @@ pub async fn run(config: Config) -> Result<()> {
     let persistence = Persistence::open(&persistence_config)?;
     let state = Arc::new(SharedState::default());
     let base_replicator = build_replicator(state.clone(), persistence.clone()).await?;
-    let active_standby_config = config.ha.active_standby.clone();
+    let active_standby_config = config.ha.active_standby_config();
     let ha_addon = build_addon(&config.ha.addon);
     let active_standby_runtime = active_standby_config
         .enabled
@@ -31,7 +31,7 @@ pub async fn run(config: Config) -> Result<()> {
             base_replicator
         };
     let leader_monitor_enabled = !matches!(&config.ha.addon, HaAddonConfig::Noop);
-    let replication_config = config.ha.replication.clone();
+    let replication_config = config.ha.replication_config();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();

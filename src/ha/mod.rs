@@ -289,7 +289,7 @@ pub async fn run_active_standby(
     let bind_addr = config
         .heartbeat_bind
         .parse::<SocketAddr>()
-        .context("ha.active_standby.heartbeat_bind must be a SocketAddr")?;
+        .context("ha.heartbeat_bind must be a SocketAddr")?;
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind active-standby heartbeat listener {bind_addr}"))?;
@@ -476,7 +476,7 @@ pub async fn run_state_replication(
     let bind_addr = config
         .bind_addr
         .parse::<SocketAddr>()
-        .context("ha.replication.bind_addr must be a SocketAddr")?;
+        .context("ha.replication_bind_addr must be a SocketAddr")?;
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("failed to bind HA replication listener {bind_addr}"))?;

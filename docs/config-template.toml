@@ -319,67 +319,42 @@ prefix = "sip:1"
 upstream_group = "pbx-b"
 
 [ha]
-# Interval in milliseconds for observing role changes and running HA addon
-# hooks. Must be greater than 0.
-leader_check_interval_ms = 1000
-
-[persistence]
-# Persist REGISTER location, affinity state, and the HA event log to a local
-# SQLite database. This is local-node storage; do not share the same database
-# file between active and standby nodes.
-enabled = true
-path = "/var/lib/sigproxy-rs/ha/state.db"
-required = false
-event_retention_seconds = 3600
-cleanup_interval_ms = 60000
-
-[ha.active_standby]
-# Enable the simple two-node active-standby role monitor.
+# HA defaults to disabled. When enabled, sigproxy runs active-standby heartbeats
+# and standby state replication together.
 enabled = false
 
-# Initial role when active-standby is enabled. Supported: "active", "standby".
+# Initial role when HA is enabled. Supported: "active", "standby".
 initial_role = "standby"
 
-# Local heartbeat HTTP bind address for active-standby.
+# Local heartbeat HTTP bind address and peer heartbeat address.
 heartbeat_bind = "127.0.0.1:7900"
+peer_heartbeat_addr = "127.0.0.2:7900"
 
-# Optional peer heartbeat address. In a two-node pair, point this at the other
-# node's heartbeat_bind.
-peer_heartbeat_addr = "127.0.0.1:7900"
-
-# Heartbeat poll interval in milliseconds. Must be greater than 0 when enabled.
+# Heartbeat poll interval and failover timeout in milliseconds. The timeout must
+# be greater than heartbeat_interval_ms.
 heartbeat_interval_ms = 1000
-
-# Peer timeout before local promotion. Must be greater than heartbeat_interval_ms.
 failover_timeout_ms = 5000
 
-[ha.replication]
-# Enable standby state pull from the active peer. When persistence is enabled
-# on both nodes, standby pulls incremental /ha/events first and falls back to
-# /ha/snapshot when the event log has a gap or was already cleaned up.
-enabled = false
+# Local HA replication HTTP bind address and peer replication address.
+replication_bind_addr = "127.0.0.1:7901"
+peer_replication_addr = "127.0.0.2:7901"
 
-# Local HA replication HTTP bind address.
-bind_addr = "127.0.0.1:7901"
+# Event/snapshot pull interval and request timeout in milliseconds.
+replication_pull_interval_ms = 1000
+replication_request_timeout_ms = 2000
 
-# Optional peer replication address. In a two-node pair, point this at the other
-# node's ha.replication.bind_addr.
-peer_addr = "127.0.0.1:7902"
+# Interval in milliseconds for observing role changes and running HA addon hooks.
+leader_check_interval_ms = 1000
 
-# Event/snapshot pull interval in milliseconds. Must be greater than 0 when enabled.
-pull_interval_ms = 10000
-
-# Snapshot request timeout in milliseconds. Must be greater than 0 when enabled.
-request_timeout_ms = 2000
-
-[ha.addon]
 # HA addon type. Supported:
-# - "noop": do nothing, useful for normal stateless proxy deployments.
+# - "noop": do nothing, useful for lab deployments.
 # - "command": run shell commands on leader promotion / step-down.
 # In active-standby deployments, noop does not move traffic by itself. Use a
 # VIP/EIP/LB mechanism to ensure only the active node receives SIP traffic.
-type = "noop"
-
+#
+# [ha.addon]
+# type = "noop"
+#
 # Command addon variant. Uncomment this section instead of the noop section
 # above when wiring EIP/VIP/floating endpoint scripts.
 #
@@ -391,3 +366,13 @@ type = "noop"
 # Command hooks are required fencing hooks for active-standby role changes:
 # promotion is rejected when on_become_leader fails, and timed-out hooks are
 # killed before sigproxy returns an error.
+
+[persistence]
+# Persist REGISTER location, affinity state, and the HA event log to a local
+# SQLite database. This is local-node storage; do not share the same database
+# file between active and standby nodes.
+enabled = true
+path = "/var/lib/sigproxy-rs/ha/state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000

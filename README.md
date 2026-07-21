@@ -141,24 +141,12 @@ bind = "0.0.0.0:5060"
 transport = "tcp"
 upstream_group = "pbx-a"
 
-[ha]
-leader_check_interval_ms = 1000
-
 [persistence]
 enabled = true
 path = "/var/lib/sigproxy-rs/ha/state.db"
 required = false
 event_retention_seconds = 3600
 cleanup_interval_ms = 60000
-
-[ha.active_standby]
-enabled = false
-
-[ha.replication]
-enabled = false
-
-[ha.addon]
-type = "noop"
 ```
 
 Use `public_addr` for the address public SIP clients can reach, and
@@ -210,6 +198,9 @@ VIP/EIP/LB hook or equivalent traffic steering so only the active node receives
 client SIP traffic. Command hooks are treated as required fencing hooks for
 active-standby role changes: promotion succeeds only after
 `on_become_leader` succeeds, and hook timeout terminates the hook process.
+HA is configured from a single `[ha] enabled = true` block; enabling HA starts
+both the role heartbeat loop and standby state replication. Single-node
+deployments can omit `[ha]` entirely.
 
 ## Upstream Health Checks
 

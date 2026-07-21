@@ -209,7 +209,9 @@ fn parse_threat_format(value: &str) -> Result<ProxyThreatIntelFormat> {
 }
 
 fn log_startup_mode(config: &Config) {
-    let mode = if config.ha.active_standby.enabled {
+    let active_standby = config.ha.active_standby_config();
+    let replication = config.ha.replication_config();
+    let mode = if active_standby.enabled {
         "active-standby"
     } else {
         "standalone"
@@ -254,9 +256,9 @@ fn log_startup_mode(config: &Config) {
         node_id = config.node.id,
         listeners = config.proxy.listeners.len(),
         upstream_groups = config.proxy.upstream_groups.len(),
-        active_standby_enabled = config.ha.active_standby.enabled,
-        initial_role = ?config.ha.active_standby.initial_role,
-        replication_enabled = config.ha.replication.enabled,
+        active_standby_enabled = active_standby.enabled,
+        initial_role = ?active_standby.initial_role,
+        replication_enabled = replication.enabled,
         persistence_enabled = persistence.enabled,
         persistence_path = %persistence.path,
         persistence_required = persistence.required,
