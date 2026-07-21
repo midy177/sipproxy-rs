@@ -1,17 +1,26 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::Entry;
 use std::hash::{Hash, Hasher};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 const METRIC_SHARDS: usize = 64;
 
 #[derive(Debug)]
 pub struct ProxyMetrics {
-    shards: Vec<Mutex<HashMap<String, Counter>>>,
+    shards: Vec<RwLock<HashMap<String, Arc<Counter>>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Counter {
+    name: String,
+    labels: Vec<(String, String)>,
+    value: AtomicU64,
+}
+
+#[derive(Debug)]
+struct CounterSnapshot {
     name: String,
     labels: Vec<(String, String)>,
     value: u64,
@@ -21,7 +30,7 @@ impl Default for ProxyMetrics {
     fn default() -> Self {
         Self {
             shards: (0..METRIC_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
         }
     }
@@ -30,27 +39,42 @@ impl Default for ProxyMetrics {
 impl ProxyMetrics {
     pub fn incr(&self, name: &'static str, labels: &[(&'static str, &str)]) {
         let key = counter_key(name, labels);
-        let mut counters = self.shards[metric_shard_index(&key)]
-            .lock()
-            .expect("metrics mutex poisoned");
-        counters
-            .entry(key)
-            .and_modify(|counter| counter.value += 1)
-            .or_insert(Counter {
-                name: name.to_string(),
-                labels: labels
-                    .iter()
-                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                    .collect(),
-                value: 1,
-            });
+        let shard = &self.shards[metric_shard_index(&key)];
+        {
+            let counters = shard.read().expect("metrics rwlock poisoned");
+            if let Some(counter) = counters.get(&key) {
+                counter.value.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+
+        let mut counters = shard.write().expect("metrics rwlock poisoned");
+        match counters.entry(key) {
+            Entry::Occupied(entry) => {
+                entry.get().value.fetch_add(1, Ordering::Relaxed);
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::new(Counter {
+                    name: name.to_string(),
+                    labels: labels
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .collect(),
+                    value: AtomicU64::new(1),
+                }));
+            }
+        }
     }
 
     pub fn render_prometheus(&self) -> String {
         let mut values = Vec::new();
         for shard in &self.shards {
-            let counters = shard.lock().expect("metrics mutex poisoned");
-            values.extend(counters.values().cloned());
+            let counters = shard.read().expect("metrics rwlock poisoned");
+            values.extend(counters.values().map(|counter| CounterSnapshot {
+                name: counter.name.clone(),
+                labels: counter.labels.clone(),
+                value: counter.value.load(Ordering::Relaxed),
+            }));
         }
         values.sort_by(|left, right| {
             left.name
