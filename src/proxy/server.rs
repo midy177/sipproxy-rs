@@ -29,7 +29,7 @@ use rsipstack::sip::{
 };
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -340,6 +340,7 @@ impl ProxyServer {
         let affinity_bindings = self.affinity.active_len().await;
         let location_bindings = self.state.contact_count().await;
         let upstream_health = self.upstreams.health_snapshots();
+        let security_stats = self.security.stats().await;
         let xdp_stats = self.security.xdp_stats();
         let persistence_stats = match &self.persistence {
             Some(persistence) => match persistence.stats().await {
@@ -385,6 +386,38 @@ impl ProxyServer {
             "proxy_location_bindings",
             location_bindings as u64,
         );
+        append_gauge(
+            &mut output,
+            "proxy_security_active_blocks",
+            security_stats.active_blocks_total,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_security_token_buckets",
+            security_stats.token_buckets_total,
+        );
+        for count in &security_stats.active_blocks {
+            append_labeled_gauge(
+                &mut output,
+                "proxy_security_active_blocks_by_listener",
+                &[
+                    ("listener", count.listener.as_str()),
+                    ("kind", count.kind.as_str()),
+                ],
+                count.count,
+            );
+        }
+        for count in &security_stats.token_buckets {
+            append_labeled_gauge(
+                &mut output,
+                "proxy_security_token_buckets_by_listener",
+                &[
+                    ("listener", count.listener.as_str()),
+                    ("kind", count.kind.as_str()),
+                ],
+                count.count,
+            );
+        }
         if let Some(stats) = persistence_stats {
             let role = format!("{:?}", self.replicator.role().await).to_ascii_lowercase();
             let event_lag = stats
@@ -2273,6 +2306,21 @@ struct SecurityRuntime {
     blocks: ShardedSecurityMap<Instant>,
 }
 
+#[derive(Debug, Default)]
+struct SecurityRuntimeStats {
+    active_blocks_total: u64,
+    token_buckets_total: u64,
+    active_blocks: Vec<SecurityRuntimeCount>,
+    token_buckets: Vec<SecurityRuntimeCount>,
+}
+
+#[derive(Debug)]
+struct SecurityRuntimeCount {
+    listener: String,
+    kind: String,
+    count: u64,
+}
+
 impl SecurityRuntime {
     fn new(config: &ProxyConfig) -> Result<Self> {
         let mut listeners = HashMap::new();
@@ -2314,6 +2362,24 @@ impl SecurityRuntime {
 
     fn xdp_stats(&self) -> Vec<(&'static str, u64)> {
         self.xdp.stats()
+    }
+
+    async fn stats(&self) -> SecurityRuntimeStats {
+        let now = Instant::now();
+        let block_counts = self
+            .blocks
+            .counts_by(|key, until| (*until > now).then(|| security_metric_key(key)))
+            .await;
+        let bucket_counts = self
+            .buckets
+            .counts_by(|key, _| Some(security_metric_key(key)))
+            .await;
+        SecurityRuntimeStats {
+            active_blocks_total: block_counts.values().copied().sum(),
+            token_buckets_total: bucket_counts.values().copied().sum(),
+            active_blocks: security_metric_counts(block_counts),
+            token_buckets: security_metric_counts(bucket_counts),
+        }
     }
 
     async fn run_prune_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -2789,6 +2855,22 @@ impl<V> ShardedStringMap<V> {
         len
     }
 
+    async fn counts_by<F>(&self, mut f: F) -> BTreeMap<(String, String), u64>
+    where
+        F: FnMut(&String, &V) -> Option<(String, String)>,
+    {
+        let mut counts = BTreeMap::new();
+        for shard in &self.shards {
+            let entries = shard.lock().await;
+            for (key, value) in entries.iter() {
+                if let Some(metric_key) = f(key, value) {
+                    *counts.entry(metric_key).or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
     #[cfg(test)]
     async fn is_empty(&self) -> bool {
         for shard in &self.shards {
@@ -2804,6 +2886,39 @@ fn string_shard_index(key: &str, shards: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % shards
+}
+
+fn security_metric_key(key: &str) -> (String, String) {
+    let mut parts = key.split('|');
+    match parts.next().unwrap_or("unknown") {
+        "dynamic-ban" => {
+            let _offense = parts.next();
+            (
+                parts.next().unwrap_or("unknown").to_string(),
+                "dynamic-ban".to_string(),
+            )
+        }
+        "sip-block" | "sip-rate" => {
+            let kind = key.split('|').next().unwrap_or("unknown").to_string();
+            let listener = key.split('|').nth(1).unwrap_or("unknown").to_string();
+            (listener, kind)
+        }
+        kind => {
+            let listener = parts.next().unwrap_or("unknown").to_string();
+            (listener, kind.to_string())
+        }
+    }
+}
+
+fn security_metric_counts(counts: BTreeMap<(String, String), u64>) -> Vec<SecurityRuntimeCount> {
+    counts
+        .into_iter()
+        .map(|((listener, kind), count)| SecurityRuntimeCount {
+            listener,
+            kind,
+            count,
+        })
+        .collect()
 }
 
 struct ListenerSecurityRuntime {
@@ -6756,6 +6871,87 @@ Content-Length: 0\r\n\r\n",
         assert!(
             metrics.contains("proxy_ha_snapshot_fallbacks_total{reason=\"event-pull-error\"} 1")
         );
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_security_runtime_gauges() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig::default(),
+        );
+        let listener_key = test_listener().key();
+        let now = Instant::now();
+        let ip_block_key = "block|udp/127.0.0.1:5060|203.0.113.10";
+        let sip_block_key = "sip-block|udp/127.0.0.1:5060|INVITE|sip:100@example.com";
+        let expired_block_key = "block|udp/127.0.0.1:5060|198.51.100.10";
+        let packet_bucket_key = "packets|udp/127.0.0.1:5060|203.0.113.10";
+        let dynamic_bucket_key = "dynamic-ban|parse-error|udp/127.0.0.1:5060|203.0.113.10";
+
+        server
+            .security
+            .blocks
+            .shard_for_key(ip_block_key)
+            .lock()
+            .await
+            .insert(ip_block_key.to_string(), now + Duration::from_secs(60));
+        server
+            .security
+            .blocks
+            .shard_for_key(sip_block_key)
+            .lock()
+            .await
+            .insert(sip_block_key.to_string(), now + Duration::from_secs(60));
+        server
+            .security
+            .blocks
+            .shard_for_key(expired_block_key)
+            .lock()
+            .await
+            .insert(expired_block_key.to_string(), now - Duration::from_secs(1));
+        server
+            .security
+            .buckets
+            .shard_for_key(packet_bucket_key)
+            .lock()
+            .await
+            .insert(
+                packet_bucket_key.to_string(),
+                TokenBucket {
+                    tokens: 1.0,
+                    updated_at: now,
+                },
+            );
+        server
+            .security
+            .buckets
+            .shard_for_key(dynamic_bucket_key)
+            .lock()
+            .await
+            .insert(
+                dynamic_bucket_key.to_string(),
+                TokenBucket {
+                    tokens: 1.0,
+                    updated_at: now,
+                },
+            );
+
+        let metrics = server.render_metrics().await;
+        assert!(metrics.contains("proxy_security_active_blocks 2"));
+        assert!(metrics.contains("proxy_security_token_buckets 2"));
+        assert!(metrics.contains(&format!(
+            "proxy_security_active_blocks_by_listener{{listener=\"{listener_key}\",kind=\"block\"}} 1"
+        )));
+        assert!(metrics.contains(&format!(
+            "proxy_security_active_blocks_by_listener{{listener=\"{listener_key}\",kind=\"sip-block\"}} 1"
+        )));
+        assert!(metrics.contains(&format!(
+            "proxy_security_token_buckets_by_listener{{listener=\"{listener_key}\",kind=\"dynamic-ban\"}} 1"
+        )));
+        assert!(metrics.contains(&format!(
+            "proxy_security_token_buckets_by_listener{{listener=\"{listener_key}\",kind=\"packets\"}} 1"
+        )));
+        assert!(!metrics.contains("203.0.113.10"));
     }
 
     #[tokio::test]

@@ -220,5 +220,3 @@ limits continue through the current RFC-compatible user-space path.
 - Add authentication-failure counters once proxy-visible auth failures are
   classified from upstream responses.
 - Add optional metrics for active blocks and token bucket drops per listener.
-- Implement optional XDP offload for CIDR, geo, IP packet rate, and dynamic IP
-  blocklist enforcement.

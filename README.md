@@ -512,10 +512,11 @@ curl http://127.0.0.1:9100/metrics
 ```
 
 Current counters cover SIP requests, local responses, upstream responses,
-forwarded requests, forwarding errors, and affinity lookups. Runtime gauges
-cover UDP branch routes, TCP upstream connections, TCP branch routes, INVITE
-transaction routes, affinity bindings, location bindings, and per-upstream
-health state with consecutive success/failure counters.
+forwarded requests, forwarding errors, affinity lookups, and security drops.
+Runtime gauges cover UDP branch routes, TCP upstream connections, TCP branch
+routes, INVITE transaction routes, affinity bindings, location bindings, active
+security blocks, token bucket entries, and per-upstream health state with
+consecutive success/failure counters.
 
 When `[persistence]` is enabled, metrics also expose
 `proxy_persistence_latest_event_seq`, `proxy_persistence_last_applied_seq`,
