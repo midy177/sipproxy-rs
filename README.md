@@ -144,7 +144,7 @@ upstream_group = "pbx-a"
 [ha]
 leader_check_interval_ms = 1000
 
-[ha.persistence]
+[persistence]
 enabled = true
 path = "/var/lib/sigproxy-rs/ha/state.db"
 required = false
@@ -170,7 +170,7 @@ keeps a reachable route.
 `public_addr` and `internal_addr` may be just a host/IP; when the port is
 omitted, sigproxy uses the port from the matching SIP listener.
 
-When `[ha.persistence]` is enabled, sigproxy stores REGISTER location,
+When `[persistence]` is enabled, sigproxy stores REGISTER location,
 affinity bindings, and the HA event log in local SQLite WAL mode. In a
 two-node active/standby pair, standby pulls `/ha/events` incrementally and
 falls back to `/ha/snapshot` when its checkpoint is behind the retained event

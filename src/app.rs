@@ -15,7 +15,8 @@ use tokio::task::JoinSet;
 use tracing::info;
 
 pub async fn run(config: Config) -> Result<()> {
-    let persistence = HaPersistence::open(&config.ha.persistence)?;
+    let persistence_config = config.persistence_config().clone();
+    let persistence = HaPersistence::open(&persistence_config)?;
     let state = Arc::new(SharedState::default());
     let base_replicator = build_replicator(state.clone(), persistence.clone()).await?;
     let active_standby_config = config.ha.active_standby.clone();
@@ -66,7 +67,8 @@ pub async fn run(config: Config) -> Result<()> {
         ));
     }
     if let Some(persistence) = persistence {
-        let interval = Duration::from_millis(server.config().ha.persistence.cleanup_interval_ms);
+        let interval =
+            Duration::from_millis(server.config().persistence_config().cleanup_interval_ms);
         tasks.spawn(persistence.cleanup_loop(interval, shutdown_rx.clone()));
     }
     tasks.spawn(async move { server.run(shutdown_rx).await });

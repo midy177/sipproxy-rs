@@ -98,7 +98,7 @@ data:
     [ha]
     leader_check_interval_ms = 1000
 
-    [ha.persistence]
+    [persistence]
     enabled = true
     path = "/var/lib/sigproxy-rs/ha/state.db"
     required = false

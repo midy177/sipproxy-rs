@@ -1281,19 +1281,25 @@ impl ProxyServer {
             None
         };
         let from_upstream = self.upstreams.contains(_peer);
+        let from_trusted_peer = self.security.is_trusted_peer(listener, _peer.ip());
+        let route_set_targets_this_proxy = self
+            .top_route_targets_this_proxy(&message, listener, _peer)
+            .await?;
         let request_uri_targets_this_proxy =
             self.request_uri_targets_this_proxy(&request_uri, listener);
         let target = if let Some(route) = transaction_route.as_ref() {
             self.record_affinity_lookup("transaction-hit");
             route.target
-        } else if from_upstream || request_uri_targets_this_proxy {
+        } else if from_upstream
+            || request_uri_targets_this_proxy
+            || (from_trusted_peer && route_set_targets_this_proxy)
+        {
             if let Some(binding) = self.lookup_registration_binding(&request_uri).await {
                 self.record_affinity_lookup("location-hit");
                 target_for_registration_binding(&binding, listener.transport)
                     .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
-            } else if from_upstream
-                && let Some(target) =
-                    self.request_uri_target_from_upstream(_peer, &request_uri, listener)
+            } else if (from_upstream || (from_trusted_peer && route_set_targets_this_proxy))
+                && let Some(target) = self.direct_request_uri_target(&request_uri, listener)
             {
                 self.record_affinity_lookup("request-uri-target");
                 target
@@ -1381,16 +1387,24 @@ impl ProxyServer {
         Ok((message, target, branch, invite_transaction_key))
     }
 
-    fn request_uri_target_from_upstream(
+    async fn top_route_targets_this_proxy(
         &self,
+        message: &SipMessage,
+        listener: &ProxyListenerConfig,
         peer: SocketAddr,
+    ) -> Result<bool> {
+        let Some(route) = message.top_header_value("Route")? else {
+            return Ok(false);
+        };
+        Ok(self.route_targets_this_proxy(&route, listener, peer).await)
+    }
+
+    fn direct_request_uri_target(
+        &self,
         request_uri: &str,
         listener: &ProxyListenerConfig,
     ) -> Option<UpstreamTarget> {
-        self.upstreams
-            .contains(peer)
-            .then(|| parse_contact_target(request_uri, listener.transport))
-            .flatten()
+        parse_contact_target(request_uri, listener.transport)
             .filter(|target| !self.upstreams.contains(target.addr))
             .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
     }
@@ -5935,6 +5949,82 @@ Content-Length: 0\r\n\r\n"
         assert!(forwarded.starts_with(&format!("INVITE sip:6805@{client_addr} SIP/2.0")));
         assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
         assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn trusted_route_set_request_uri_contact_routes_directly_to_client() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trusted_peer_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        let server = ProxyServer::new(
+            Config {
+                sip: SipConfig {
+                    external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstream_socket.local_addr().unwrap().to_string(),
+                    ..SipConfig::default()
+                },
+                proxy: ProxyConfig {
+                    record_route: true,
+                    security: ProxySecurityConfig {
+                        trusted_cidrs: Some(vec!["127.0.0.0/8".to_string()]),
+                        ..ProxySecurityConfig::default()
+                    },
+                    listeners: vec![test_listener()],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream_socket.local_addr().unwrap().to_string()],
+                    }],
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            None,
+        )
+        .unwrap();
+        let packet = format!(
+            "INVITE sip:3001@{client_addr};ob SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5088;branch=z9hG4bK-trusted-route-set\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: trusted-route-set-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3000@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                packet.as_bytes(),
+                trusted_peer_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with(&format!("INVITE sip:3001@{client_addr};ob SIP/2.0")));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

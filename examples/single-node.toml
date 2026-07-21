@@ -52,7 +52,7 @@ request_retries = 3
 allow_partial = true
 
 [proxy.security.geo.deny]
-countries = ["RU", "IR", "KP"]
+countries = []
 
 [proxy.security.dynamic_ban]
 enabled = true
@@ -103,15 +103,15 @@ upstream_group = "default"
 # transport = "tcp"
 # upstream_group = "default"
 
-[ha]
-leader_check_interval_ms = 1000
-
-[ha.persistence]
+[persistence]
 enabled = true
 path = "/var/lib/sigproxy-rs/ha/state.db"
 required = false
 event_retention_seconds = 3600
-cleanup_interval_ms = 60000
+cleanup_interval_ms = 600000
+
+[ha]
+leader_check_interval_ms = 1000
 
 [ha.active_standby]
 enabled = false

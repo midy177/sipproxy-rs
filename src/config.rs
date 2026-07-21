@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub proxy: ProxyConfig,
     #[serde(default)]
+    pub persistence: PersistenceConfig,
+    #[serde(default)]
     pub ha: HaConfig,
 }
 
@@ -25,6 +27,7 @@ impl Default for Config {
             node: NodeConfig::default(),
             sip: SipConfig::default(),
             proxy: ProxyConfig::default(),
+            persistence: PersistenceConfig::default(),
             ha: HaConfig::default(),
         }
     }
@@ -247,18 +250,20 @@ impl Config {
         if self.ha.leader_check_interval_ms == 0 {
             bail!("ha.leader_check_interval_ms must be greater than 0");
         }
-        if self.ha.persistence.enabled {
-            if self.ha.persistence.path.trim().is_empty() {
-                bail!("ha.persistence.path must not be empty when persistence is enabled");
+        let persistence = self.persistence_config();
+        let persistence_path = self.persistence_config_path();
+        if persistence.enabled {
+            if persistence.path.trim().is_empty() {
+                bail!("{persistence_path}.path must not be empty when persistence is enabled");
             }
-            if self.ha.persistence.cleanup_interval_ms == 0 {
+            if persistence.cleanup_interval_ms == 0 {
                 bail!(
-                    "ha.persistence.cleanup_interval_ms must be greater than 0 when persistence is enabled"
+                    "{persistence_path}.cleanup_interval_ms must be greater than 0 when persistence is enabled"
                 );
             }
-            if self.ha.persistence.event_retention_seconds == 0 {
+            if persistence.event_retention_seconds == 0 {
                 bail!(
-                    "ha.persistence.event_retention_seconds must be greater than 0 when persistence is enabled"
+                    "{persistence_path}.event_retention_seconds must be greater than 0 when persistence is enabled"
                 );
             }
         }
@@ -313,6 +318,14 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    pub fn persistence_config(&self) -> &PersistenceConfig {
+        &self.persistence
+    }
+
+    pub fn persistence_config_path(&self) -> &'static str {
+        "persistence"
     }
 }
 
@@ -1762,8 +1775,6 @@ pub struct HaConfig {
     #[serde(default = "default_ha_leader_check_interval_ms")]
     pub leader_check_interval_ms: u64,
     #[serde(default)]
-    pub persistence: HaPersistenceConfig,
-    #[serde(default)]
     pub active_standby: HaActiveStandbyConfig,
     #[serde(default)]
     pub replication: HaReplicationConfig,
@@ -1775,7 +1786,6 @@ impl Default for HaConfig {
     fn default() -> Self {
         Self {
             leader_check_interval_ms: default_ha_leader_check_interval_ms(),
-            persistence: HaPersistenceConfig::default(),
             active_standby: HaActiveStandbyConfig::default(),
             replication: HaReplicationConfig::default(),
             addon: HaAddonConfig::Noop,
@@ -1787,8 +1797,8 @@ fn default_ha_leader_check_interval_ms() -> u64 {
     1_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HaPersistenceConfig {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistenceConfig {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_ha_persistence_path")]
@@ -1801,7 +1811,7 @@ pub struct HaPersistenceConfig {
     pub cleanup_interval_ms: u64,
 }
 
-impl Default for HaPersistenceConfig {
+impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -1812,6 +1822,8 @@ impl Default for HaPersistenceConfig {
         }
     }
 }
+
+pub type HaPersistenceConfig = PersistenceConfig;
 
 fn default_ha_persistence_path() -> String {
     "/var/lib/sigproxy-rs/ha/state.db".to_string()
@@ -1976,6 +1988,13 @@ ttl_seconds = 3600
 # Off by default unless configured. Presets: "off", "trusted", "public", "strict".
 preset = "off"
 
+[persistence]
+enabled = false
+path = "/var/lib/sigproxy-rs/ha/state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
+
 [[proxy.upstream_groups]]
 name = "default"
 mode = "round-robin"
@@ -2042,6 +2061,67 @@ mod tests {
     fn example_config_is_valid() {
         let config: Config = toml::from_str(example_config()).unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_top_level_persistence_config() {
+        let config: Config = toml::from_str(
+            r#"
+[persistence]
+enabled = true
+path = "/tmp/sigproxy-state.db"
+required = true
+event_retention_seconds = 7200
+cleanup_interval_ms = 30000
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let persistence = config.persistence_config();
+        assert_eq!(config.persistence_config_path(), "persistence");
+        assert!(persistence.enabled);
+        assert_eq!(persistence.path, "/tmp/sigproxy-state.db");
+        assert!(persistence.required);
+        assert_eq!(persistence.event_retention_seconds, 7200);
+        assert_eq!(persistence.cleanup_interval_ms, 30000);
+    }
+
+    #[test]
+    fn legacy_ha_persistence_config_is_ignored() {
+        let config: Config = toml::from_str(
+            r#"
+[ha.persistence]
+enabled = true
+path = "/tmp/old-state.db"
+required = false
+event_retention_seconds = 3600
+cleanup_interval_ms = 60000
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        assert_eq!(config.persistence_config_path(), "persistence");
+        assert!(!config.persistence_config().enabled);
     }
 
     #[test]
