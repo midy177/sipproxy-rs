@@ -21,7 +21,9 @@ use axum::{Router, extract::State, routing::get};
 use bytes::BytesMut;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
-    Transport as RsipTransport, Uri as RsipUri, typed::Contact as RsipContact, uri::Param,
+    Transport as RsipTransport, Uri as RsipUri,
+    typed::{Contact as RsipContact, Route as RsipRoute},
+    uri::Param,
 };
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -1472,7 +1474,7 @@ impl ProxyServer {
         listener: &ProxyListenerConfig,
         target: SocketAddr,
     ) -> bool {
-        let Some(route_target) = parse_contact_target(route, listener.transport) else {
+        let Some(route_target) = parse_route_target(route, listener.transport) else {
             return false;
         };
         self.is_advertised_or_listener_addr(route_target.addr, listener)
@@ -4146,6 +4148,22 @@ fn parse_contact_target(contact: &str, default_transport: SipTransport) -> Optio
         .params
         .iter()
         .chain(contact.params.iter())
+        .find_map(|param| match param {
+            Param::Transport(transport) => sip_transport_from_rsip(*transport),
+            _ => None,
+        })
+        .unwrap_or(default_transport);
+    Some(UpstreamTarget { addr, transport })
+}
+
+fn parse_route_target(route: &str, default_transport: SipTransport) -> Option<UpstreamTarget> {
+    let route = RsipRoute::parse(route).ok()?;
+    let addr = SocketAddr::try_from(route.uri.host_with_port).ok()?;
+    let transport = route
+        .uri
+        .params
+        .iter()
+        .chain(route.params.iter())
         .find_map(|param| match param {
             Param::Transport(transport) => sip_transport_from_rsip(*transport),
             _ => None,
@@ -7879,6 +7897,18 @@ Content-Length: 0\r\n\r\n"
 
         assert_eq!(target.addr, "127.0.0.1:5060".parse().unwrap());
         assert_eq!(target.transport, SipTransport::Udp);
+    }
+
+    #[test]
+    fn route_target_uses_typed_route_header_parser() {
+        let target = parse_route_target(
+            "<sip:127.0.0.1:5061;transport=tcp;lr;du=sip:95.143.188.49:5060>",
+            SipTransport::Udp,
+        )
+        .unwrap();
+
+        assert_eq!(target.addr, "127.0.0.1:5061".parse().unwrap());
+        assert_eq!(target.transport, SipTransport::Tcp);
     }
 
     #[test]
