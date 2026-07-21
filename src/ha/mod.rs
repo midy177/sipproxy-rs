@@ -495,31 +495,61 @@ async fn run_snapshot_pull(
                 }
                 match pull_ha_events(&client, &events_endpoint, request_timeout, server.clone()).await {
                     Ok(HaEventPullOutcome::Applied) => {
+                        server.record_ha_event_pull("applied");
                         debug!(peer = %peer_addr, "applied HA event batch from peer");
                         continue;
                     }
-                    Ok(HaEventPullOutcome::Idle) => continue,
-                    Ok(HaEventPullOutcome::SnapshotRequired) => {}
-                    Err(err) => warn!(peer = %peer_addr, error = %format!("{err:#}"), "failed to pull HA events; falling back to snapshot"),
+                    Ok(HaEventPullOutcome::Idle) => {
+                        server.record_ha_event_pull("idle");
+                        continue;
+                    }
+                    Ok(HaEventPullOutcome::SnapshotRequired) => {
+                        server.record_ha_event_pull("snapshot-required");
+                        server.record_ha_snapshot_fallback("event-log-unavailable");
+                    }
+                    Err(err) => {
+                        server.record_ha_event_pull("error");
+                        server.record_ha_snapshot_fallback("event-pull-error");
+                        warn!(peer = %peer_addr, error = %format!("{err:#}"), "failed to pull HA events; falling back to snapshot");
+                    }
                 }
                 match timeout(request_timeout, client.get(&endpoint).send()).await {
                     Ok(Ok(response)) if response.status().is_success() => {
                         match timeout(request_timeout, response.json::<HaStateSnapshot>()).await {
                             Ok(Ok(snapshot)) => {
-                                server.install_state_snapshot(snapshot).await;
-                                debug!(peer = %peer_addr, "installed HA state snapshot from peer");
+                                if server.install_state_snapshot(snapshot).await {
+                                    server.record_ha_snapshot_pull("installed");
+                                    debug!(peer = %peer_addr, "installed HA state snapshot from peer");
+                                } else {
+                                    server.record_ha_snapshot_pull("rejected");
+                                }
                             }
-                            Ok(Err(err)) => warn!(peer = %peer_addr, error = %err, "failed to decode HA snapshot"),
-                            Err(_) => warn!(peer = %peer_addr, "timed out decoding HA snapshot"),
+                            Ok(Err(err)) => {
+                                server.record_ha_snapshot_pull("decode-error");
+                                warn!(peer = %peer_addr, error = %err, "failed to decode HA snapshot");
+                            }
+                            Err(_) => {
+                                server.record_ha_snapshot_pull("decode-timeout");
+                                warn!(peer = %peer_addr, "timed out decoding HA snapshot");
+                            }
                         }
                     }
-                    Ok(Ok(response)) => warn!(
-                        peer = %peer_addr,
-                        status = %response.status(),
-                        "HA snapshot peer returned non-success status"
-                    ),
-                    Ok(Err(err)) => warn!(peer = %peer_addr, error = %err, "failed to pull HA snapshot"),
-                    Err(_) => warn!(peer = %peer_addr, "timed out pulling HA snapshot"),
+                    Ok(Ok(response)) => {
+                        server.record_ha_snapshot_pull("http-error");
+                        warn!(
+                            peer = %peer_addr,
+                            status = %response.status(),
+                            "HA snapshot peer returned non-success status"
+                        );
+                    }
+                    Ok(Err(err)) => {
+                        server.record_ha_snapshot_pull("request-error");
+                        warn!(peer = %peer_addr, error = %err, "failed to pull HA snapshot");
+                    }
+                    Err(_) => {
+                        server.record_ha_snapshot_pull("request-timeout");
+                        warn!(peer = %peer_addr, "timed out pulling HA snapshot");
+                    }
                 }
             }
         }

@@ -45,6 +45,8 @@ data:
     startup_refresh = "disabled"
     fail_open = true
     unknown_country = "allow"
+    request_retries = 3
+    allow_partial = true
 
     [proxy.security.geo.deny]
     countries = ["RU", "IR", "KP"]

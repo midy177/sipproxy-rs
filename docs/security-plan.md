@@ -196,6 +196,9 @@ Runtime requirements for real XDP offload:
 - `/sys/fs/bpf` mounted and writable by the process.
 - Access to the target network interface, typically with host networking or a
   container network setup that exposes the interface.
+- `iproute2` is required only when `detach_stale = true`, so startup can remove
+  stale `sigproxy_xdp` programs left by an earlier process. `bpftool` is not
+  required at runtime.
 
 Performance expectation: public internet scans, floods, geo-denied sources, and
 already banned IPs are dropped before socket receive. Valid SIP and SIP-semantic

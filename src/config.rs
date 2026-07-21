@@ -546,6 +546,9 @@ fn validate_geo_security_config(config: &ProxyGeoSecurityConfig, path: &str) -> 
     {
         bail!("{path}.request_timeout_seconds must be greater than 0 when set");
     }
+    if config.request_retries.is_some_and(|value| value == 0) {
+        bail!("{path}.request_retries must be greater than 0 when set");
+    }
     for (name, countries) in [
         ("allow.countries", config.allow.countries.as_deref()),
         ("deny.countries", config.deny.countries.as_deref()),
@@ -614,6 +617,14 @@ fn default_geo_refresh_interval_seconds() -> u64 {
 
 fn default_geo_request_timeout_seconds() -> u64 {
     10
+}
+
+fn default_geo_request_retries() -> u32 {
+    3
+}
+
+fn default_geo_allow_partial() -> bool {
+    true
 }
 
 fn validate_cidr(value: &str) -> Result<()> {
@@ -833,6 +844,10 @@ pub struct ProxyGeoSecurityConfig {
     #[serde(default)]
     pub request_timeout_seconds: Option<u64>,
     #[serde(default)]
+    pub request_retries: Option<u32>,
+    #[serde(default)]
+    pub allow_partial: Option<bool>,
+    #[serde(default)]
     pub allow: ProxyGeoCountryListConfig,
     #[serde(default)]
     pub deny: ProxyGeoCountryListConfig,
@@ -866,6 +881,12 @@ impl ProxyGeoSecurityConfig {
         }
         if let Some(request_timeout_seconds) = self.request_timeout_seconds {
             effective.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(request_retries) = self.request_retries {
+            effective.request_retries = request_retries;
+        }
+        if let Some(allow_partial) = self.allow_partial {
+            effective.allow_partial = allow_partial;
         }
         if let Some(countries) = &self.allow.countries {
             effective.allow_countries = normalize_country_codes(countries);
@@ -1367,6 +1388,8 @@ pub struct EffectiveProxyGeoSecurityConfig {
     pub fail_open: bool,
     pub unknown_country: ProxyGeoUnknownCountryPolicy,
     pub request_timeout_seconds: u64,
+    pub request_retries: u32,
+    pub allow_partial: bool,
     pub allow_countries: Vec<String>,
     pub deny_countries: Vec<String>,
 }
@@ -1383,6 +1406,8 @@ impl Default for EffectiveProxyGeoSecurityConfig {
             fail_open: true,
             unknown_country: ProxyGeoUnknownCountryPolicy::default(),
             request_timeout_seconds: default_geo_request_timeout_seconds(),
+            request_retries: default_geo_request_retries(),
+            allow_partial: default_geo_allow_partial(),
             allow_countries: Vec::new(),
             deny_countries: Vec::new(),
         }
@@ -2154,6 +2179,8 @@ enabled = true
 cache_dir = "/tmp/sigproxy-geo"
 startup_refresh = "disabled"
 unknown_country = "deny"
+request_retries = 5
+allow_partial = true
 
 [proxy.security.geo.deny]
 countries = ["ru", "ir"]
@@ -2185,6 +2212,8 @@ servers = ["127.0.0.1:5080"]
             .proxy
             .effective_security_for_listener(&config.proxy.listeners[0]);
         assert!(effective.geo.enabled);
+        assert_eq!(effective.geo.request_retries, 5);
+        assert!(effective.geo.allow_partial);
         assert_eq!(effective.geo.deny_countries, vec!["RU", "IR"]);
         assert_eq!(effective.geo.allow_countries, vec!["CN"]);
         assert!(effective.dynamic_ban.enabled);

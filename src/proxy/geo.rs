@@ -277,9 +277,11 @@ impl GeoSourceConfig {
                 || config.refresh_interval_seconds != source.refresh_interval_seconds
                 || config.startup_refresh != source.startup_refresh
                 || config.request_timeout_seconds != source.request_timeout_seconds
+                || config.request_retries != source.request_retries
+                || config.allow_partial != source.allow_partial
             {
                 bail!(
-                    "all enabled proxy.security.geo listener configs must use the same provider, provider_base_url, cache_dir, refresh_interval_seconds, startup_refresh, and request_timeout_seconds"
+                    "all enabled proxy.security.geo listener configs must use the same provider, provider_base_url, cache_dir, refresh_interval_seconds, startup_refresh, request_timeout_seconds, request_retries, and allow_partial"
                 );
             }
         }
@@ -307,8 +309,8 @@ impl GeoSourceConfig {
             refresh_interval: Duration::from_secs(source.refresh_interval_seconds),
             startup_refresh: source.startup_refresh,
             request_timeout: Duration::from_secs(source.request_timeout_seconds),
-            request_retries: 3,
-            allow_partial: false,
+            request_retries: source.request_retries,
+            allow_partial: source.allow_partial,
             countries,
         })
     }
@@ -1071,6 +1073,24 @@ mod tests {
         assert!(prefixes.iter().any(|prefix| {
             prefix.addr == "2001:db8::".parse::<IpAddr>().unwrap() && prefix.prefix == 126
         }));
+    }
+
+    #[test]
+    fn geo_source_uses_runtime_partial_and_retry_config() {
+        let mut config = EffectiveProxyGeoSecurityConfig {
+            enabled: true,
+            request_retries: 7,
+            allow_partial: true,
+            deny_countries: vec!["CN".to_string()],
+            ..EffectiveProxyGeoSecurityConfig::default()
+        };
+        config.cache_dir = "/tmp/sigproxy-geo-source-test".to_string();
+
+        let source = GeoSourceConfig::from_configs(&[&config]).unwrap();
+
+        assert_eq!(source.request_retries, 7);
+        assert!(source.allow_partial);
+        assert_eq!(source.countries, vec!["CN"]);
     }
 
     #[test]

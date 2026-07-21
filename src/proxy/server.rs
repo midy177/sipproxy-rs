@@ -213,14 +213,14 @@ impl ProxyServer {
         .with_checksum()
     }
 
-    pub async fn install_state_snapshot(&self, snapshot: HaStateSnapshot) {
+    pub async fn install_state_snapshot(&self, snapshot: HaStateSnapshot) -> bool {
         if !snapshot.checksum_is_valid() {
             warn!(
                 last_seq = snapshot.last_seq,
                 checksum = %snapshot.checksum,
                 "refusing to install HA state snapshot with invalid checksum"
             );
-            return;
+            return false;
         }
         let persist_snapshot = snapshot.clone();
         self.state.install_snapshot(snapshot.contacts).await;
@@ -233,6 +233,7 @@ impl ProxyServer {
                 "failed to persist installed HA state snapshot"
             );
         }
+        true
     }
 
     async fn restore_persistent_state(&self) -> Result<()> {
@@ -335,6 +336,19 @@ impl ProxyServer {
         let location_bindings = self.state.contact_count().await;
         let upstream_health = self.upstreams.health_snapshots();
         let xdp_stats = self.security.xdp_stats();
+        let persistence_stats = match &self.persistence {
+            Some(persistence) => match persistence.stats().await {
+                Ok(stats) => Some(stats),
+                Err(err) => {
+                    debug!(
+                        error = %format!("{err:#}"),
+                        "failed to collect HA persistence metrics"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
 
         append_gauge(
             &mut output,
@@ -366,6 +380,41 @@ impl ProxyServer {
             "proxy_location_bindings",
             location_bindings as u64,
         );
+        if let Some(stats) = persistence_stats {
+            append_gauge(
+                &mut output,
+                "proxy_ha_persistence_latest_event_seq",
+                stats.latest_event_seq,
+            );
+            append_gauge(
+                &mut output,
+                "proxy_ha_persistence_last_applied_seq",
+                stats.last_applied_seq,
+            );
+            append_gauge(
+                &mut output,
+                "proxy_ha_persistence_event_rows",
+                stats.event_rows,
+            );
+            append_labeled_counter(
+                &mut output,
+                "proxy_ha_persistence_event_appends_total",
+                &[("result", "success")],
+                stats.event_appends_succeeded,
+            );
+            append_labeled_counter(
+                &mut output,
+                "proxy_ha_persistence_event_appends_total",
+                &[("result", "failure")],
+                stats.event_appends_failed,
+            );
+            append_labeled_counter(
+                &mut output,
+                "proxy_ha_persistence_sqlite_write_failures_total",
+                &[],
+                stats.sqlite_writes_failed,
+            );
+        }
         for health in upstream_health {
             let labels = [
                 ("group", health.group.as_str()),
@@ -1738,6 +1787,21 @@ impl ProxyServer {
             "proxy_security_dropped_packets_total",
             &[("listener", listener_key.as_str()), ("reason", reason)],
         );
+    }
+
+    pub(crate) fn record_ha_event_pull(&self, result: &str) {
+        self.metrics
+            .incr("proxy_ha_event_pulls_total", &[("result", result)]);
+    }
+
+    pub(crate) fn record_ha_snapshot_pull(&self, result: &str) {
+        self.metrics
+            .incr("proxy_ha_snapshot_pulls_total", &[("result", result)]);
+    }
+
+    pub(crate) fn record_ha_snapshot_fallback(&self, reason: &str) {
+        self.metrics
+            .incr("proxy_ha_snapshot_fallbacks_total", &[("reason", reason)]);
     }
 
     async fn lookup_invite_transaction(&self, key: Option<&str>) -> Option<InviteTransactionRoute> {
@@ -4236,6 +4300,7 @@ fn unique_id() -> u64 {
 mod tests {
     use super::*;
     use crate::cluster::{ClusterCommand, ContactBinding, StandaloneReplicator, expires_at};
+    use crate::config::HaPersistenceConfig;
     use crate::config::{
         Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyDynamicBanConfig,
         ProxyGeoCountryListConfig, ProxyGeoSecurityConfig, ProxyGeoStartupRefresh,
@@ -5995,6 +6060,69 @@ Content-Length: 0\r\n\r\n",
             "proxy_upstream_healthy{{group=\"default\",server=\"{}\"}} 1",
             upstream_socket.local_addr().unwrap()
         )));
+    }
+
+    #[tokio::test]
+    async fn metrics_reports_ha_persistence_and_replication_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = HaPersistence::open(&HaPersistenceConfig {
+            enabled: true,
+            path: dir.path().join("state.db").to_string_lossy().to_string(),
+            required: false,
+            event_retention_seconds: 3600,
+            cleanup_interval_ms: 60_000,
+        })
+        .unwrap()
+        .unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(
+            state.clone(),
+            Some(persistence.clone()),
+        ));
+        let server = ProxyServer::new(
+            Config {
+                proxy: ProxyConfig {
+                    listeners: vec![test_listener()],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec!["127.0.0.1:5080".to_string()],
+                    }],
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            Some(persistence.clone()),
+        )
+        .unwrap();
+
+        persistence
+            .apply_cluster_command(&ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:100@example.com".to_string(),
+                contact: "sip:100@127.0.0.1:5062".to_string(),
+                source: "127.0.0.1:50000".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await
+            .unwrap();
+        server.record_ha_event_pull("applied");
+        server.record_ha_snapshot_pull("installed");
+        server.record_ha_snapshot_fallback("event-pull-error");
+
+        let metrics = server.render_metrics().await;
+        assert!(metrics.contains("proxy_ha_persistence_latest_event_seq 1"));
+        assert!(metrics.contains("proxy_ha_persistence_last_applied_seq 0"));
+        assert!(metrics.contains("proxy_ha_persistence_event_rows 1"));
+        assert!(metrics.contains("proxy_ha_persistence_event_appends_total{result=\"success\"} 1"));
+        assert!(metrics.contains("proxy_ha_persistence_sqlite_write_failures_total 0"));
+        assert!(metrics.contains("proxy_ha_event_pulls_total{result=\"applied\"} 1"));
+        assert!(metrics.contains("proxy_ha_snapshot_pulls_total{result=\"installed\"} 1"));
+        assert!(
+            metrics.contains("proxy_ha_snapshot_fallbacks_total{reason=\"event-pull-error\"} 1")
+        );
     }
 
     #[tokio::test]

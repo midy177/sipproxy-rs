@@ -340,6 +340,8 @@ registered_invite_source_match = "ip"
 enabled = true
 cache_dir = "/var/lib/sigproxy-rs/geo"
 startup_refresh = "disabled"
+request_retries = 3
+allow_partial = true
 
 [proxy.security.geo.deny]
 countries = ["RU", "IR", "KP"]
@@ -378,7 +380,9 @@ default (`GEO_COUNTRIES=all`, `GEO_RETRIES=3`, `GEO_ALLOW_PARTIAL=true`). A
 temporary failure for one country is skipped with a warning so the image can
 still embed the countries that were fetched successfully. Runtime startup does
 not download geo data unless `startup_refresh = "background"` or `"blocking"` is
-explicitly configured.
+explicitly configured. When runtime refresh is enabled, `request_retries` and
+`allow_partial` apply to the refresh path as well, so transient ipdeny failures
+do not have to block the whole snapshot.
 
 `all` expands to country and territory zones only; ipdeny aggregate zones such
 as `AP` and `EU` are intentionally excluded because they overlap concrete
@@ -404,11 +408,13 @@ from `geo.sgeo`, and per-source-IP packet token buckets. SIP semantic checks
 such as REGISTER/INVITE AoR limits and registered-INVITE-source policy remain
 in user space. XDP drop/pass counters are exposed as
 `proxy_xdp_packets_total{action="..."}`. The userspace control plane loads,
-attaches, and updates XDP maps directly through aya; runtime `bpftool` and
-`ip link` shell-outs are not required. Running with XDP requires Linux
-privileges such as `CAP_NET_ADMIN` and `CAP_BPF` plus access to bpffs at
-`/sys/fs/bpf`; otherwise `fail_open = true` falls back to user-space security,
-while `fail_open = false` rejects startup.
+attaches, and updates XDP maps directly through aya; runtime `bpftool` is not
+required. When `detach_stale = true`, sigproxy uses the `ip` command from
+`iproute2` to remove only stale `sigproxy_xdp` programs before attaching; the
+official image includes it. Running with XDP requires Linux privileges such as
+`CAP_NET_ADMIN` and `CAP_BPF` plus access to bpffs at `/sys/fs/bpf`; otherwise
+`fail_open = true` falls back to user-space security, while `fail_open = false`
+rejects startup.
 
 On the host, make sure bpffs is mounted before starting the container:
 

@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::task;
 use tracing::{info, warn};
@@ -20,6 +21,9 @@ struct HaPersistenceInner {
     conn: Arc<StdMutex<Connection>>,
     required: bool,
     event_retention_seconds: u64,
+    event_appends_succeeded: AtomicU64,
+    event_appends_failed: AtomicU64,
+    sqlite_writes_failed: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +49,16 @@ pub struct HaEventsResponse {
     pub latest_seq: u64,
     pub snapshot_required: bool,
     pub events: Vec<HaEventRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HaPersistenceStats {
+    pub latest_event_seq: u64,
+    pub last_applied_seq: u64,
+    pub event_rows: u64,
+    pub event_appends_succeeded: u64,
+    pub event_appends_failed: u64,
+    pub sqlite_writes_failed: u64,
 }
 
 impl HaPersistence {
@@ -73,6 +87,9 @@ impl HaPersistence {
                 conn: Arc::new(StdMutex::new(conn)),
                 required: config.required,
                 event_retention_seconds: config.event_retention_seconds,
+                event_appends_succeeded: AtomicU64::new(0),
+                event_appends_failed: AtomicU64::new(0),
+                sqlite_writes_failed: AtomicU64::new(0),
             }),
         }))
     }
@@ -102,14 +119,16 @@ impl HaPersistence {
     pub async fn apply_cluster_command(&self, command: &ClusterCommand) -> Result<()> {
         let command = command.clone();
         let conn = self.inner.conn.clone();
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || {
             let mut conn = conn
                 .lock()
                 .expect("HA persistence connection lock poisoned");
             apply_cluster_command(&mut conn, &command, true).map(|_| ())
         })
         .await
-        .context("HA persistence command task failed")?
+        .context("HA persistence command task failed")?;
+        self.record_write_result(&result, 1);
+        result
     }
 
     pub async fn upsert_affinity_bindings(
@@ -119,8 +138,9 @@ impl HaPersistence {
         if bindings.is_empty() {
             return Ok(());
         }
+        let appended_events = bindings.len() as u64;
         let conn = self.inner.conn.clone();
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || {
             let mut conn = conn
                 .lock()
                 .expect("HA persistence connection lock poisoned");
@@ -139,13 +159,15 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence affinity task failed")?
+        .context("HA persistence affinity task failed")?;
+        self.record_write_result(&result, appended_events);
+        result
     }
 
     pub async fn install_snapshot(&self, snapshot: &HaStateSnapshot) -> Result<()> {
         let snapshot = snapshot.clone();
         let conn = self.inner.conn.clone();
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || {
             let mut conn = conn
                 .lock()
                 .expect("HA persistence connection lock poisoned");
@@ -167,13 +189,15 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence snapshot task failed")?
+        .context("HA persistence snapshot task failed")?;
+        self.record_sqlite_write_result(&result);
+        result
     }
 
     pub async fn cleanup_expired(&self) -> Result<()> {
         let conn = self.inner.conn.clone();
         let retention = self.inner.event_retention_seconds;
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || {
             let conn = conn
                 .lock()
                 .expect("HA persistence connection lock poisoned");
@@ -196,7 +220,9 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence cleanup task failed")?
+        .context("HA persistence cleanup task failed")?;
+        self.record_sqlite_write_result(&result);
+        result
     }
 
     pub async fn latest_event_seq(&self) -> Result<u64> {
@@ -238,14 +264,34 @@ impl HaPersistence {
     pub async fn apply_event(&self, event: &HaEventRecord) -> Result<()> {
         let event = event.clone();
         let conn = self.inner.conn.clone();
-        task::spawn_blocking(move || {
+        let result = task::spawn_blocking(move || {
             let mut conn = conn
                 .lock()
                 .expect("HA persistence connection lock poisoned");
             apply_event_without_append(&mut conn, &event)
         })
         .await
-        .context("HA persistence apply event task failed")?
+        .context("HA persistence apply event task failed")?;
+        self.record_sqlite_write_result(&result);
+        result
+    }
+
+    pub async fn stats(&self) -> Result<HaPersistenceStats> {
+        let conn = self.inner.conn.clone();
+        let stats = task::spawn_blocking(move || {
+            let conn = conn
+                .lock()
+                .expect("HA persistence connection lock poisoned");
+            persistence_stats(&conn)
+        })
+        .await
+        .context("HA persistence stats task failed")??;
+        Ok(HaPersistenceStats {
+            event_appends_succeeded: self.inner.event_appends_succeeded.load(Ordering::Relaxed),
+            event_appends_failed: self.inner.event_appends_failed.load(Ordering::Relaxed),
+            sqlite_writes_failed: self.inner.sqlite_writes_failed.load(Ordering::Relaxed),
+            ..stats
+        })
     }
 
     pub async fn cleanup_loop(
@@ -270,6 +316,30 @@ impl HaPersistence {
             }
         }
         Ok(())
+    }
+
+    fn record_write_result(&self, result: &Result<()>, appended_events: u64) {
+        self.record_sqlite_write_result(result);
+        match result {
+            Ok(()) => {
+                self.inner
+                    .event_appends_succeeded
+                    .fetch_add(appended_events, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.inner
+                    .event_appends_failed
+                    .fetch_add(appended_events, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_sqlite_write_result(&self, result: &Result<()>) {
+        if result.is_err() {
+            self.inner
+                .sqlite_writes_failed
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -492,6 +562,24 @@ fn latest_event_seq(conn: &Connection) -> Result<u64> {
     Ok(seq)
 }
 
+fn event_row_count(conn: &Connection) -> Result<u64> {
+    let count = conn.query_row("select count(*) from ha_events", [], |row| {
+        row.get::<_, u64>(0)
+    })?;
+    Ok(count)
+}
+
+fn persistence_stats(conn: &Connection) -> Result<HaPersistenceStats> {
+    Ok(HaPersistenceStats {
+        latest_event_seq: latest_event_seq(conn)?,
+        last_applied_seq: last_applied_seq(conn)?.unwrap_or(0),
+        event_rows: event_row_count(conn)?,
+        event_appends_succeeded: 0,
+        event_appends_failed: 0,
+        sqlite_writes_failed: 0,
+    })
+}
+
 fn first_event_seq(conn: &Connection) -> Result<Option<u64>> {
     Ok(conn.query_row("select min(seq) from ha_events", [], |row| {
         row.get::<_, Option<u64>>(0)
@@ -669,6 +757,42 @@ mod tests {
         let snapshot = persistence.load_snapshot().await.unwrap();
         assert!(snapshot.contacts.contacts.is_empty());
         assert!(snapshot.affinity.bindings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistence_stats_reports_sequences_rows_and_write_counters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db").to_string_lossy().to_string();
+        let persistence = HaPersistence::open(&test_config(path)).unwrap().unwrap();
+
+        persistence
+            .apply_cluster_command(&ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:100@example.com".to_string(),
+                contact: "sip:100@127.0.0.1:5062".to_string(),
+                source: "127.0.0.1:50000".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await
+            .unwrap();
+        persistence
+            .upsert_affinity_bindings(vec![AffinityBindingSnapshot {
+                key: AffinityKey::from_string("call-id:abc".to_string()),
+                target: AffinityTarget {
+                    addr: "127.0.0.1:5080".parse().unwrap(),
+                    transport: SipTransport::Udp,
+                },
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }])
+            .await
+            .unwrap();
+
+        let stats = persistence.stats().await.unwrap();
+        assert_eq!(stats.latest_event_seq, 2);
+        assert_eq!(stats.last_applied_seq, 0);
+        assert_eq!(stats.event_rows, 2);
+        assert_eq!(stats.event_appends_succeeded, 2);
+        assert_eq!(stats.event_appends_failed, 0);
+        assert_eq!(stats.sqlite_writes_failed, 0);
     }
 
     #[tokio::test]

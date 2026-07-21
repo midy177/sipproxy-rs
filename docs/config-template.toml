@@ -118,6 +118,8 @@ preset = "off"
 # fail_open = true
 # unknown_country = "allow" # "allow" or "deny"
 # request_timeout_seconds = 10
+# request_retries = 3
+# allow_partial = true
 #
 # [proxy.security.geo.deny]
 # countries = ["RU", "IR", "KP"]
