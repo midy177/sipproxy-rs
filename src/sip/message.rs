@@ -89,6 +89,8 @@ impl SipMessage {
                 .enumerate()
                 .find_map(|(index, header)| match header {
                     Header::Via(via) => Some((index, via.value().to_string())),
+                    // Keep this fallback for messages created by older wrappers or malformed
+                    // parsers that preserved a Via-shaped standard header as Other.
                     Header::Other(name, value) if name.eq_ignore_ascii_case("Via") => {
                         Some((index, value.to_string()))
                     }
@@ -778,6 +780,34 @@ Content-Length: 0\r\n\r\n",
         assert_eq!(
             resp.top_via_branch().unwrap().as_deref(),
             Some("z9hG4bK-client")
+        );
+        assert!(matches!(
+            resp.inner.headers().iter().next(),
+            Some(Header::Via(_))
+        ));
+    }
+
+    #[test]
+    fn pop_top_via_normalizes_other_via_fallback_to_standard_variant() {
+        let mut resp = SipMessage::parse(
+            b"SIP/2.0 180 Ringing\r\n\
+Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>;tag=b\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+        resp.inner.headers_mut().0[0] = Header::Other(
+            "Via".to_string(),
+            "SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy, SIP/2.0/UDP client.example.com;branch=z9hG4bK-client"
+                .to_string(),
+        );
+
+        assert_eq!(
+            resp.pop_top_via().unwrap().as_deref(),
+            Some("SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy")
         );
         assert!(matches!(
             resp.inner.headers().iter().next(),

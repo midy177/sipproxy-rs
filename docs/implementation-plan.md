@@ -623,7 +623,8 @@ Active-standby 生产启用前必修：
 - UDP downstream 转 TCP upstream 已改为复用 TCP upstream 长连接池，按 proxy branch 分发多个 INVITE provisional/final response，并确保 proxy Via transport 使用实际 upstream transport。
 - code review 主线修复已完成：路由 domain 精确 host 匹配、原子唯一 proxy branch、UDP 收包循环后台处理、listener 瞬时 IO 错误继续运行、app 子任务监督、INVITE upstream 响应长等待、TCP/UDP branch final 后清理、发送失败回滚、affinity 不健康目标回退、active-standby/replication peer 必填校验。
 - 基础测试覆盖配置、SIP 解析、REGISTER、路由和 proxy 处理路径。
+- `Header::Other` 剩余用法已收敛到异常 Via 兼容 fallback 和自定义扩展头场景；标准 SIP 头写入路径已尽量走 `rsipstack` 标准 header variant。
 
 待完成：
 
-- 继续审计剩余薄封装，能稳定复用 `rsipstack` typed API 的地方继续替换。
+- 当前无功能性待完成项；后续如升级 `rsipstack` 后新增 typed API，再继续替换对应薄封装。
