@@ -4,8 +4,6 @@
 #include <linux/in.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
-#include <linux/icmp.h>
-#include <linux/icmpv6.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
@@ -22,6 +20,7 @@
 #define SIG_RATE_TCP_SYN_FLOOD 242
 #define SIG_RATE_TCP_ACK_FLOOD 243
 #define SIG_RATE_ICMP_FLOOD 244
+#define ICMP_MIN_HEADER_BYTES 8
 #define MAX_VLAN_DEPTH 4
 #define MAX_IPV6_EXT_HEADERS 6
 
@@ -491,8 +490,7 @@ int sigproxy_xdp(struct xdp_md *ctx)
             return handle_l4(4, IPPROTO_TCP, tcp->dest, (__u8 *)&iph->saddr, packet_class);
         }
         if (iph->protocol == IPPROTO_ICMP) {
-            struct icmphdr *icmp = cursor;
-            if ((void *)(icmp + 1) > data_end)
+            if ((void *)cursor + ICMP_MIN_HEADER_BYTES > data_end)
                 return XDP_PASS;
             return handle_icmp(4, (__u8 *)&iph->saddr);
         }
@@ -527,8 +525,7 @@ int sigproxy_xdp(struct xdp_md *ctx)
             return handle_l4(6, IPPROTO_TCP, tcp->dest, (__u8 *)&ip6h->saddr, packet_class);
         }
         if (nexthdr == IPPROTO_ICMPV6) {
-            struct icmp6hdr *icmp6 = cursor;
-            if ((void *)(icmp6 + 1) > data_end)
+            if ((void *)cursor + ICMP_MIN_HEADER_BYTES > data_end)
                 return XDP_PASS;
             return handle_icmp(6, (__u8 *)&ip6h->saddr);
         }
