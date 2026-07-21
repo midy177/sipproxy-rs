@@ -14,6 +14,7 @@ use crate::proxy::registry::{
     extract_response_contact_expires, extract_to_aor,
 };
 use crate::proxy::routing::RouteTable;
+use crate::proxy::threat::{ThreatDecision, ThreatPolicy, ThreatRuntime, evaluate_threat_policy};
 use crate::proxy::xdp::XdpRuntime;
 use crate::sip::{SipMessage, SipStartLine};
 use anyhow::{Context, Result, bail};
@@ -123,6 +124,9 @@ impl ProxyServer {
         this.restore_persistent_state().await?;
 
         if let Some(task) = this.security.spawn_geo_refresh(shutdown.clone()).await {
+            tasks.push(task);
+        }
+        if let Some(task) = this.security.spawn_threat_refresh(shutdown.clone()).await {
             tasks.push(task);
         }
         tasks.push(tokio::spawn(
@@ -2263,6 +2267,7 @@ enum SecurityBanAction {
 struct SecurityRuntime {
     listeners: ArcSwap<HashMap<String, Arc<ListenerSecurityRuntime>>>,
     geo: Option<Arc<GeoRuntime>>,
+    threat: Option<Arc<ThreatRuntime>>,
     xdp: XdpRuntime,
     buckets: ShardedSecurityMap<TokenBucket>,
     blocks: ShardedSecurityMap<Instant>,
@@ -2281,10 +2286,12 @@ impl SecurityRuntime {
             );
         }
         let geo = GeoRuntime::new(&effective_configs)?;
-        let xdp = XdpRuntime::new(config, geo.as_ref())?;
+        let threat = ThreatRuntime::new(&effective_configs)?;
+        let xdp = XdpRuntime::new(config, geo.as_ref(), threat.as_ref())?;
         Ok(Self {
             listeners: ArcSwap::from_pointee(listeners),
             geo,
+            threat,
             xdp,
             buckets: ShardedSecurityMap::new(SECURITY_MAP_SHARDS),
             blocks: ShardedSecurityMap::new(SECURITY_MAP_SHARDS),
@@ -2298,6 +2305,13 @@ impl SecurityRuntime {
         self.geo.as_ref()?.spawn_refresh_task(shutdown).await
     }
 
+    async fn spawn_threat_refresh(
+        &self,
+        shutdown: watch::Receiver<bool>,
+    ) -> Option<tokio::task::JoinHandle<Result<()>>> {
+        self.threat.as_ref()?.spawn_refresh_task(shutdown).await
+    }
+
     fn xdp_stats(&self) -> Vec<(&'static str, u64)> {
         self.xdp.stats()
     }
@@ -2308,7 +2322,7 @@ impl SecurityRuntime {
                 _ = shutdown.changed() => break,
                 _ = tokio::time::sleep(SECURITY_PRUNE_INTERVAL) => {
                     self.prune_expired().await;
-                    self.xdp.sync_static_policy(self.geo.as_ref());
+                    self.xdp.sync_static_policy(self.geo.as_ref(), self.threat.as_ref());
                 }
             }
         }
@@ -2356,6 +2370,48 @@ impl SecurityRuntime {
         match evaluate_geo_policy(&runtime.geo_policy, self.geo.as_ref(), peer.ip()) {
             GeoDecision::Allow => {}
             GeoDecision::Drop(reason) => return SecurityDecision::Drop(reason),
+        }
+
+        match evaluate_threat_policy(&runtime.threat_policy, self.threat.as_ref(), peer.ip()) {
+            ThreatDecision::Allow => {}
+            ThreatDecision::Drop(reason) => return SecurityDecision::Drop(reason),
+        }
+
+        let flood = &runtime.config.flood;
+        if flood.enabled {
+            let (rate, burst, reason) = match listener.transport {
+                SipTransport::Udp => (
+                    flood.udp_packets_per_second,
+                    flood.udp_burst,
+                    "udp-flood-rate-limit",
+                ),
+                SipTransport::Tcp => (
+                    flood.tcp_packets_per_second,
+                    flood.tcp_burst,
+                    "tcp-flood-rate-limit",
+                ),
+            };
+            if rate > 0 && burst > 0 {
+                let bucket_key = ip_security_key("flood-packets", listener_key.as_str(), peer.ip());
+                if !self
+                    .allow_bucket(bucket_key, rate as f64, burst as f64)
+                    .await
+                {
+                    if flood.block_seconds > 0 {
+                        let subject = peer.ip().to_string();
+                        self.block_for(
+                            &block_key,
+                            flood.block_seconds,
+                            listener_key.as_str(),
+                            "ip",
+                            subject.as_str(),
+                            reason,
+                        )
+                        .await;
+                    }
+                    return SecurityDecision::Drop(reason);
+                }
+            }
         }
 
         let ip_rate = &runtime.config.ip_rate_limit;
@@ -2753,6 +2809,7 @@ fn string_shard_index(key: &str, shards: usize) -> usize {
 struct ListenerSecurityRuntime {
     config: EffectiveProxySecurityConfig,
     geo_policy: GeoPolicy,
+    threat_policy: ThreatPolicy,
     trusted_cidrs: Vec<Cidr>,
     allow_cidrs: Vec<Cidr>,
     deny_cidrs: Vec<Cidr>,
@@ -2762,6 +2819,7 @@ impl ListenerSecurityRuntime {
     fn new(config: EffectiveProxySecurityConfig) -> Result<Self> {
         Ok(Self {
             geo_policy: GeoPolicy::from_config(&config.geo),
+            threat_policy: ThreatPolicy::from_config(&config.threat_intel),
             trusted_cidrs: parse_cidrs(&config.trusted_cidrs)?,
             allow_cidrs: parse_cidrs(&config.allow_cidrs)?,
             deny_cidrs: parse_cidrs(&config.deny_cidrs)?,

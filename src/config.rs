@@ -483,7 +483,9 @@ fn validate_security_config(config: &ProxySecurityConfig, path: &str) -> Result<
         bail!("{path}.prefilter.invalid_log_sample_per_minute must be greater than 0 when set");
     }
     validate_geo_security_config(&config.geo, &format!("{path}.geo"))?;
+    validate_threat_intel_security_config(&config.threat_intel, &format!("{path}.threat_intel"))?;
     validate_dynamic_ban_config(&config.dynamic_ban, &format!("{path}.dynamic_ban"))?;
+    validate_flood_security_config(&config.flood, &format!("{path}.flood"))?;
     validate_xdp_security_config(&config.xdp, &format!("{path}.xdp"))?;
 
     if config
@@ -576,6 +578,49 @@ fn validate_geo_security_config(config: &ProxyGeoSecurityConfig, path: &str) -> 
     Ok(())
 }
 
+fn validate_threat_intel_security_config(
+    config: &ProxyThreatIntelSecurityConfig,
+    path: &str,
+) -> Result<()> {
+    if config
+        .cache_dir
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        bail!("{path}.cache_dir must not be empty when set");
+    }
+    if config
+        .refresh_interval_seconds
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.refresh_interval_seconds must be greater than 0 when set");
+    }
+    if config
+        .request_timeout_seconds
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.request_timeout_seconds must be greater than 0 when set");
+    }
+    if config.request_retries.is_some_and(|value| value == 0) {
+        bail!("{path}.request_retries must be greater than 0 when set");
+    }
+    if let Some(sources) = &config.sources {
+        for (index, source) in sources.iter().enumerate() {
+            let source_path = format!("{path}.sources[{index}]");
+            if source.name.trim().is_empty() {
+                bail!("{source_path}.name must not be empty");
+            }
+            if source.url.trim().is_empty() {
+                bail!("{source_path}.url must not be empty");
+            }
+            if source.min_score.is_some_and(|value| value == 0) {
+                bail!("{source_path}.min_score must be greater than 0 when set");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_dynamic_ban_config(config: &ProxyDynamicBanConfig, path: &str) -> Result<()> {
     if config.ban_seconds.is_some_and(|value| value == 0) {
         bail!("{path}.ban_seconds must be greater than 0 when set");
@@ -597,6 +642,21 @@ fn validate_dynamic_ban_config(config: &ProxyDynamicBanConfig, path: &str) -> Re
         .is_some_and(|value| value == 0)
     {
         bail!("{path}.sip_rate_violations_per_minute must be greater than 0 when set");
+    }
+    Ok(())
+}
+
+fn validate_flood_security_config(config: &ProxyFloodSecurityConfig, path: &str) -> Result<()> {
+    for (field, value) in [
+        ("udp_packets_per_second", config.udp_packets_per_second),
+        ("udp_burst", config.udp_burst),
+        ("tcp_packets_per_second", config.tcp_packets_per_second),
+        ("tcp_burst", config.tcp_burst),
+        ("block_seconds", config.block_seconds),
+    ] {
+        if value.is_some_and(|value| value == 0) {
+            bail!("{path}.{field} must be greater than 0 when set");
+        }
     }
     Ok(())
 }
@@ -638,6 +698,43 @@ fn default_geo_request_retries() -> u32 {
 
 fn default_geo_allow_partial() -> bool {
     true
+}
+
+fn default_threat_cache_dir() -> String {
+    "/var/lib/sigproxy-rs/threat".to_string()
+}
+
+fn default_threat_refresh_interval_seconds() -> u64 {
+    86_400
+}
+
+fn default_threat_request_timeout_seconds() -> u64 {
+    10
+}
+
+fn default_threat_request_retries() -> u32 {
+    3
+}
+
+fn default_threat_allow_partial() -> bool {
+    true
+}
+
+fn default_threat_sources() -> Vec<EffectiveProxyThreatIntelSourceConfig> {
+    vec![
+        EffectiveProxyThreatIntelSourceConfig {
+            name: "ipsum".to_string(),
+            url: "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt".to_string(),
+            format: ProxyThreatIntelFormat::Ipsum,
+            min_score: Some(3),
+        },
+        EffectiveProxyThreatIntelSourceConfig {
+            name: "spamhaus-drop".to_string(),
+            url: "https://www.spamhaus.org/drop/drop.txt".to_string(),
+            format: ProxyThreatIntelFormat::SpamhausDrop,
+            min_score: None,
+        },
+    ]
 }
 
 fn validate_cidr(value: &str) -> Result<()> {
@@ -797,7 +894,11 @@ pub struct ProxySecurityConfig {
     #[serde(default)]
     pub geo: ProxyGeoSecurityConfig,
     #[serde(default)]
+    pub threat_intel: ProxyThreatIntelSecurityConfig,
+    #[serde(default)]
     pub dynamic_ban: ProxyDynamicBanConfig,
+    #[serde(default)]
+    pub flood: ProxyFloodSecurityConfig,
     #[serde(default)]
     pub ip_rate_limit: ProxyIpRateLimitConfig,
     #[serde(default)]
@@ -824,8 +925,11 @@ impl ProxySecurityConfig {
         }
         self.prefilter.apply_to_effective(&mut effective.prefilter);
         self.geo.apply_to_effective(&mut effective.geo);
+        self.threat_intel
+            .apply_to_effective(&mut effective.threat_intel);
         self.dynamic_ban
             .apply_to_effective(&mut effective.dynamic_ban);
+        self.flood.apply_to_effective(&mut effective.flood);
         self.ip_rate_limit
             .apply_to_effective(&mut effective.ip_rate_limit);
         self.sip_rate_limit
@@ -911,6 +1015,91 @@ impl ProxyGeoSecurityConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyThreatIntelSecurityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+    #[serde(default)]
+    pub refresh_interval_seconds: Option<u64>,
+    #[serde(default)]
+    pub startup_refresh: Option<ProxyGeoStartupRefresh>,
+    #[serde(default)]
+    pub fail_open: Option<bool>,
+    #[serde(default)]
+    pub request_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub request_retries: Option<u32>,
+    #[serde(default)]
+    pub allow_partial: Option<bool>,
+    #[serde(default)]
+    pub sources: Option<Vec<ProxyThreatIntelSourceConfig>>,
+}
+
+impl ProxyThreatIntelSecurityConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyThreatIntelSecurityConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(cache_dir) = &self.cache_dir {
+            effective.cache_dir = cache_dir.clone();
+        }
+        if let Some(refresh_interval_seconds) = self.refresh_interval_seconds {
+            effective.refresh_interval_seconds = refresh_interval_seconds;
+        }
+        if let Some(startup_refresh) = self.startup_refresh {
+            effective.startup_refresh = startup_refresh;
+        }
+        if let Some(fail_open) = self.fail_open {
+            effective.fail_open = fail_open;
+        }
+        if let Some(request_timeout_seconds) = self.request_timeout_seconds {
+            effective.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(request_retries) = self.request_retries {
+            effective.request_retries = request_retries;
+        }
+        if let Some(allow_partial) = self.allow_partial {
+            effective.allow_partial = allow_partial;
+        }
+        if let Some(sources) = &self.sources {
+            effective.sources = sources
+                .iter()
+                .filter(|source| source.enabled.unwrap_or(true))
+                .map(EffectiveProxyThreatIntelSourceConfig::from_config)
+                .collect();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyThreatIntelSourceConfig {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub format: ProxyThreatIntelFormat,
+    #[serde(default)]
+    pub min_score: Option<u32>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProxyThreatIntelFormat {
+    Cidr,
+    Ips,
+    Ipsum,
+    SpamhausDrop,
+}
+
+impl Default for ProxyThreatIntelFormat {
+    fn default() -> Self {
+        Self::Cidr
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProxyGeoCountryListConfig {
     #[serde(default)]
     pub countries: Option<Vec<String>>,
@@ -985,6 +1174,45 @@ impl ProxyDynamicBanConfig {
         }
         if let Some(sip_rate_violations_per_minute) = self.sip_rate_violations_per_minute {
             effective.sip_rate_violations_per_minute = sip_rate_violations_per_minute;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProxyFloodSecurityConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub udp_packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub udp_burst: Option<u64>,
+    #[serde(default)]
+    pub tcp_packets_per_second: Option<u64>,
+    #[serde(default)]
+    pub tcp_burst: Option<u64>,
+    #[serde(default)]
+    pub block_seconds: Option<u64>,
+}
+
+impl ProxyFloodSecurityConfig {
+    fn apply_to_effective(&self, effective: &mut EffectiveProxyFloodSecurityConfig) {
+        if let Some(enabled) = self.enabled {
+            effective.enabled = enabled;
+        }
+        if let Some(udp_packets_per_second) = self.udp_packets_per_second {
+            effective.udp_packets_per_second = udp_packets_per_second;
+        }
+        if let Some(udp_burst) = self.udp_burst {
+            effective.udp_burst = udp_burst;
+        }
+        if let Some(tcp_packets_per_second) = self.tcp_packets_per_second {
+            effective.tcp_packets_per_second = tcp_packets_per_second;
+        }
+        if let Some(tcp_burst) = self.tcp_burst {
+            effective.tcp_burst = tcp_burst;
+        }
+        if let Some(block_seconds) = self.block_seconds {
+            effective.block_seconds = block_seconds;
         }
     }
 }
@@ -1150,6 +1378,8 @@ pub struct ProxyXdpSecurityConfig {
     #[serde(default)]
     pub geo_filter: Option<bool>,
     #[serde(default)]
+    pub threat_intel: Option<bool>,
+    #[serde(default)]
     pub ip_rate_limit: Option<bool>,
 }
 
@@ -1176,6 +1406,9 @@ impl ProxyXdpSecurityConfig {
         if let Some(geo_filter) = self.geo_filter {
             effective.geo_filter = geo_filter;
         }
+        if let Some(threat_intel) = self.threat_intel {
+            effective.threat_intel = threat_intel;
+        }
         if let Some(ip_rate_limit) = self.ip_rate_limit {
             effective.ip_rate_limit = ip_rate_limit;
         }
@@ -1190,7 +1423,9 @@ pub struct EffectiveProxySecurityConfig {
     pub deny_cidrs: Vec<String>,
     pub prefilter: EffectiveProxySecurityPrefilterConfig,
     pub geo: EffectiveProxyGeoSecurityConfig,
+    pub threat_intel: EffectiveProxyThreatIntelSecurityConfig,
     pub dynamic_ban: EffectiveProxyDynamicBanConfig,
+    pub flood: EffectiveProxyFloodSecurityConfig,
     pub ip_rate_limit: EffectiveProxyIpRateLimitConfig,
     pub sip_rate_limit: EffectiveProxySipRateLimitConfig,
     pub sip_policy: EffectiveProxySipPolicyConfig,
@@ -1201,7 +1436,9 @@ impl EffectiveProxySecurityConfig {
     pub fn enabled(&self) -> bool {
         self.prefilter.enabled
             || self.geo.enabled
+            || self.threat_intel.enabled
             || self.dynamic_ban.enabled
+            || self.flood.enabled
             || self.ip_rate_limit.enabled
             || self.sip_rate_limit.enabled
             || self.sip_policy.require_registered_invite_source
@@ -1222,7 +1459,9 @@ impl EffectiveProxySecurityConfig {
                     invalid_log_sample_per_minute: 10,
                 },
                 geo: EffectiveProxyGeoSecurityConfig::default(),
+                threat_intel: EffectiveProxyThreatIntelSecurityConfig::default(),
                 dynamic_ban: EffectiveProxyDynamicBanConfig::default(),
+                flood: EffectiveProxyFloodSecurityConfig::default(),
                 ip_rate_limit: EffectiveProxyIpRateLimitConfig {
                     enabled: false,
                     packets_per_second: 0,
@@ -1252,6 +1491,7 @@ impl EffectiveProxySecurityConfig {
                     invalid_log_sample_per_minute: 20,
                 },
                 geo: EffectiveProxyGeoSecurityConfig::default(),
+                threat_intel: EffectiveProxyThreatIntelSecurityConfig::default(),
                 dynamic_ban: EffectiveProxyDynamicBanConfig {
                     enabled: true,
                     ban_seconds: 60,
@@ -1259,6 +1499,7 @@ impl EffectiveProxySecurityConfig {
                     parse_errors_per_minute: 60,
                     sip_rate_violations_per_minute: 30,
                 },
+                flood: EffectiveProxyFloodSecurityConfig::default(),
                 ip_rate_limit: EffectiveProxyIpRateLimitConfig {
                     enabled: true,
                     packets_per_second: 200,
@@ -1288,6 +1529,7 @@ impl EffectiveProxySecurityConfig {
                     invalid_log_sample_per_minute: 10,
                 },
                 geo: EffectiveProxyGeoSecurityConfig::default(),
+                threat_intel: EffectiveProxyThreatIntelSecurityConfig::default(),
                 dynamic_ban: EffectiveProxyDynamicBanConfig {
                     enabled: true,
                     ban_seconds: 300,
@@ -1295,6 +1537,7 @@ impl EffectiveProxySecurityConfig {
                     parse_errors_per_minute: 20,
                     sip_rate_violations_per_minute: 10,
                 },
+                flood: EffectiveProxyFloodSecurityConfig::default(),
                 ip_rate_limit: EffectiveProxyIpRateLimitConfig {
                     enabled: true,
                     packets_per_second: 50,
@@ -1324,6 +1567,7 @@ impl EffectiveProxySecurityConfig {
                     invalid_log_sample_per_minute: 5,
                 },
                 geo: EffectiveProxyGeoSecurityConfig::default(),
+                threat_intel: EffectiveProxyThreatIntelSecurityConfig::default(),
                 dynamic_ban: EffectiveProxyDynamicBanConfig {
                     enabled: true,
                     ban_seconds: 900,
@@ -1331,6 +1575,7 @@ impl EffectiveProxySecurityConfig {
                     parse_errors_per_minute: 5,
                     sip_rate_violations_per_minute: 5,
                 },
+                flood: EffectiveProxyFloodSecurityConfig::default(),
                 ip_rate_limit: EffectiveProxyIpRateLimitConfig {
                     enabled: true,
                     packets_per_second: 15,
@@ -1372,6 +1617,7 @@ pub struct EffectiveProxyXdpSecurityConfig {
     pub sync_dynamic_ban: bool,
     pub cidr_filter: bool,
     pub geo_filter: bool,
+    pub threat_intel: bool,
     pub ip_rate_limit: bool,
 }
 
@@ -1385,7 +1631,56 @@ impl Default for EffectiveProxyXdpSecurityConfig {
             sync_dynamic_ban: true,
             cidr_filter: true,
             geo_filter: true,
+            threat_intel: true,
             ip_rate_limit: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyThreatIntelSecurityConfig {
+    pub enabled: bool,
+    pub cache_dir: String,
+    pub refresh_interval_seconds: u64,
+    pub startup_refresh: ProxyGeoStartupRefresh,
+    pub fail_open: bool,
+    pub request_timeout_seconds: u64,
+    pub request_retries: u32,
+    pub allow_partial: bool,
+    pub sources: Vec<EffectiveProxyThreatIntelSourceConfig>,
+}
+
+impl Default for EffectiveProxyThreatIntelSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_dir: default_threat_cache_dir(),
+            refresh_interval_seconds: default_threat_refresh_interval_seconds(),
+            startup_refresh: ProxyGeoStartupRefresh::default(),
+            fail_open: true,
+            request_timeout_seconds: default_threat_request_timeout_seconds(),
+            request_retries: default_threat_request_retries(),
+            allow_partial: default_threat_allow_partial(),
+            sources: default_threat_sources(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EffectiveProxyThreatIntelSourceConfig {
+    pub name: String,
+    pub url: String,
+    pub format: ProxyThreatIntelFormat,
+    pub min_score: Option<u32>,
+}
+
+impl EffectiveProxyThreatIntelSourceConfig {
+    fn from_config(config: &ProxyThreatIntelSourceConfig) -> Self {
+        Self {
+            name: config.name.trim().to_string(),
+            url: config.url.trim().to_string(),
+            format: config.format,
+            min_score: config.min_score,
         }
     }
 }
@@ -1444,6 +1739,29 @@ impl Default for EffectiveProxyDynamicBanConfig {
             invalid_packets_per_minute: 0,
             parse_errors_per_minute: 0,
             sip_rate_violations_per_minute: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveProxyFloodSecurityConfig {
+    pub enabled: bool,
+    pub udp_packets_per_second: u64,
+    pub udp_burst: u64,
+    pub tcp_packets_per_second: u64,
+    pub tcp_burst: u64,
+    pub block_seconds: u64,
+}
+
+impl Default for EffectiveProxyFloodSecurityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            udp_packets_per_second: 0,
+            udp_burst: 0,
+            tcp_packets_per_second: 0,
+            tcp_burst: 0,
+            block_seconds: 0,
         }
     }
 }

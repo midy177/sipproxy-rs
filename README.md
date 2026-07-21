@@ -348,22 +348,45 @@ allow_partial = true
 [proxy.security.geo.deny]
 countries = ["RU", "IR", "KP"]
 
+[proxy.security.threat_intel]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/threat"
+startup_refresh = "disabled"
+request_retries = 3
+allow_partial = true
+
 [proxy.security.dynamic_ban]
 enabled = true
 ban_seconds = 3600
 invalid_packets_per_minute = 30
 parse_errors_per_minute = 20
 sip_rate_violations_per_minute = 10
+
+[proxy.security.flood]
+enabled = true
+udp_packets_per_second = 200
+udp_burst = 400
+tcp_packets_per_second = 200
+tcp_burst = 400
+block_seconds = 300
 ```
 
 Presets are `off`, `trusted`, `public`, and `strict`. SIP listeners apply
-CIDR allow/deny checks, listener-scoped geo country checks, packet and
-parse-error rate limits, fail2ban-style dynamic bans, invalid start-line
-prefiltering, and `REGISTER`/`INVITE` SIP identity limits. `ACK` and `CANCEL`
-are not SIP-rate-limited so transaction cleanup is not disrupted. Geo data is
-loaded from a binary `geo.sgeo` cache in `cache_dir`, with an embedded empty
-snapshot as the startup fallback. By default, geo refresh is disabled at runtime
-so container deployments use the cache built into the image.
+CIDR allow/deny checks, listener-scoped geo country checks, threat-intel CIDR
+checks, raw packet flood limits, packet and parse-error rate limits,
+fail2ban-style dynamic bans, invalid start-line prefiltering, and
+`REGISTER`/`INVITE` SIP identity limits. `ACK` and `CANCEL` are not
+SIP-rate-limited so transaction cleanup is not disrupted. Geo data is loaded
+from a binary `geo.sgeo` cache in `cache_dir`; threat intel is loaded from
+`threat.sthr`. Both use an embedded empty snapshot as the startup fallback. By
+default, runtime refresh is disabled so container deployments use the caches
+built into the image.
+
+`[proxy.security.flood]` is a raw packet flood guard applied before SIP method
+rate limits. It is listener-scoped and source-IP based. XDP already offloads the
+existing packet token bucket for traffic targeting configured SIP listeners;
+separate SYN/ACK/ICMP classification requires additional BPF policy maps and is
+tracked as the next XDP expansion.
 
 When `require_registered_invite_source = true`, initial `INVITE` requests from
 client-side peers must use a From AoR that has an active REGISTER binding, and
@@ -380,14 +403,22 @@ Build or preseed the binary geo cache with:
 sigproxy geo-cache build --countries all --output /var/lib/sigproxy-rs/geo/geo.sgeo --retries 3 --allow-partial
 ```
 
-The Dockerfile downloads and builds the full geo cache at image build time by
-default (`GEO_COUNTRIES=all`, `GEO_RETRIES=3`, `GEO_ALLOW_PARTIAL=true`). A
-temporary failure for one country is skipped with a warning so the image can
-still embed the countries that were fetched successfully. Runtime startup does
-not download geo data unless `startup_refresh = "background"` or `"blocking"` is
-explicitly configured. When runtime refresh is enabled, `request_retries` and
-`allow_partial` apply to the refresh path as well, so transient ipdeny failures
-do not have to block the whole snapshot.
+Build or preseed the binary threat-intel cache with the built-in IPSum and
+Spamhaus DROP sources:
+
+```bash
+sigproxy threat-cache build --output /var/lib/sigproxy-rs/threat/threat.sthr --retries 3 --allow-partial
+```
+
+The Dockerfile downloads and builds the full geo cache and default threat cache
+at image build time by default (`GEO_COUNTRIES=all`, `GEO_RETRIES=3`,
+`GEO_ALLOW_PARTIAL=true`, `THREAT_CACHE=true`, `THREAT_RETRIES=3`,
+`THREAT_ALLOW_PARTIAL=true`). A temporary failure for one country or source is
+skipped with a warning so the image can still embed the entries that were
+fetched successfully. Runtime startup does not download geo or threat data
+unless `startup_refresh = "background"` or `"blocking"` is explicitly
+configured. When runtime refresh is enabled, `request_retries` and
+`allow_partial` apply to the refresh path as well.
 
 `all` expands to country and territory zones only; ipdeny aggregate zones such
 as `AP` and `EU` are intentionally excluded because they overlap concrete
@@ -408,8 +439,9 @@ docker build --build-arg GEO_COUNTRIES= -t sigproxy-rs .
 
 When `[proxy.security.xdp]` is enabled, the Docker image also builds and ships
 `/usr/local/share/sigproxy/sigproxy_xdp.o`. XDP offloads listener-scoped dynamic
-IP blocklists, CIDR allow/deny rules, geo country allow/deny rules generated
-from `geo.sgeo`, and per-source-IP packet token buckets. SIP semantic checks
+IP blocklists, CIDR allow/deny rules, threat-intel CIDRs, geo country
+allow/deny rules generated from `geo.sgeo`, and per-source-IP packet token
+buckets. SIP semantic checks
 such as REGISTER/INVITE AoR limits and registered-INVITE-source policy remain
 in user space. XDP drop/pass counters are exposed as
 `proxy_xdp_packets_total{action="..."}`. The userspace control plane loads,

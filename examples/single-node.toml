@@ -54,12 +54,28 @@ allow_partial = true
 [proxy.security.geo.deny]
 countries = []
 
+[proxy.security.threat_intel]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/threat"
+startup_refresh = "disabled"
+fail_open = true
+request_retries = 3
+allow_partial = true
+
 [proxy.security.dynamic_ban]
 enabled = true
 ban_seconds = 3600
 invalid_packets_per_minute = 30
 parse_errors_per_minute = 20
 sip_rate_violations_per_minute = 10
+
+[proxy.security.flood]
+enabled = true
+udp_packets_per_second = 200
+udp_burst = 400
+tcp_packets_per_second = 200
+tcp_burst = 400
+block_seconds = 300
 
 [proxy.security.sip_policy]
 require_registered_invite_source = true
@@ -73,6 +89,7 @@ fail_open = true
 sync_dynamic_ban = true
 cidr_filter = true
 geo_filter = true
+threat_intel = true
 ip_rate_limit = true
 
 [[proxy.upstream_groups]]

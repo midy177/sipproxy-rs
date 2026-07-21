@@ -2,6 +2,7 @@ use crate::config::{
     EffectiveProxySecurityConfig, ProxyConfig, ProxyGeoUnknownCountryPolicy, SipTransport,
 };
 use crate::proxy::geo::GeoRuntime;
+use crate::proxy::threat::ThreatRuntime;
 use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
 use aya::{
@@ -117,6 +118,7 @@ struct XdpListenerPolicySpec {
     trusted_cidrs: Vec<XdpCidrPrefix>,
     allow_cidrs: Vec<XdpCidrPrefix>,
     deny_cidrs: Vec<XdpCidrPrefix>,
+    threat_intel: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,7 +134,11 @@ enum XdpBackend {
 }
 
 impl XdpRuntime {
-    pub fn new(config: &ProxyConfig, geo: Option<&Arc<GeoRuntime>>) -> Result<Self> {
+    pub fn new(
+        config: &ProxyConfig,
+        geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
+    ) -> Result<Self> {
         let mut requested = false;
         let mut fail_closed = false;
         let mut sync_dynamic_ban = false;
@@ -156,7 +162,7 @@ impl XdpRuntime {
         }
 
         let backend = if requested {
-            match XdpBackend::attach(&interfaces, &listeners, geo, detach_stale) {
+            match XdpBackend::attach(&interfaces, &listeners, geo, threat, detach_stale) {
                 Ok(backend) => backend,
                 Err(err) if fail_closed => {
                     return Err(err.context("proxy.security.xdp is enabled with fail_open=false"));
@@ -255,11 +261,15 @@ impl XdpRuntime {
         }
     }
 
-    pub fn sync_static_policy(&self, geo: Option<&Arc<GeoRuntime>>) {
+    pub fn sync_static_policy(
+        &self,
+        geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
+    ) {
         let Some(backend) = &self.backend else {
             return;
         };
-        if let Err(err) = backend.sync_static_policy(geo) {
+        if let Err(err) = backend.sync_static_policy(geo, threat) {
             warn!(
                 error = %format!("{err:#}"),
                 "failed to sync XDP static policy maps"
@@ -383,6 +393,7 @@ impl XdpListenerPolicySpec {
                 set_country_bit(&mut geo_deny, country)?;
             }
         }
+        let threat_intel = security.xdp.threat_intel && security.threat_intel.enabled;
 
         let mut packets_per_second = 0_u32;
         let mut burst = 0_u32;
@@ -408,6 +419,7 @@ impl XdpListenerPolicySpec {
             trusted_cidrs,
             allow_cidrs,
             deny_cidrs,
+            threat_intel,
         })
     }
 }
@@ -477,9 +489,10 @@ impl XdpBackend {
         interfaces: &BTreeSet<String>,
         listeners: &[XdpListenerSpec],
         geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
         detach_stale: bool,
     ) -> Result<Option<Self>> {
-        attach_backend(interfaces, listeners, geo, detach_stale)
+        attach_backend(interfaces, listeners, geo, threat, detach_stale)
     }
 
     async fn sync_ip_block(&self, listener_key: &str, ip: IpAddr) -> Result<()> {
@@ -515,15 +528,19 @@ impl XdpBackend {
         }
     }
 
-    fn sync_static_policy(&self, geo: Option<&Arc<GeoRuntime>>) -> Result<()> {
+    fn sync_static_policy(
+        &self,
+        geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
+    ) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = geo;
+            let _ = (geo, threat);
             Ok(())
         }
         #[cfg(target_os = "linux")]
         match self {
-            Self::Aya(backend) => backend.sync_static_policy(geo),
+            Self::Aya(backend) => backend.sync_static_policy(geo, threat),
         }
     }
 }
@@ -533,6 +550,7 @@ fn attach_backend(
     _interfaces: &BTreeSet<String>,
     _listeners: &[XdpListenerSpec],
     _geo: Option<&Arc<GeoRuntime>>,
+    _threat: Option<&Arc<ThreatRuntime>>,
     _detach_stale: bool,
 ) -> Result<Option<XdpBackend>> {
     bail!("XDP kernel offload is only supported on Linux")
@@ -543,12 +561,14 @@ fn attach_backend(
     interfaces: &BTreeSet<String>,
     listeners: &[XdpListenerSpec],
     geo: Option<&Arc<GeoRuntime>>,
+    threat: Option<&Arc<ThreatRuntime>>,
     detach_stale: bool,
 ) -> Result<Option<XdpBackend>> {
     Ok(Some(XdpBackend::Aya(AyaXdpBackend::attach(
         interfaces,
         listeners,
         geo,
+        threat,
         detach_stale,
     )?)))
 }
@@ -673,6 +693,7 @@ impl AyaXdpBackend {
         interfaces: &BTreeSet<String>,
         listeners: &[XdpListenerSpec],
         geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
         detach_stale: bool,
     ) -> Result<Self> {
         ensure_bpffs_dirs()?;
@@ -709,7 +730,7 @@ impl AyaXdpBackend {
         };
         backend.clear_dynamic_blocklist()?;
         info!("syncing initial XDP static policy maps");
-        backend.sync_static_policy(geo)?;
+        backend.sync_static_policy(geo, threat)?;
         let resolved_interfaces = resolve_interfaces(interfaces)?;
         info!(
             interfaces = %resolved_interfaces.join(","),
@@ -741,12 +762,19 @@ impl AyaXdpBackend {
         Ok(())
     }
 
-    fn sync_static_policy(&self, geo: Option<&Arc<GeoRuntime>>) -> Result<()> {
+    fn sync_static_policy(
+        &self,
+        geo: Option<&Arc<GeoRuntime>>,
+        threat: Option<&Arc<ThreatRuntime>>,
+    ) -> Result<()> {
         let started = StdInstant::now();
         let geo_prefixes = geo
             .map(|runtime| runtime.xdp_prefixes())
             .unwrap_or_default();
-        let plan = self.build_static_sync_plan(&geo_prefixes)?;
+        let threat_prefixes = threat
+            .map(|runtime| runtime.xdp_prefixes())
+            .unwrap_or_default();
+        let plan = self.build_static_sync_plan(&geo_prefixes, &threat_prefixes)?;
         {
             let current = self
                 .static_state
@@ -756,6 +784,7 @@ impl AyaXdpBackend {
                 debug!(
                     listeners = self.listeners.len(),
                     geo_prefixes = geo_prefixes.len(),
+                    threat_prefixes = threat_prefixes.len(),
                     fingerprint = plan.fingerprint,
                     "XDP static policy maps unchanged; skipping sync"
                 );
@@ -765,6 +794,7 @@ impl AyaXdpBackend {
         info!(
             listeners = self.listeners.len(),
             geo_prefixes = geo_prefixes.len(),
+            threat_prefixes = threat_prefixes.len(),
             "XDP static policy sync started"
         );
         {
@@ -809,6 +839,13 @@ impl AyaXdpBackend {
                     let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
                     deny_cidrs.insert(&key, XdpCidrValue { enabled: 1 }, 0)?;
                 }
+                if spec.policy.threat_intel {
+                    for prefix in &threat_prefixes {
+                        let key =
+                            make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
+                        deny_cidrs.insert(&key, XdpCidrValue { enabled: 1 }, 0)?;
+                    }
+                }
                 if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
                     for (index, prefix) in geo_prefixes.iter().enumerate() {
                         let key =
@@ -837,6 +874,7 @@ impl AyaXdpBackend {
         info!(
             listeners = self.listeners.len(),
             geo_prefixes = geo_prefixes.len(),
+            threat_prefixes = threat_prefixes.len(),
             elapsed_ms = started.elapsed().as_millis(),
             "XDP static policy maps synced"
         );
@@ -846,6 +884,7 @@ impl AyaXdpBackend {
     fn build_static_sync_plan(
         &self,
         geo_prefixes: &[crate::proxy::geo::GeoIpPrefix],
+        threat_prefixes: &[crate::proxy::threat::ThreatIpPrefix],
     ) -> Result<XdpStaticPlan> {
         let mut keys = XdpStaticKeys::default();
         let mut hasher = DefaultHasher::new();
@@ -869,6 +908,14 @@ impl AyaXdpBackend {
             for cidr in &spec.policy.deny_cidrs {
                 let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
                 keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
+            }
+            if spec.policy.threat_intel {
+                for prefix in threat_prefixes {
+                    prefix.addr.hash(&mut hasher);
+                    prefix.prefix.hash(&mut hasher);
+                    let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
+                    keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
+                }
             }
             if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
                 for prefix in geo_prefixes {
@@ -1315,6 +1362,7 @@ mod tests {
                 ..ProxyConfig::default()
             },
             None,
+            None,
         )
         .unwrap();
 
@@ -1345,6 +1393,7 @@ mod tests {
                 },
                 ..ProxyConfig::default()
             },
+            None,
             None,
         )
         .unwrap();
@@ -1409,7 +1458,9 @@ mod tests {
                 deny_countries: vec!["RU".to_string()],
                 ..EffectiveProxyGeoSecurityConfig::default()
             },
+            threat_intel: Default::default(),
             dynamic_ban: Default::default(),
+            flood: Default::default(),
             ip_rate_limit: EffectiveProxyIpRateLimitConfig {
                 enabled: true,
                 packets_per_second: 50,
@@ -1432,6 +1483,7 @@ mod tests {
                 sync_dynamic_ban: true,
                 cidr_filter: true,
                 geo_filter: true,
+                threat_intel: true,
                 ip_rate_limit: true,
             },
         })

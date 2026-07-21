@@ -131,12 +131,51 @@ preset = "off"
 # ship a prebuilt /var/lib/sigproxy-rs/geo/geo.sgeo. Enable "background" only
 # when the running process should refresh geo data after startup.
 #
+# [proxy.security.threat_intel]
+# enabled = false
+# cache_dir = "/var/lib/sigproxy-rs/threat"
+# refresh_interval_seconds = 86400
+# startup_refresh = "disabled" # "disabled", "background", or "blocking"
+# fail_open = true
+# request_timeout_seconds = 10
+# request_retries = 3
+# allow_partial = true
+#
+# Sources are optional. When omitted, sigproxy uses built-in IPSum and
+# Spamhaus DROP feeds. Configure sources only when you want to replace that
+# default set.
+# [[proxy.security.threat_intel.sources]]
+# name = "ipsum"
+# url = "https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt"
+# format = "ipsum" # "cidr", "ips", "ipsum", or "spamhaus-drop"
+# min_score = 3
+# enabled = true
+#
+# [[proxy.security.threat_intel.sources]]
+# name = "spamhaus-drop"
+# url = "https://www.spamhaus.org/drop/drop.txt"
+# format = "spamhaus-drop"
+# enabled = true
+#
+# Threat intel uses a binary cache named threat.sthr inside cache_dir. Container
+# images can ship a prebuilt /var/lib/sigproxy-rs/threat/threat.sthr. Runtime
+# network refresh happens only when startup_refresh is "background" or
+# "blocking".
+#
 # [proxy.security.dynamic_ban]
 # enabled = true
 # ban_seconds = 3600
 # invalid_packets_per_minute = 30
 # parse_errors_per_minute = 20
 # sip_rate_violations_per_minute = 10
+#
+# [proxy.security.flood]
+# enabled = false
+# udp_packets_per_second = 200
+# udp_burst = 400
+# tcp_packets_per_second = 200
+# tcp_burst = 400
+# block_seconds = 300
 #
 # [proxy.security.ip_rate_limit]
 # packets_per_second = 50
@@ -166,6 +205,7 @@ preset = "off"
 # sync_dynamic_ban = true
 # cidr_filter = true
 # geo_filter = true
+# threat_intel = true
 # ip_rate_limit = true
 
 [[proxy.upstream_groups]]

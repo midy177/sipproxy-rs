@@ -26,7 +26,10 @@ RUN clang -O2 -g -target bpf \
 ARG GEO_COUNTRIES="all"
 ARG GEO_RETRIES="3"
 ARG GEO_ALLOW_PARTIAL="true"
-RUN mkdir -p /etc/sigproxy /var/lib/sigproxy-rs/geo \
+ARG THREAT_CACHE="true"
+ARG THREAT_RETRIES="3"
+ARG THREAT_ALLOW_PARTIAL="true"
+RUN mkdir -p /etc/sigproxy /var/lib/sigproxy-rs/geo /var/lib/sigproxy-rs/threat \
     && if [ -n "$GEO_COUNTRIES" ]; then \
         if [ "$GEO_ALLOW_PARTIAL" = "true" ]; then GEO_PARTIAL_FLAG="--allow-partial"; else GEO_PARTIAL_FLAG=""; fi; \
         /usr/local/bin/sigproxy geo-cache build \
@@ -34,6 +37,13 @@ RUN mkdir -p /etc/sigproxy /var/lib/sigproxy-rs/geo \
             --output /var/lib/sigproxy-rs/geo/geo.sgeo \
             --retries "$GEO_RETRIES" \
             $GEO_PARTIAL_FLAG; \
+    fi \
+    && if [ "$THREAT_CACHE" = "true" ]; then \
+        if [ "$THREAT_ALLOW_PARTIAL" = "true" ]; then THREAT_PARTIAL_FLAG="--allow-partial"; else THREAT_PARTIAL_FLAG=""; fi; \
+        /usr/local/bin/sigproxy threat-cache build \
+            --output /var/lib/sigproxy-rs/threat/threat.sthr \
+            --retries "$THREAT_RETRIES" \
+            $THREAT_PARTIAL_FLAG; \
     fi
 
 ENTRYPOINT ["/usr/local/bin/sigproxy"]
