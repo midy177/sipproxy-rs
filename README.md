@@ -419,12 +419,14 @@ sigproxy threat-cache build --output /var/lib/sigproxy-rs/threat/threat.sthr --r
 The Dockerfile downloads and builds the full geo cache and default threat cache
 at image build time by default (`GEO_COUNTRIES=all`, `GEO_RETRIES=3`,
 `GEO_ALLOW_PARTIAL=true`, `THREAT_CACHE=true`, `THREAT_RETRIES=3`,
-`THREAT_ALLOW_PARTIAL=true`). A temporary failure for one country or source is
-skipped with a warning so the image can still embed the entries that were
-fetched successfully. Runtime startup does not download geo or threat data
-unless `startup_refresh = "background"` or `"blocking"` is explicitly
-configured. When runtime refresh is enabled, `request_retries` and
-`allow_partial` apply to the refresh path as well.
+`THREAT_ALLOW_PARTIAL=true`). Cache prefetch is fail-open by default
+(`GEO_FAIL_OPEN=true`, `THREAT_FAIL_OPEN=true`): temporary upstream failures log
+a build warning and continue without blocking the image. Set either build arg to
+`false` when the image must contain a fresh cache or fail the build. Runtime
+startup does not download geo or threat data unless
+`startup_refresh = "background"` or `"blocking"` is explicitly configured. When
+runtime refresh is enabled, `request_retries` and `allow_partial` apply to the
+refresh path as well.
 
 `all` expands to country and territory zones only; ipdeny aggregate zones such
 as `AP` and `EU` are intentionally excluded because they overlap concrete

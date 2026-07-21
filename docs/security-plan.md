@@ -95,8 +95,11 @@ docker build -t sigproxy-rs .
 
 The Dockerfile defaults `GEO_COUNTRIES=all`, so image builds preseed the geo
 cache unless `--build-arg GEO_COUNTRIES=` is passed. It also defaults
-`GEO_RETRIES=3` and `GEO_ALLOW_PARTIAL=true`, so transient failures for a single
-country are skipped with a warning instead of failing the whole image build.
+`GEO_RETRIES=3` and `GEO_ALLOW_PARTIAL=true`. Build-time cache prefetch is
+fail-open by default (`GEO_FAIL_OPEN=true`, `THREAT_FAIL_OPEN=true`), so
+temporary upstream failures log a warning and do not block the image build. Set
+the matching build arg to `false` for fail-closed release builds that must embed
+a fresh cache.
 `all` excludes ipdeny aggregate zones such as `AP` and `EU` because those
 regional ranges overlap concrete countries.
 
