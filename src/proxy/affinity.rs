@@ -76,6 +76,15 @@ impl AffinityTable {
             .find_map(|key| bindings.get(key).map(|binding| binding.target)))
     }
 
+    pub async fn lookup_key(&self, key: &AffinityKey) -> Option<AffinityTarget> {
+        if !self.config.enabled {
+            return None;
+        }
+        let mut bindings = self.bindings.lock().await;
+        prune_affinity(&mut bindings, Instant::now());
+        bindings.get(key).map(|binding| binding.target)
+    }
+
     pub async fn remember(
         &self,
         message: &SipMessage,
@@ -104,6 +113,29 @@ impl AffinityTable {
             bindings.insert(key, AffinityBinding { target, expires_at });
         }
         Ok(snapshots)
+    }
+
+    pub async fn remember_key(
+        &self,
+        key: AffinityKey,
+        target: AffinityTarget,
+        ttl: Duration,
+    ) -> Vec<AffinityBindingSnapshot> {
+        if !self.config.enabled || ttl.is_zero() {
+            return Vec::new();
+        }
+        let expires_at = Instant::now() + ttl;
+        let expires_at_epoch_ms = now_epoch_ms() + ttl.as_millis();
+        let snapshot = AffinityBindingSnapshot {
+            key: key.clone(),
+            target,
+            expires_at_epoch_ms,
+        };
+        self.bindings
+            .lock()
+            .await
+            .insert(key, AffinityBinding { target, expires_at });
+        vec![snapshot]
     }
 
     pub async fn snapshot(&self) -> AffinityStateSnapshot {

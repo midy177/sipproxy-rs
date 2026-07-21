@@ -6,12 +6,12 @@ use crate::config::{
 };
 use crate::ha::HaStateSnapshot;
 use crate::persistence::{HaEventPayload, HaEventRecord, HaEventsResponse, Persistence};
-use crate::proxy::affinity::{AffinityTable, AffinityTarget};
+use crate::proxy::affinity::{AffinityKey, AffinityTable, AffinityTarget};
 use crate::proxy::geo::{GeoDecision, GeoPolicy, GeoRuntime, evaluate_geo_policy};
 use crate::proxy::metrics::ProxyMetrics;
 use crate::proxy::registry::{
     extract_aor, extract_contact, extract_expires, extract_from_aor,
-    extract_response_contact_expires,
+    extract_response_contact_expires, extract_to_aor,
 };
 use crate::proxy::routing::RouteTable;
 use crate::proxy::xdp::XdpRuntime;
@@ -1294,7 +1294,14 @@ impl ProxyServer {
             || request_uri_targets_this_proxy
             || (from_trusted_peer && route_set_targets_this_proxy)
         {
-            if let Some(binding) = self.lookup_registration_binding(&request_uri).await {
+            if let Some(binding) = self
+                .lookup_delivery_registration_binding(
+                    &message,
+                    &request_uri,
+                    from_upstream || (from_trusted_peer && route_set_targets_this_proxy),
+                )
+                .await
+            {
                 self.record_affinity_lookup("location-hit");
                 target_for_registration_binding(&binding, listener.transport)
                     .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
@@ -1319,6 +1326,12 @@ impl ProxyServer {
                 self.record_affinity_lookup("miss");
                 self.select_upstream(&request_uri, listener)
             }
+        } else if let Some(target) = self
+            .lookup_registered_upstream_target(&message, &request_uri)
+            .await
+        {
+            self.record_affinity_lookup("registered-upstream-hit");
+            target
         } else if let Some(target) = self.affinity.lookup(&message).await? {
             let target = UpstreamTarget {
                 addr: target.addr,
@@ -1370,12 +1383,15 @@ impl ProxyServer {
         }
         if method == "REGISTER" {
             let pending_register = match self.config.proxy.effective_register_routing() {
-                RegisterRoutingMode::ContactRewrite => {
-                    self.rewrite_register_contact_and_pending(&mut message, &via_host, _peer)?
-                }
+                RegisterRoutingMode::ContactRewrite => self.rewrite_register_contact_and_pending(
+                    &mut message,
+                    &via_host,
+                    _peer,
+                    target,
+                )?,
                 RegisterRoutingMode::Path => {
                     let pending =
-                        self.register_contact_routes_pending(&message, &via_host, _peer)?;
+                        self.register_contact_routes_pending(&message, &via_host, _peer, target)?;
                     message.prepend_header("Path", format!("<sip:{via_host};lr>"));
                     pending
                 }
@@ -1641,11 +1657,56 @@ impl ProxyServer {
         None
     }
 
+    async fn lookup_delivery_registration_binding(
+        &self,
+        message: &SipMessage,
+        request_uri: &str,
+        allow_to_aor_fallback: bool,
+    ) -> Option<ContactBinding> {
+        if let Some(binding) = self.lookup_registration_binding(request_uri).await {
+            return Some(binding);
+        }
+        if !allow_to_aor_fallback {
+            return None;
+        }
+        let Ok(to_aor) = extract_to_aor(message) else {
+            return None;
+        };
+        self.lookup_registration_binding(&to_aor).await
+    }
+
+    async fn lookup_registered_upstream_target(
+        &self,
+        message: &SipMessage,
+        request_uri: &str,
+    ) -> Option<UpstreamTarget> {
+        if message.method()? != "INVITE" || !is_initial_invite_request(message) {
+            return None;
+        }
+        for route in registered_upstream_lookup_keys(message, request_uri) {
+            let key = registration_upstream_affinity_key(&route);
+            let Some(target) = self.affinity.lookup_key(&key).await else {
+                continue;
+            };
+            let target = UpstreamTarget {
+                addr: target.addr,
+                transport: target.transport,
+            };
+            if self.is_healthy_upstream_target(target) {
+                return Some(target);
+            }
+            self.record_affinity_lookup("registered-upstream-unhealthy");
+            return None;
+        }
+        None
+    }
+
     fn rewrite_register_contact_and_pending(
         &self,
         message: &mut SipMessage,
         via_host: &str,
         peer: SocketAddr,
+        target: UpstreamTarget,
     ) -> Result<Option<PendingRegister>> {
         let aor = extract_aor(message).ok();
         let original_contact = extract_contact(message).ok().flatten();
@@ -1675,7 +1736,7 @@ impl ProxyServer {
                 },
             );
         }
-        Ok(pending_register(bindings, expires))
+        Ok(pending_register(bindings, expires, target))
     }
 
     fn register_contact_routes_pending(
@@ -1683,6 +1744,7 @@ impl ProxyServer {
         message: &SipMessage,
         via_host: &str,
         peer: SocketAddr,
+        target: UpstreamTarget,
     ) -> Result<Option<PendingRegister>> {
         let expires = extract_expires(message);
         let mut first_contact = None;
@@ -1704,7 +1766,7 @@ impl ProxyServer {
                 },
             );
         }
-        Ok(pending_register(bindings, expires))
+        Ok(pending_register(bindings, expires, target))
     }
 
     fn record_forwarded_request(
@@ -1916,11 +1978,25 @@ impl ProxyServer {
         }
 
         let expires = extract_response_contact_expires(response).unwrap_or(pending.request_expires);
+        let mut upstream_affinity_bindings = Vec::new();
         for binding in pending.bindings {
             if expires.is_zero() {
                 self.submit_cluster_command(ClusterCommand::UnregisterContact { aor: binding.aor })
                     .await;
             } else {
+                let key = registration_upstream_affinity_key(&binding.aor);
+                upstream_affinity_bindings.extend(
+                    self.affinity
+                        .remember_key(
+                            key,
+                            AffinityTarget {
+                                addr: pending.target.addr,
+                                transport: pending.target.transport,
+                            },
+                            expires,
+                        )
+                        .await,
+                );
                 self.submit_cluster_command(ClusterCommand::RegisterContact(ContactBinding {
                     aor: binding.aor,
                     contact: binding.contact,
@@ -1929,6 +2005,16 @@ impl ProxyServer {
                 }))
                 .await;
             }
+        }
+        if let Some(persistence) = &self.persistence
+            && let Err(err) = persistence
+                .upsert_affinity_bindings(upstream_affinity_bindings)
+                .await
+        {
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to persist REGISTER upstream affinity bindings"
+            );
         }
     }
 
@@ -2145,6 +2231,7 @@ struct InviteTransactionRoute {
 struct PendingRegister {
     bindings: Vec<PendingRegisterBinding>,
     request_expires: Duration,
+    target: UpstreamTarget,
     created_at: Instant,
 }
 
@@ -4088,6 +4175,36 @@ fn registered_invite_source_matches(
     }
 }
 
+fn registration_upstream_affinity_key(route: &str) -> AffinityKey {
+    AffinityKey::from_string(format!("registration-upstream:{route}"))
+}
+
+fn registered_upstream_lookup_keys(message: &SipMessage, request_uri: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Ok(to_aor) = extract_to_aor(message) {
+        for key in registration_route_keys(&to_aor) {
+            push_unique_key(&mut keys, key);
+        }
+    }
+    for key in registration_route_keys(request_uri) {
+        push_unique_key(&mut keys, key);
+    }
+    keys
+}
+
+fn is_initial_invite_request(message: &SipMessage) -> bool {
+    let Some(request) = message.as_request() else {
+        return false;
+    };
+    let Ok(to_header) = request.to_header() else {
+        return false;
+    };
+    match rsipstack::sip::typed::To::parse(to_header.value()) {
+        Ok(to) => to.tag().is_none(),
+        Err(_) => false,
+    }
+}
+
 fn registration_route_keys(route: &str) -> Vec<String> {
     let mut keys = Vec::new();
     push_unique_key(&mut keys, route.trim().to_string());
@@ -4120,10 +4237,12 @@ fn collect_contact_route_bindings(
 fn pending_register(
     bindings: Vec<PendingRegisterBinding>,
     request_expires: Duration,
+    target: UpstreamTarget,
 ) -> Option<PendingRegister> {
     (!bindings.is_empty()).then_some(PendingRegister {
         bindings,
         request_expires,
+        target,
         created_at: Instant::now(),
     })
 }
@@ -5753,6 +5872,81 @@ Content-Length: 0\r\n\r\n",
     }
 
     #[tokio::test]
+    async fn downstream_invite_routes_to_upstream_that_registered_callee() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let first_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let second_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstreams(vec![
+            first_upstream.local_addr().unwrap(),
+            second_upstream.local_addr().unwrap(),
+        ]);
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-3001-upstream\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-3001-upstream\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            first_upstream.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_client_socket.recv_from(&mut buf).await.unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"INVITE sip:3001@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-downstream-invite-callee-upstream\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: downstream-invite-callee-upstream\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                "127.0.0.1:5061".parse().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = first_upstream.recv_from(&mut buf).await.unwrap();
+        let forwarded_invite = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded_invite.starts_with("INVITE sip:3001@example.com SIP/2.0"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                second_upstream.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn proxy_address_request_uri_from_pbx_alias_routes_to_registered_location() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -5908,6 +6102,86 @@ Content-Length: 0\r\n\r\n"
             timeout(
                 Duration::from_millis(100),
                 contact_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_route_set_uses_to_aor_when_request_uri_contact_is_not_registered() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_source_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let stale_contact_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let registered_source_addr = registered_source_socket.local_addr().unwrap();
+        let stale_contact_addr = stale_contact_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_source_addr};branch=z9hG4bK-register-3001-to-aor;rport\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_source_addr}>;expires=60\r\n\
+Call-ID: register-3001-to-aor\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_source_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_source_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_source_socket.recv_from(&mut buf).await.unwrap();
+
+        let invite = format!(
+            "INVITE sip:3001@{stale_contact_addr};ob SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP {upstream};branch=z9hG4bK-upstream-to-aor\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: upstream-to-aor-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3000@example.com>\r\n\
+Content-Length: 0\r\n\r\n",
+            upstream = upstream_socket.local_addr().unwrap()
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = registered_source_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with(&format!("INVITE sip:3001@{stale_contact_addr};ob SIP/2.0")));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                stale_contact_socket.recv_from(&mut buf)
             )
             .await
             .is_err()

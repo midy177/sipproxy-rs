@@ -33,6 +33,14 @@ pub fn extract_from_aor(message: &SipMessage) -> Result<String> {
     Ok(from.uri.to_string())
 }
 
+pub fn extract_to_aor(message: &SipMessage) -> Result<String> {
+    let request = message
+        .as_request()
+        .context("To parsing requires a SIP request")?;
+    let to = rsipstack::sip::typed::To::parse(request.to_header()?.value())?;
+    Ok(to.uri.to_string())
+}
+
 pub fn extract_expires(message: &SipMessage) -> Duration {
     let Some(request) = message.as_request() else {
         return Duration::from_secs(3600);
@@ -81,6 +89,7 @@ CSeq: 1 REGISTER\r\n\r\n",
         );
         assert_eq!(extract_expires(&msg), Duration::from_secs(120));
         assert_eq!(extract_from_aor(&msg).unwrap(), "sip:100@example.com");
+        assert_eq!(extract_to_aor(&msg).unwrap(), "sip:100@example.com");
     }
 
     #[test]
