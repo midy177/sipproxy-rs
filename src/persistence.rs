@@ -98,6 +98,17 @@ impl HaPersistence {
         self.inner.required
     }
 
+    #[cfg(test)]
+    pub fn set_query_only_for_tests(&self, enabled: bool) -> Result<()> {
+        let conn = self
+            .inner
+            .conn
+            .lock()
+            .expect("HA persistence connection lock poisoned");
+        conn.pragma_update(None, "query_only", enabled)?;
+        Ok(())
+    }
+
     pub async fn load_snapshot(&self) -> Result<HaStateSnapshot> {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {

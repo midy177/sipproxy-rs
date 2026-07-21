@@ -528,7 +528,7 @@ SQLite schema 草案：
   - active REGISTER 后 standby 在一个增量周期内 lookup。
   - active affinity 写入后 standby 在一个增量周期内 lookup。
   - event log 缺口时 standby fallback snapshot 并对齐 `last_applied_seq`。
-  - event pull 失败时 SIP 转发不失败，下一次 snapshot 恢复一致。
+  - event pull 失败时 fallback snapshot 并恢复一致。
   - `required = true` 时 SQLite 写失败会拒绝写入。
 
 ### 阶段 5：生产化增强

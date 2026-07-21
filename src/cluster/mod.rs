@@ -187,6 +187,18 @@ fn now_epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HaPersistenceConfig;
+    use crate::persistence::HaPersistence;
+
+    fn test_persistence_config(path: String, required: bool) -> HaPersistenceConfig {
+        HaPersistenceConfig {
+            enabled: true,
+            path,
+            required,
+            event_retention_seconds: 3600,
+            cleanup_interval_ms: 60_000,
+        }
+    }
 
     #[tokio::test]
     async fn standalone_replicator_applies_register_and_unregister() {
@@ -244,5 +256,57 @@ mod tests {
 
         assert!(target.lookup("sip:100@example.com").await.is_some());
         assert!(target.lookup("sip:200@example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn required_persistence_failure_rejects_replicator_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = HaPersistence::open(&test_persistence_config(
+            dir.path().join("state.db").to_string_lossy().to_string(),
+            true,
+        ))
+        .unwrap()
+        .unwrap();
+        persistence.set_query_only_for_tests(true).unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = StandaloneReplicator::new(state.clone(), Some(persistence));
+
+        let result = replicator
+            .submit(ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:required@example.com".to_string(),
+                contact: "sip:required@127.0.0.1:5062".to_string(),
+                source: "127.0.0.1:50000".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(state.lookup("sip:required@example.com").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn optional_persistence_failure_keeps_replicator_write_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = HaPersistence::open(&test_persistence_config(
+            dir.path().join("state.db").to_string_lossy().to_string(),
+            false,
+        ))
+        .unwrap()
+        .unwrap();
+        persistence.set_query_only_for_tests(true).unwrap();
+        let state = Arc::new(SharedState::default());
+        let replicator = StandaloneReplicator::new(state.clone(), Some(persistence));
+
+        replicator
+            .submit(ClusterCommand::RegisterContact(ContactBinding {
+                aor: "sip:optional@example.com".to_string(),
+                contact: "sip:optional@127.0.0.1:5062".to_string(),
+                source: "127.0.0.1:50000".to_string(),
+                expires_at_epoch_ms: expires_at(Duration::from_secs(60)),
+            }))
+            .await
+            .unwrap();
+
+        assert!(state.lookup("sip:optional@example.com").await.is_some());
     }
 }
