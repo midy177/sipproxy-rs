@@ -1157,12 +1157,12 @@ impl ProxyServer {
                 self.record_forwarded_request("udp", target.transport, Some(method));
                 self.forward_udp_to_tcp_upstream(
                     socket,
-                    message.to_bytes(),
+                    message,
                     peer,
                     target.addr,
                     branch,
                     invite_transaction_key,
-                    method.to_string(),
+                    method,
                 )
                 .await
             }
@@ -1172,16 +1172,17 @@ impl ProxyServer {
     async fn forward_udp_to_tcp_upstream(
         &self,
         socket: &UdpSocket,
-        packet: Vec<u8>,
+        message: SipMessage,
         client_peer: SocketAddr,
         upstream: SocketAddr,
         branch: String,
         invite_transaction_key: Option<String>,
-        method: String,
+        method: &str,
     ) -> Result<()> {
+        let packet = message.to_bytes();
         let mut responses = match self
             .tcp_upstreams
-            .send_request(upstream, branch.clone(), packet.clone())
+            .send_request(upstream, &branch, &packet)
             .await
         {
             Ok(responses) => responses,
@@ -1194,15 +1195,8 @@ impl ProxyServer {
             addr: upstream,
             transport: SipTransport::Tcp,
         };
-        let message = SipMessage::parse(&packet)?;
-        self.remember_successful_forward(
-            &message,
-            target,
-            &branch,
-            invite_transaction_key,
-            method.as_str(),
-        )
-        .await;
+        self.remember_successful_forward(&message, target, &branch, invite_transaction_key, method)
+            .await;
 
         self.send_udp_to_tcp_responses(
             socket,
@@ -1210,7 +1204,7 @@ impl ProxyServer {
             client_peer,
             upstream,
             &branch,
-            method.as_str(),
+            method,
         )
         .await
     }
@@ -1227,9 +1221,10 @@ impl ProxyServer {
             .prepare_forward(message, peer, listener, method)
             .await?;
         self.record_forwarded_request("tcp", target.transport, Some(method));
+        let packet = message.to_bytes();
         let mut responses = match self
             .tcp_upstreams
-            .send_request(target.addr, branch.clone(), message.to_bytes())
+            .send_request(target.addr, &branch, &packet)
             .await
         {
             Ok(responses) => responses,
@@ -2961,16 +2956,13 @@ impl TcpUpstreamPool {
     async fn send_request(
         &self,
         target: SocketAddr,
-        branch: String,
-        packet: Vec<u8>,
+        branch: &str,
+        packet: &[u8],
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         let mut last_error = None;
         for _ in 0..2 {
             let connection = self.get_or_connect(target).await?;
-            match connection
-                .send_request(branch.clone(), packet.clone())
-                .await
-            {
+            match connection.send_request(branch, packet).await {
                 Ok(responses) => return Ok(responses),
                 Err(err) => {
                     last_error = Some(err);
@@ -3062,8 +3054,8 @@ impl TcpUpstreamConnection {
 
     async fn send_request(
         &self,
-        branch: String,
-        packet: Vec<u8>,
+        branch: &str,
+        packet: &[u8],
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         if !self.is_alive() {
             bail!("upstream SIP TCP connection {} is closed", self.target);
@@ -3074,7 +3066,7 @@ impl TcpUpstreamConnection {
             let mut branches = self.branches.lock().await;
             prune_tcp_branches(&mut branches, Instant::now());
             branches.insert(
-                branch.clone(),
+                branch.to_string(),
                 TcpBranchRoute {
                     tx,
                     created_at: Instant::now(),
@@ -3089,7 +3081,7 @@ impl TcpUpstreamConnection {
         .await
         .context("upstream SIP TCP write timed out")?;
         if let Err(err) = write_result {
-            self.branches.lock().await.remove(&branch);
+            self.branches.lock().await.remove(branch);
             self.alive.store(false, Ordering::Relaxed);
             return Err(err).context("failed to write SIP request to upstream TCP connection");
         }
