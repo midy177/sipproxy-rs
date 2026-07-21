@@ -569,7 +569,7 @@ async fn pull_ha_events(
     request_timeout: Duration,
     server: Arc<ProxyServer>,
 ) -> Result<HaEventPullOutcome> {
-    if !server.has_ha_persistence() {
+    if !server.has_persistence() {
         return Ok(HaEventPullOutcome::SnapshotRequired);
     }
     let after = server.last_applied_ha_event_seq().await;

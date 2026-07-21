@@ -472,6 +472,14 @@ cover UDP branch routes, TCP upstream connections, TCP branch routes, INVITE
 transaction routes, affinity bindings, location bindings, and per-upstream
 health state with consecutive success/failure counters.
 
+When `[persistence]` is enabled, metrics also expose
+`proxy_persistence_latest_event_seq`, `proxy_persistence_last_applied_seq`,
+`proxy_persistence_event_rows`, `proxy_persistence_event_lag`,
+`proxy_persistence_event_appends_total`, and
+`proxy_persistence_sqlite_write_failures_total`. Active-standby replication
+pulls are tracked separately with `proxy_ha_event_pulls_total`,
+`proxy_ha_snapshot_pulls_total`, and `proxy_ha_snapshot_fallbacks_total`.
+
 ## Benchmark
 
 See [docs/benchmark.md](docs/benchmark.md).

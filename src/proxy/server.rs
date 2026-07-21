@@ -112,7 +112,7 @@ impl ProxyServer {
         &self.config
     }
 
-    pub fn has_ha_persistence(&self) -> bool {
+    pub fn has_persistence(&self) -> bool {
         self.persistence.is_some()
     }
 
@@ -248,7 +248,7 @@ impl ProxyServer {
         info!(
             contacts = contact_count,
             affinity_bindings = affinity_count,
-            "restored HA state from persistence"
+            "restored proxy state from persistence"
         );
         Ok(())
     }
@@ -6163,7 +6163,7 @@ Content-Length: 0\r\n\r\n",
     }
 
     #[tokio::test]
-    async fn metrics_reports_ha_persistence_and_replication_counters() {
+    async fn metrics_reports_persistence_and_ha_replication_counters() {
         let dir = tempfile::tempdir().unwrap();
         let persistence = Persistence::open(&PersistenceConfig {
             enabled: true,

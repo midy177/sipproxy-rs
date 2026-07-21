@@ -609,7 +609,7 @@ Active-standby 生产启用前必修：
 - INVITE lightweight transaction route 已支持 CANCEL/ACK 命中原 INVITE upstream。
 - Record-Route 已收窄到 dialog-forming 请求。
 - ACK/CANCEL/BYE/re-INVITE/UPDATE 方法级测试已补充。
-- proxy metrics 已支持 `/metrics` Prometheus text format，覆盖请求、本地响应、上游响应、转发、转发错误、affinity lookup，以及 UDP/TCP branch route、INVITE transaction route、TCP upstream connection、affinity binding、location binding 等实时 gauge。
+- proxy metrics 已支持 `/metrics` Prometheus text format，覆盖请求、本地响应、上游响应、转发、转发错误、affinity lookup，以及 UDP/TCP branch route、INVITE transaction route、TCP upstream connection、affinity binding、location binding、persistence 状态、HA 增量/快照拉取和 XDP 统计等实时 gauge/counter。
 - SIP 压测脚本已支持 UDP OPTIONS、REGISTER、INVITE 和 mock upstream，输出 RPS 与 p50/p95/p99 延迟。
 - upstream 健康检查已支持 OPTIONS 与 TCP connect 两种 probe，支持阈值、可配置成功状态码、被动失败反馈、首轮立即探测和组内并发探测；OPTIONS 请求构造使用 `rsipstack` typed Request/Header/Uri/Via API。
 - UDP downstream 转 TCP upstream 已改为复用 TCP upstream 长连接池，按 proxy branch 分发多个 INVITE provisional/final response，并确保 proxy Via transport 使用实际 upstream transport。
