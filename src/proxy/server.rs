@@ -1406,7 +1406,7 @@ impl ProxyServer {
                 RegisterRoutingMode::Path => {
                     let pending =
                         self.register_contact_routes_pending(&message, &via_host, _peer, target)?;
-                    message.prepend_header("Path", format!("<sip:{via_host};lr>"));
+                    message.prepend_path(&via_host)?;
                     pending
                 }
             };

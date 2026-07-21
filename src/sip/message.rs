@@ -1,12 +1,15 @@
 use anyhow::{Context, Result};
-use rsipstack::sip::headers::{Header, Headers};
+use rsipstack::sip::headers::{Header, Headers, untyped::Path as UntypedPath};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
     Auth, ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
     SipMessage as RsipMessage, StatusCode, Transport, Uri, Version,
     headers::{CallId, UserAgent},
     param::{Branch, Tag},
-    typed::{CSeq, Contact as TypedContact, From as FromHeader, RecordRoute, To as ToHeader, Via},
+    typed::{
+        CSeq, Contact as TypedContact, From as FromHeader, RecordRoute, Route as TypedRoute,
+        To as ToHeader, Via,
+    },
     uri::{Host, Received},
 };
 use std::net::{IpAddr, SocketAddr};
@@ -207,6 +210,14 @@ impl SipMessage {
         self.inner
             .headers_mut()
             .push_front(RecordRoute::from(uri).into());
+        Ok(())
+    }
+
+    pub fn prepend_path(&mut self, addr: &str) -> Result<()> {
+        let route = TypedRoute::parse(&format!("<sip:{addr};lr>")).context("invalid Path URI")?;
+        self.inner
+            .headers_mut()
+            .push_front(Header::Path(UntypedPath::new(route.to_string())));
         Ok(())
     }
 
@@ -622,6 +633,25 @@ CSeq: 1 OPTIONS\r\n\r\n",
         assert!(wire.contains("CSeq: 42 OPTIONS"));
         assert!(wire.contains("User-Agent: sigproxy-rs/0.1.0"));
         assert!(wire.contains("Content-Length: 0"));
+    }
+
+    #[test]
+    fn prepends_path_with_route_syntax_validation() {
+        let mut request = SipMessage::parse(
+            b"REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP client.example.com;branch=z9hG4bK-client\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        request.prepend_path("127.0.0.1:5060").unwrap();
+        let wire = String::from_utf8(request.to_bytes()).unwrap();
+
+        assert!(wire.contains("Path: <sip:127.0.0.1:5060;lr>"));
     }
 
     #[test]
