@@ -3,13 +3,14 @@ use crate::config::{
     ProxyGeoStartupRefresh,
 };
 use anyhow::{Context, Result, bail};
+use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
@@ -70,7 +71,7 @@ pub async fn build_ipdeny_cache(
 #[derive(Debug)]
 pub struct GeoRuntime {
     source: GeoSourceConfig,
-    snapshot: RwLock<Arc<GeoSnapshot>>,
+    snapshot: ArcSwap<GeoSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +104,7 @@ impl GeoRuntime {
         );
         Ok(Some(Arc::new(Self {
             source,
-            snapshot: RwLock::new(Arc::new(snapshot)),
+            snapshot: ArcSwap::from_pointee(snapshot),
         })))
     }
 
@@ -129,20 +130,13 @@ impl GeoRuntime {
     }
 
     fn lookup_country_code(&self, ip: IpAddr) -> Option<u16> {
-        let snapshot = self
-            .snapshot
-            .read()
-            .expect("geo snapshot lock poisoned")
-            .clone();
+        let snapshot = self.snapshot.load();
         snapshot.lookup_country(ip)
     }
 
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn xdp_prefixes(&self) -> Vec<GeoIpPrefix> {
-        self.snapshot
-            .read()
-            .expect("geo snapshot lock poisoned")
-            .xdp_prefixes()
+        self.snapshot.load().xdp_prefixes()
     }
 
     async fn run_refresh_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -175,7 +169,7 @@ impl GeoRuntime {
         }
         let snapshot = fetch_geo_snapshot(&self.source).await?;
         write_cache(&self.source.cache_path, &snapshot)?;
-        *self.snapshot.write().expect("geo snapshot lock poisoned") = Arc::new(snapshot);
+        self.snapshot.store(Arc::new(snapshot));
         info!(
             cache = %self.source.cache_path.display(),
             countries = self.source.countries.len(),
@@ -1110,11 +1104,11 @@ mod tests {
                 allow_partial: false,
                 countries: vec!["US".to_string()],
             },
-            snapshot: RwLock::new(Arc::new(GeoSnapshot {
+            snapshot: ArcSwap::from_pointee(GeoSnapshot {
                 created_at_epoch_seconds: 0,
                 ipv4,
                 ipv6,
-            })),
+            }),
         });
         let policy = GeoPolicy {
             enabled: true,
