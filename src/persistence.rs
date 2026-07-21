@@ -1,5 +1,5 @@
 use crate::cluster::{ClusterCommand, ContactBinding, ContactStateSnapshot};
-use crate::config::HaPersistenceConfig;
+use crate::config::PersistenceConfig;
 use crate::config::SipTransport;
 use crate::ha::HaStateSnapshot;
 use crate::proxy::{AffinityBindingSnapshot, AffinityKey, AffinityStateSnapshot, AffinityTarget};
@@ -13,11 +13,11 @@ use tokio::task;
 use tracing::{info, warn};
 
 #[derive(Clone)]
-pub struct HaPersistence {
-    inner: Arc<HaPersistenceInner>,
+pub struct Persistence {
+    inner: Arc<PersistenceInner>,
 }
 
-struct HaPersistenceInner {
+struct PersistenceInner {
     conn: Arc<StdMutex<Connection>>,
     required: bool,
     event_retention_seconds: u64,
@@ -52,7 +52,7 @@ pub struct HaEventsResponse {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HaPersistenceStats {
+pub struct PersistenceStats {
     pub latest_event_seq: u64,
     pub last_applied_seq: u64,
     pub event_rows: u64,
@@ -61,8 +61,8 @@ pub struct HaPersistenceStats {
     pub sqlite_writes_failed: u64,
 }
 
-impl HaPersistence {
-    pub fn open(config: &HaPersistenceConfig) -> Result<Option<Self>> {
+impl Persistence {
+    pub fn open(config: &PersistenceConfig) -> Result<Option<Self>> {
         if !config.enabled {
             return Ok(None);
         }
@@ -70,20 +70,20 @@ impl HaPersistence {
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create HA persistence dir {}", parent.display())
+                format!("failed to create persistence dir {}", parent.display())
             })?;
         }
         let conn = Connection::open(&config.path)
-            .with_context(|| format!("failed to open HA persistence database {}", config.path))?;
+            .with_context(|| format!("failed to open persistence database {}", config.path))?;
         configure_connection(&conn)?;
         migrate(&conn)?;
         info!(
             path = %config.path,
             required = config.required,
-            "HA persistence database opened"
+            "persistence database opened"
         );
         Ok(Some(Self {
-            inner: Arc::new(HaPersistenceInner {
+            inner: Arc::new(PersistenceInner {
                 conn: Arc::new(StdMutex::new(conn)),
                 required: config.required,
                 event_retention_seconds: config.event_retention_seconds,
@@ -104,7 +104,7 @@ impl HaPersistence {
             .inner
             .conn
             .lock()
-            .expect("HA persistence connection lock poisoned");
+            .expect("persistence connection lock poisoned");
         conn.pragma_update(None, "query_only", enabled)?;
         Ok(())
     }
@@ -112,9 +112,7 @@ impl HaPersistence {
     pub async fn load_snapshot(&self) -> Result<HaStateSnapshot> {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             Ok(HaStateSnapshot {
                 last_seq: latest_event_seq(&conn)?,
                 checksum: String::new(),
@@ -124,20 +122,18 @@ impl HaPersistence {
             .map(HaStateSnapshot::with_checksum)
         })
         .await
-        .context("HA persistence load task failed")?
+        .context("persistence load task failed")?
     }
 
     pub async fn apply_cluster_command(&self, command: &ClusterCommand) -> Result<()> {
         let command = command.clone();
         let conn = self.inner.conn.clone();
         let result = task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let mut conn = conn.lock().expect("persistence connection lock poisoned");
             apply_cluster_command(&mut conn, &command, true).map(|_| ())
         })
         .await
-        .context("HA persistence command task failed")?;
+        .context("persistence command task failed")?;
         self.record_write_result(&result, 1);
         result
     }
@@ -152,9 +148,7 @@ impl HaPersistence {
         let appended_events = bindings.len() as u64;
         let conn = self.inner.conn.clone();
         let result = task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let mut conn = conn.lock().expect("persistence connection lock poisoned");
             let tx = conn.transaction()?;
             for binding in bindings {
                 let seq = append_event(
@@ -170,7 +164,7 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence affinity task failed")?;
+        .context("persistence affinity task failed")?;
         self.record_write_result(&result, appended_events);
         result
     }
@@ -179,9 +173,7 @@ impl HaPersistence {
         let snapshot = snapshot.clone();
         let conn = self.inner.conn.clone();
         let result = task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let mut conn = conn.lock().expect("persistence connection lock poisoned");
             let tx = conn.transaction()?;
             tx.execute("delete from contacts", [])?;
             tx.execute("delete from affinity", [])?;
@@ -200,7 +192,7 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence snapshot task failed")?;
+        .context("persistence snapshot task failed")?;
         self.record_sqlite_write_result(&result);
         result
     }
@@ -209,9 +201,7 @@ impl HaPersistence {
         let conn = self.inner.conn.clone();
         let retention = self.inner.event_retention_seconds;
         let result = task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             let now = now_epoch_ms().to_string();
             let retain_after = now_epoch_ms()
                 .saturating_sub(u128::from(retention) * 1_000)
@@ -231,7 +221,7 @@ impl HaPersistence {
             Ok(())
         })
         .await
-        .context("HA persistence cleanup task failed")?;
+        .context("persistence cleanup task failed")?;
         self.record_sqlite_write_result(&result);
         result
     }
@@ -239,65 +229,55 @@ impl HaPersistence {
     pub async fn latest_event_seq(&self) -> Result<u64> {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             latest_event_seq(&conn)
         })
         .await
-        .context("HA persistence latest seq task failed")?
+        .context("persistence latest seq task failed")?
     }
 
     pub async fn last_applied_seq(&self) -> Result<u64> {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             last_applied_seq(&conn).map(|seq| seq.unwrap_or(0))
         })
         .await
-        .context("HA persistence last applied seq task failed")?
+        .context("persistence last applied seq task failed")?
     }
 
     pub async fn events_after(&self, after: u64, limit: usize) -> Result<HaEventsResponse> {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             events_after(&conn, after, limit)
         })
         .await
-        .context("HA persistence events task failed")?
+        .context("persistence events task failed")?
     }
 
     pub async fn apply_event(&self, event: &HaEventRecord) -> Result<()> {
         let event = event.clone();
         let conn = self.inner.conn.clone();
         let result = task::spawn_blocking(move || {
-            let mut conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let mut conn = conn.lock().expect("persistence connection lock poisoned");
             apply_event_without_append(&mut conn, &event)
         })
         .await
-        .context("HA persistence apply event task failed")?;
+        .context("persistence apply event task failed")?;
         self.record_sqlite_write_result(&result);
         result
     }
 
-    pub async fn stats(&self) -> Result<HaPersistenceStats> {
+    pub async fn stats(&self) -> Result<PersistenceStats> {
         let conn = self.inner.conn.clone();
         let stats = task::spawn_blocking(move || {
-            let conn = conn
-                .lock()
-                .expect("HA persistence connection lock poisoned");
+            let conn = conn.lock().expect("persistence connection lock poisoned");
             persistence_stats(&conn)
         })
         .await
-        .context("HA persistence stats task failed")??;
-        Ok(HaPersistenceStats {
+        .context("persistence stats task failed")??;
+        Ok(PersistenceStats {
             event_appends_succeeded: self.inner.event_appends_succeeded.load(Ordering::Relaxed),
             event_appends_failed: self.inner.event_appends_failed.load(Ordering::Relaxed),
             sqlite_writes_failed: self.inner.sqlite_writes_failed.load(Ordering::Relaxed),
@@ -321,7 +301,7 @@ impl HaPersistence {
                 }
                 _ = ticker.tick() => {
                     if let Err(err) = self.cleanup_expired().await {
-                        warn!(error = %format!("{err:#}"), "failed to cleanup expired HA persistence rows");
+                        warn!(error = %format!("{err:#}"), "failed to cleanup expired persistence rows");
                     }
                 }
             }
@@ -580,8 +560,8 @@ fn event_row_count(conn: &Connection) -> Result<u64> {
     Ok(count)
 }
 
-fn persistence_stats(conn: &Connection) -> Result<HaPersistenceStats> {
-    Ok(HaPersistenceStats {
+fn persistence_stats(conn: &Connection) -> Result<PersistenceStats> {
+    Ok(PersistenceStats {
         latest_event_seq: latest_event_seq(conn)?,
         last_applied_seq: last_applied_seq(conn)?.unwrap_or(0),
         event_rows: event_row_count(conn)?,
@@ -700,8 +680,8 @@ mod tests {
     use crate::cluster::expires_at;
     use std::time::Duration;
 
-    fn test_config(path: String) -> HaPersistenceConfig {
-        HaPersistenceConfig {
+    fn test_config(path: String) -> PersistenceConfig {
+        PersistenceConfig {
             enabled: true,
             path,
             required: false,
@@ -714,7 +694,7 @@ mod tests {
     async fn persistence_round_trips_contacts_and_affinity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db").to_string_lossy().to_string();
-        let persistence = HaPersistence::open(&test_config(path.clone()))
+        let persistence = Persistence::open(&test_config(path.clone()))
             .unwrap()
             .unwrap();
 
@@ -740,7 +720,7 @@ mod tests {
             .unwrap();
         drop(persistence);
 
-        let reopened = HaPersistence::open(&test_config(path)).unwrap().unwrap();
+        let reopened = Persistence::open(&test_config(path)).unwrap().unwrap();
         let snapshot = reopened.load_snapshot().await.unwrap();
         assert_eq!(snapshot.contacts.contacts.len(), 1);
         assert_eq!(snapshot.contacts.contacts[0].aor, "sip:100@example.com");
@@ -752,7 +732,7 @@ mod tests {
     async fn persistence_does_not_restore_expired_rows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db").to_string_lossy().to_string();
-        let persistence = HaPersistence::open(&test_config(path)).unwrap().unwrap();
+        let persistence = Persistence::open(&test_config(path)).unwrap().unwrap();
 
         persistence
             .apply_cluster_command(&ClusterCommand::RegisterContact(ContactBinding {
@@ -774,7 +754,7 @@ mod tests {
     async fn persistence_stats_reports_sequences_rows_and_write_counters() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db").to_string_lossy().to_string();
-        let persistence = HaPersistence::open(&test_config(path)).unwrap().unwrap();
+        let persistence = Persistence::open(&test_config(path)).unwrap().unwrap();
 
         persistence
             .apply_cluster_command(&ClusterCommand::RegisterContact(ContactBinding {
@@ -810,7 +790,7 @@ mod tests {
     async fn event_log_replays_contacts_and_affinity_to_follower() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let source = HaPersistence::open(&test_config(
+        let source = Persistence::open(&test_config(
             source_dir
                 .path()
                 .join("state.db")
@@ -819,7 +799,7 @@ mod tests {
         ))
         .unwrap()
         .unwrap();
-        let target = HaPersistence::open(&test_config(
+        let target = Persistence::open(&test_config(
             target_dir
                 .path()
                 .join("state.db")
@@ -866,7 +846,7 @@ mod tests {
     #[tokio::test]
     async fn event_log_reports_snapshot_required_when_after_is_behind_retained_events() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = HaPersistence::open(&test_config(
+        let persistence = Persistence::open(&test_config(
             dir.path().join("state.db").to_string_lossy().to_string(),
         ))
         .unwrap()

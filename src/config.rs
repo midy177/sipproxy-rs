@@ -1801,13 +1801,13 @@ fn default_ha_leader_check_interval_ms() -> u64 {
 pub struct PersistenceConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_ha_persistence_path")]
+    #[serde(default = "default_persistence_path")]
     pub path: String,
     #[serde(default)]
     pub required: bool,
-    #[serde(default = "default_ha_persistence_event_retention_seconds")]
+    #[serde(default = "default_persistence_event_retention_seconds")]
     pub event_retention_seconds: u64,
-    #[serde(default = "default_ha_persistence_cleanup_interval_ms")]
+    #[serde(default = "default_persistence_cleanup_interval_ms")]
     pub cleanup_interval_ms: u64,
 }
 
@@ -1815,25 +1815,23 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            path: default_ha_persistence_path(),
+            path: default_persistence_path(),
             required: false,
-            event_retention_seconds: default_ha_persistence_event_retention_seconds(),
-            cleanup_interval_ms: default_ha_persistence_cleanup_interval_ms(),
+            event_retention_seconds: default_persistence_event_retention_seconds(),
+            cleanup_interval_ms: default_persistence_cleanup_interval_ms(),
         }
     }
 }
 
-pub type HaPersistenceConfig = PersistenceConfig;
-
-fn default_ha_persistence_path() -> String {
+fn default_persistence_path() -> String {
     "/var/lib/sigproxy-rs/ha/state.db".to_string()
 }
 
-fn default_ha_persistence_event_retention_seconds() -> u64 {
+fn default_persistence_event_retention_seconds() -> u64 {
     3_600
 }
 
-fn default_ha_persistence_cleanup_interval_ms() -> u64 {
+fn default_persistence_cleanup_interval_ms() -> u64 {
     60_000
 }
 

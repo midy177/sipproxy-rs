@@ -145,6 +145,7 @@ fn log_startup_mode(config: &Config) {
         })
         .find(|refresh| !matches!(refresh, ProxyGeoStartupRefresh::Disabled))
         .unwrap_or(ProxyGeoStartupRefresh::Disabled);
+    let persistence = config.persistence_config();
 
     info!(
         mode,
@@ -154,6 +155,10 @@ fn log_startup_mode(config: &Config) {
         active_standby_enabled = config.ha.active_standby.enabled,
         initial_role = ?config.ha.active_standby.initial_role,
         replication_enabled = config.ha.replication.enabled,
+        persistence_enabled = persistence.enabled,
+        persistence_path = %persistence.path,
+        persistence_required = persistence.required,
+        persistence_cleanup_interval_ms = persistence.cleanup_interval_ms,
         xdp_enabled,
         geo_startup_refresh = ?geo_startup_refresh,
         "sigproxy startup mode resolved"

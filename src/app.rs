@@ -5,7 +5,7 @@ use crate::ha::{
     ActiveStandbyReplicator, ActiveStandbyRuntime, build_addon, run_active_standby,
     run_leader_monitor, run_state_replication,
 };
-use crate::persistence::HaPersistence;
+use crate::persistence::Persistence;
 use crate::proxy::ProxyServer;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use tracing::info;
 
 pub async fn run(config: Config) -> Result<()> {
     let persistence_config = config.persistence_config().clone();
-    let persistence = HaPersistence::open(&persistence_config)?;
+    let persistence = Persistence::open(&persistence_config)?;
     let state = Arc::new(SharedState::default());
     let base_replicator = build_replicator(state.clone(), persistence.clone()).await?;
     let active_standby_config = config.ha.active_standby.clone();

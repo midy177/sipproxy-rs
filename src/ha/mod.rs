@@ -722,8 +722,8 @@ mod tests {
     use crate::cluster::{
         ClusterApplyResult, ClusterCommand, ContactBinding, SharedState, expires_at,
     };
-    use crate::config::{Config, HaPersistenceConfig};
-    use crate::persistence::HaPersistence;
+    use crate::config::{Config, PersistenceConfig};
+    use crate::persistence::Persistence;
     use crate::proxy::ProxyServer;
     use std::sync::Mutex;
     use tokio::sync::watch;
@@ -895,7 +895,7 @@ mod tests {
     async fn standby_pulls_and_applies_peer_events() {
         let source_dir = tempfile::tempdir().unwrap();
         let target_dir = tempfile::tempdir().unwrap();
-        let source_persistence = HaPersistence::open(&HaPersistenceConfig {
+        let source_persistence = Persistence::open(&PersistenceConfig {
             enabled: true,
             path: source_dir
                 .path()
@@ -941,7 +941,7 @@ mod tests {
             axum::serve(peer_listener, peer_app).await.unwrap();
         });
 
-        let target_persistence = HaPersistence::open(&HaPersistenceConfig {
+        let target_persistence = Persistence::open(&PersistenceConfig {
             enabled: true,
             path: target_dir
                 .path()
@@ -1024,7 +1024,7 @@ mod tests {
             axum::serve(peer_listener, peer_app).await.unwrap();
         });
 
-        let target_persistence = HaPersistence::open(&HaPersistenceConfig {
+        let target_persistence = Persistence::open(&PersistenceConfig {
             enabled: true,
             path: target_dir
                 .path()
@@ -1114,7 +1114,7 @@ mod tests {
             axum::serve(peer_listener, peer_app).await.unwrap();
         });
 
-        let target_persistence = HaPersistence::open(&HaPersistenceConfig {
+        let target_persistence = Persistence::open(&PersistenceConfig {
             enabled: true,
             path: target_dir
                 .path()

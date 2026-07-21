@@ -1,4 +1,4 @@
-use crate::persistence::HaPersistence;
+use crate::persistence::Persistence;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -127,11 +127,11 @@ impl SharedState {
 
 pub struct StandaloneReplicator {
     state: Arc<SharedState>,
-    persistence: Option<HaPersistence>,
+    persistence: Option<Persistence>,
 }
 
 impl StandaloneReplicator {
-    pub fn new(state: Arc<SharedState>, persistence: Option<HaPersistence>) -> Self {
+    pub fn new(state: Arc<SharedState>, persistence: Option<Persistence>) -> Self {
         Self { state, persistence }
     }
 }
@@ -168,7 +168,7 @@ impl ClusterReplicator for StandaloneReplicator {
 
 pub async fn build_replicator(
     state: Arc<SharedState>,
-    persistence: Option<HaPersistence>,
+    persistence: Option<Persistence>,
 ) -> Result<Arc<dyn ClusterReplicator>> {
     Ok(Arc::new(StandaloneReplicator::new(state, persistence)))
 }
@@ -187,11 +187,11 @@ fn now_epoch_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::HaPersistenceConfig;
-    use crate::persistence::HaPersistence;
+    use crate::config::PersistenceConfig;
+    use crate::persistence::Persistence;
 
-    fn test_persistence_config(path: String, required: bool) -> HaPersistenceConfig {
-        HaPersistenceConfig {
+    fn test_persistence_config(path: String, required: bool) -> PersistenceConfig {
+        PersistenceConfig {
             enabled: true,
             path,
             required,
@@ -261,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn required_persistence_failure_rejects_replicator_write() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = HaPersistence::open(&test_persistence_config(
+        let persistence = Persistence::open(&test_persistence_config(
             dir.path().join("state.db").to_string_lossy().to_string(),
             true,
         ))
@@ -287,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn optional_persistence_failure_keeps_replicator_write_in_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = HaPersistence::open(&test_persistence_config(
+        let persistence = Persistence::open(&test_persistence_config(
             dir.path().join("state.db").to_string_lossy().to_string(),
             false,
         ))

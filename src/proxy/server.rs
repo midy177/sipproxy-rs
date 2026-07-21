@@ -5,7 +5,7 @@ use crate::config::{
     UpstreamGroupConfig, UpstreamHealthCheckConfig, UpstreamHealthProbeConfig,
 };
 use crate::ha::HaStateSnapshot;
-use crate::persistence::{HaEventPayload, HaEventRecord, HaEventsResponse, HaPersistence};
+use crate::persistence::{HaEventPayload, HaEventRecord, HaEventsResponse, Persistence};
 use crate::proxy::affinity::{AffinityTable, AffinityTarget};
 use crate::proxy::geo::{GeoDecision, GeoPolicy, GeoRuntime, evaluate_geo_policy};
 use crate::proxy::metrics::ProxyMetrics;
@@ -60,7 +60,7 @@ pub struct ProxyServer {
     config: Config,
     state: Arc<SharedState>,
     replicator: Arc<dyn ClusterReplicator>,
-    persistence: Option<HaPersistence>,
+    persistence: Option<Persistence>,
     routes: RouteTable,
     upstreams: UpstreamGroups,
     affinity: AffinityTable,
@@ -80,7 +80,7 @@ impl ProxyServer {
         config: Config,
         state: Arc<SharedState>,
         replicator: Arc<dyn ClusterReplicator>,
-        persistence: Option<HaPersistence>,
+        persistence: Option<Persistence>,
     ) -> Result<Self> {
         let routes = RouteTable::new(&config.proxy).context("failed to build proxy route table")?;
         let upstreams = UpstreamGroups::new(&config.proxy.upstream_groups)
@@ -197,7 +197,7 @@ impl ProxyServer {
                 Err(err) => {
                     warn!(
                         error = %format!("{err:#}"),
-                        "failed to read HA persistence latest event sequence for snapshot"
+                        "failed to read persistence latest event sequence for snapshot"
                     );
                     0
                 }
@@ -262,7 +262,7 @@ impl ProxyServer {
             Err(err) => {
                 warn!(
                     error = %format!("{err:#}"),
-                    "failed to read HA persistence last applied sequence"
+                    "failed to read persistence last applied sequence"
                 );
                 0
             }
@@ -342,7 +342,7 @@ impl ProxyServer {
                 Err(err) => {
                     debug!(
                         error = %format!("{err:#}"),
-                        "failed to collect HA persistence metrics"
+                        "failed to collect persistence metrics"
                     );
                     None
                 }
@@ -387,40 +387,40 @@ impl ProxyServer {
                 .saturating_sub(stats.last_applied_seq);
             append_gauge(
                 &mut output,
-                "proxy_ha_persistence_latest_event_seq",
+                "proxy_persistence_latest_event_seq",
                 stats.latest_event_seq,
             );
             append_gauge(
                 &mut output,
-                "proxy_ha_persistence_last_applied_seq",
+                "proxy_persistence_last_applied_seq",
                 stats.last_applied_seq,
             );
             append_gauge(
                 &mut output,
-                "proxy_ha_persistence_event_rows",
+                "proxy_persistence_event_rows",
                 stats.event_rows,
             );
             append_labeled_gauge(
                 &mut output,
-                "proxy_ha_persistence_event_lag",
+                "proxy_persistence_event_lag",
                 &[("role", role.as_str())],
                 event_lag,
             );
             append_labeled_counter(
                 &mut output,
-                "proxy_ha_persistence_event_appends_total",
+                "proxy_persistence_event_appends_total",
                 &[("result", "success")],
                 stats.event_appends_succeeded,
             );
             append_labeled_counter(
                 &mut output,
-                "proxy_ha_persistence_event_appends_total",
+                "proxy_persistence_event_appends_total",
                 &[("result", "failure")],
                 stats.event_appends_failed,
             );
             append_labeled_counter(
                 &mut output,
-                "proxy_ha_persistence_sqlite_write_failures_total",
+                "proxy_persistence_sqlite_write_failures_total",
                 &[],
                 stats.sqlite_writes_failed,
             );
@@ -4324,7 +4324,7 @@ fn unique_id() -> u64 {
 mod tests {
     use super::*;
     use crate::cluster::{ClusterCommand, ContactBinding, StandaloneReplicator, expires_at};
-    use crate::config::HaPersistenceConfig;
+    use crate::config::PersistenceConfig;
     use crate::config::{
         Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyDynamicBanConfig,
         ProxyGeoCountryListConfig, ProxyGeoSecurityConfig, ProxyGeoStartupRefresh,
@@ -6165,7 +6165,7 @@ Content-Length: 0\r\n\r\n",
     #[tokio::test]
     async fn metrics_reports_ha_persistence_and_replication_counters() {
         let dir = tempfile::tempdir().unwrap();
-        let persistence = HaPersistence::open(&HaPersistenceConfig {
+        let persistence = Persistence::open(&PersistenceConfig {
             enabled: true,
             path: dir.path().join("state.db").to_string_lossy().to_string(),
             required: false,
@@ -6213,12 +6213,12 @@ Content-Length: 0\r\n\r\n",
         server.record_ha_snapshot_fallback("event-pull-error");
 
         let metrics = server.render_metrics().await;
-        assert!(metrics.contains("proxy_ha_persistence_latest_event_seq 1"));
-        assert!(metrics.contains("proxy_ha_persistence_last_applied_seq 0"));
-        assert!(metrics.contains("proxy_ha_persistence_event_rows 1"));
-        assert!(metrics.contains("proxy_ha_persistence_event_lag{role=\"standalone\"} 1"));
-        assert!(metrics.contains("proxy_ha_persistence_event_appends_total{result=\"success\"} 1"));
-        assert!(metrics.contains("proxy_ha_persistence_sqlite_write_failures_total 0"));
+        assert!(metrics.contains("proxy_persistence_latest_event_seq 1"));
+        assert!(metrics.contains("proxy_persistence_last_applied_seq 0"));
+        assert!(metrics.contains("proxy_persistence_event_rows 1"));
+        assert!(metrics.contains("proxy_persistence_event_lag{role=\"standalone\"} 1"));
+        assert!(metrics.contains("proxy_persistence_event_appends_total{result=\"success\"} 1"));
+        assert!(metrics.contains("proxy_persistence_sqlite_write_failures_total 0"));
         assert!(metrics.contains("proxy_ha_event_pulls_total{result=\"applied\"} 1"));
         assert!(metrics.contains("proxy_ha_snapshot_pulls_total{result=\"installed\"} 1"));
         assert!(
