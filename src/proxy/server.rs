@@ -46,7 +46,6 @@ use tracing::{debug, error, info, warn};
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
 const INVITE_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const UDP_BRANCH_TTL: Duration = Duration::from_secs(300);
-const UDP_BRANCH_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 const TCP_BRANCH_TTL: Duration = Duration::from_secs(300);
 const PENDING_REGISTER_TTL: Duration = Duration::from_secs(300);
 const INVITE_TRANSACTION_TTL: Duration = Duration::from_secs(300);
@@ -54,6 +53,7 @@ const LOCAL_INVITE_REJECTION_TTL: Duration = Duration::from_secs(300);
 const SECURITY_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_BUCKET_IDLE_TTL: Duration = Duration::from_secs(600);
 const SECURITY_MAP_SHARDS: usize = 64;
+const ROUTE_MAP_SHARDS: usize = 64;
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -68,10 +68,9 @@ pub struct ProxyServer {
     affinity: AffinityTable,
     security: Arc<SecurityRuntime>,
     metrics: Arc<ProxyMetrics>,
-    udp_branches: Mutex<HashMap<String, UdpBranchRoute>>,
-    udp_branch_last_prune: Mutex<Instant>,
+    udp_branches: ShardedStringMap<UdpBranchRoute>,
     pending_registers: Mutex<HashMap<String, PendingRegister>>,
-    invite_transactions: Mutex<HashMap<String, InviteTransactionRoute>>,
+    invite_transactions: ShardedStringMap<InviteTransactionRoute>,
     local_invite_rejections: Mutex<HashMap<String, Instant>>,
     tcp_upstreams: TcpUpstreamPool,
     advertised_addrs: Mutex<HashMap<String, String>>,
@@ -100,10 +99,9 @@ impl ProxyServer {
             affinity: AffinityTable::new(affinity_config),
             security,
             metrics: Arc::new(ProxyMetrics::default()),
-            udp_branches: Mutex::new(HashMap::new()),
-            udp_branch_last_prune: Mutex::new(Instant::now()),
+            udp_branches: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             pending_registers: Mutex::new(HashMap::new()),
-            invite_transactions: Mutex::new(HashMap::new()),
+            invite_transactions: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             local_invite_rejections: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
             advertised_addrs: Mutex::new(HashMap::new()),
@@ -463,15 +461,19 @@ impl ProxyServer {
     }
 
     async fn active_udp_branch_count(&self) -> usize {
-        let mut branches = self.udp_branches.lock().await;
-        prune_udp_branches(&mut branches, Instant::now());
-        branches.len()
+        let now = Instant::now();
+        self.udp_branches
+            .len_after_retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL)
+            .await
     }
 
     async fn active_invite_transaction_count(&self) -> usize {
-        let mut transactions = self.invite_transactions.lock().await;
-        prune_invite_transactions(&mut transactions, Instant::now());
-        transactions.len()
+        let now = Instant::now();
+        self.invite_transactions
+            .len_after_retain(|_, route| {
+                now.duration_since(route.created_at) <= INVITE_TRANSACTION_TTL
+            })
+            .await
     }
 
     async fn log_listener_runtime_config(&self, listener: &ProxyListenerConfig) {
@@ -555,20 +557,8 @@ impl ProxyServer {
         Ok(())
     }
 
-    async fn prune_udp_branches_if_due(
-        &self,
-        branches: &mut HashMap<String, UdpBranchRoute>,
-        now: Instant,
-    ) {
-        let mut last_prune = self.udp_branch_last_prune.lock().await;
-        if now.duration_since(*last_prune) >= UDP_BRANCH_PRUNE_INTERVAL {
-            prune_udp_branches(branches, now);
-            *last_prune = now;
-        }
-    }
-
     async fn remove_udp_branch(&self, branch: &str) {
-        self.udp_branches.lock().await.remove(branch);
+        self.udp_branches.remove(branch).await;
     }
 
     async fn remember_successful_forward(
@@ -1003,9 +993,8 @@ impl ProxyServer {
         }
 
         let route = {
-            let mut branches = self.udp_branches.lock().await;
-            self.prune_udp_branches_if_due(&mut branches, Instant::now())
-                .await;
+            let mut branches = self.udp_branches.shard_for_key(&branch).lock().await;
+            prune_udp_branches(&mut branches, Instant::now());
             branches.get(&branch).copied()
         };
         let Some(route) = route else {
@@ -1126,9 +1115,8 @@ impl ProxyServer {
             SipTransport::Udp => {
                 self.record_forwarded_request("udp", target.transport, Some(method));
                 {
-                    let mut branches = self.udp_branches.lock().await;
-                    self.prune_udp_branches_if_due(&mut branches, Instant::now())
-                        .await;
+                    let mut branches = self.udp_branches.shard_for_key(&branch).lock().await;
+                    prune_udp_branches(&mut branches, Instant::now());
                     branches.insert(
                         branch.clone(),
                         UdpBranchRoute {
@@ -1901,7 +1889,7 @@ impl ProxyServer {
 
     async fn lookup_invite_transaction(&self, key: Option<&str>) -> Option<InviteTransactionRoute> {
         let key = key?;
-        let mut transactions = self.invite_transactions.lock().await;
+        let mut transactions = self.invite_transactions.shard_for_key(key).lock().await;
         prune_invite_transactions(&mut transactions, Instant::now());
         transactions.get(key).cloned()
     }
@@ -1915,7 +1903,7 @@ impl ProxyServer {
         let Some(key) = key else {
             return;
         };
-        let mut transactions = self.invite_transactions.lock().await;
+        let mut transactions = self.invite_transactions.shard_for_key(&key).lock().await;
         prune_invite_transactions(&mut transactions, Instant::now());
         transactions.insert(
             key,
@@ -2694,11 +2682,13 @@ impl SecurityRuntime {
     }
 }
 
-struct ShardedSecurityMap<V> {
+struct ShardedStringMap<V> {
     shards: Vec<Mutex<HashMap<String, V>>>,
 }
 
-impl<V> ShardedSecurityMap<V> {
+type ShardedSecurityMap<V> = ShardedStringMap<V>;
+
+impl<V> ShardedStringMap<V> {
     fn new(shards: usize) -> Self {
         let shard_count = shards.max(1);
         Self {
@@ -2709,7 +2699,7 @@ impl<V> ShardedSecurityMap<V> {
     }
 
     fn shard_for_key(&self, key: &str) -> &Mutex<HashMap<String, V>> {
-        &self.shards[security_shard_index(key, self.shards.len())]
+        &self.shards[string_shard_index(key, self.shards.len())]
     }
 
     async fn retain<F>(&self, mut f: F)
@@ -2719,6 +2709,23 @@ impl<V> ShardedSecurityMap<V> {
         for shard in &self.shards {
             shard.lock().await.retain(|key, value| f(key, value));
         }
+    }
+
+    async fn remove(&self, key: &str) -> Option<V> {
+        self.shard_for_key(key).lock().await.remove(key)
+    }
+
+    async fn len_after_retain<F>(&self, mut f: F) -> usize
+    where
+        F: FnMut(&String, &mut V) -> bool,
+    {
+        let mut len = 0;
+        for shard in &self.shards {
+            let mut entries = shard.lock().await;
+            entries.retain(|key, value| f(key, value));
+            len += entries.len();
+        }
+        len
     }
 
     #[cfg(test)]
@@ -2732,7 +2739,7 @@ impl<V> ShardedSecurityMap<V> {
     }
 }
 
-fn security_shard_index(key: &str, shards: usize) -> usize {
+fn string_shard_index(key: &str, shards: usize) -> usize {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     (hasher.finish() as usize) % shards
