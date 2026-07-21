@@ -2344,7 +2344,8 @@ impl SecurityRuntime {
         peer: SocketAddr,
         packet: &[u8],
     ) -> SecurityDecision {
-        let Some(runtime) = self.listener(listener) else {
+        let listener_key = listener.key();
+        let Some(runtime) = self.listener_by_key(&listener_key) else {
             return SecurityDecision::Allow;
         };
         if !runtime.config.enabled() {
@@ -2360,7 +2361,6 @@ impl SecurityRuntime {
             return SecurityDecision::Allow;
         }
 
-        let listener_key = listener.key();
         let block_key = ip_security_key("block", listener_key.as_str(), peer.ip());
         if self.is_blocked(&block_key).await {
             return SecurityDecision::Drop("ip-blocked");
@@ -2412,7 +2412,8 @@ impl SecurityRuntime {
         listener: &ProxyListenerConfig,
         peer: SocketAddr,
     ) -> SecurityDecision {
-        let Some(runtime) = self.listener(listener) else {
+        let listener_key = listener.key();
+        let Some(runtime) = self.listener_by_key(&listener_key) else {
             return SecurityDecision::Allow;
         };
         if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
@@ -2424,7 +2425,6 @@ impl SecurityRuntime {
             return SecurityDecision::Allow;
         }
 
-        let listener_key = listener.key();
         let bucket_key = ip_security_key("parse-errors", listener_key.as_str(), peer.ip());
         if self
             .allow_bucket(
@@ -2458,7 +2458,8 @@ impl SecurityRuntime {
         offense: Option<DynamicOffense>,
     ) -> Option<&'static str> {
         let offense = offense?;
-        let runtime = self.listener(listener)?;
+        let listener_key = listener.key();
+        let runtime = self.listener_by_key(&listener_key)?;
         if !runtime.config.dynamic_ban.enabled || runtime.is_trusted(peer.ip()) {
             return None;
         }
@@ -2471,7 +2472,6 @@ impl SecurityRuntime {
         if per_minute == 0 {
             return None;
         }
-        let listener_key = listener.key();
         let bucket_key = format!(
             "dynamic-ban|{}|{}|{}",
             dynamic_offense_key(offense),
@@ -2503,7 +2503,8 @@ impl SecurityRuntime {
         listener: &ProxyListenerConfig,
         peer: SocketAddr,
     ) -> bool {
-        let Some(runtime) = self.listener(listener) else {
+        let listener_key = listener.key();
+        let Some(runtime) = self.listener_by_key(&listener_key) else {
             return false;
         };
         let prefilter = &runtime.config.prefilter;
@@ -2514,7 +2515,6 @@ impl SecurityRuntime {
         if per_minute == 0 {
             return false;
         }
-        let listener_key = listener.key();
         self.allow_bucket(
             ip_security_key("invalid-log", listener_key.as_str(), peer.ip()),
             per_minute as f64 / 60.0,
@@ -2533,7 +2533,8 @@ impl SecurityRuntime {
         if matches!(method, "ACK" | "CANCEL") {
             return None;
         }
-        let runtime = self.listener(listener)?;
+        let listener_key = listener.key();
+        let runtime = self.listener_by_key(&listener_key)?;
         if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
             return None;
         }
@@ -2553,7 +2554,6 @@ impl SecurityRuntime {
             _ => return None,
         };
 
-        let listener_key = listener.key();
         let identity = sip_rate_identity(message, method, peer);
         let block_key = format!("sip-block|{listener_key}|{method}|{identity}");
         if self.is_blocked(&block_key).await {
@@ -2580,7 +2580,11 @@ impl SecurityRuntime {
     }
 
     fn listener(&self, listener: &ProxyListenerConfig) -> Option<&ListenerSecurityRuntime> {
-        self.listeners.get(&listener.key())
+        self.listeners.get(listener.key().as_str())
+    }
+
+    fn listener_by_key(&self, listener_key: &str) -> Option<&ListenerSecurityRuntime> {
+        self.listeners.get(listener_key)
     }
 
     async fn allow_bucket(&self, key: String, rate_per_second: f64, burst: f64) -> bool {
