@@ -152,6 +152,9 @@ preset = "off"
 # [proxy.security.sip_policy]
 # require_registered_invite_source = false
 # registered_invite_source_match = "ip" # "ip" or "ip-port"
+# "ip" checks only the public source IP of the registered AoR. Devices behind
+# the same NAT public IP can satisfy this check for each other. Use "ip-port"
+# only when client NAT source ports are stable.
 #
 # Optional XDP offload. This is intentionally limited to L3/L4 checks; SIP
 # semantic limits stay in user space.
@@ -339,3 +342,6 @@ type = "noop"
 # on_become_leader = "/usr/local/bin/bind-floating-endpoint.sh"
 # on_step_down = "/usr/local/bin/unbind-floating-endpoint.sh"
 # timeout_ms = 5000
+# Command hooks are required fencing hooks for active-standby role changes:
+# promotion is rejected when on_become_leader fails, and timed-out hooks are
+# killed before sigproxy returns an error.

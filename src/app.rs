@@ -20,6 +20,7 @@ pub async fn run(config: Config) -> Result<()> {
     let state = Arc::new(SharedState::default());
     let base_replicator = build_replicator(state.clone(), persistence.clone()).await?;
     let active_standby_config = config.ha.active_standby.clone();
+    let ha_addon = build_addon(&config.ha.addon);
     let active_standby_runtime = active_standby_config
         .enabled
         .then(|| ActiveStandbyRuntime::new(config.node.id, active_standby_config.initial_role));
@@ -34,12 +35,11 @@ pub async fn run(config: Config) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    if leader_monitor_enabled {
-        let ha = build_addon(&config.ha.addon);
+    if leader_monitor_enabled && active_standby_runtime.is_none() {
         tasks.spawn(run_leader_monitor(
             config.node.clone(),
             replicator.clone(),
-            ha,
+            ha_addon.clone(),
             shutdown_rx.clone(),
             Duration::from_millis(config.ha.leader_check_interval_ms),
         ));
@@ -54,7 +54,9 @@ pub async fn run(config: Config) -> Result<()> {
     if let Some(runtime) = active_standby_runtime {
         tasks.spawn(run_active_standby(
             active_standby_config,
+            server.config().node.clone(),
             runtime,
+            ha_addon,
             shutdown_rx.clone(),
         ));
     }

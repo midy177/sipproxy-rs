@@ -207,7 +207,9 @@ For a commented template that lists every supported configuration field, see
 The active-standby examples use the `noop` HA addon, so they do not move SIP
 traffic by themselves. Production active-standby deployments still need a
 VIP/EIP/LB hook or equivalent traffic steering so only the active node receives
-client SIP traffic.
+client SIP traffic. Command hooks are treated as required fencing hooks for
+active-standby role changes: promotion succeeds only after
+`on_become_leader` succeeds, and hook timeout terminates the hook process.
 
 ## Upstream Health Checks
 
@@ -367,7 +369,10 @@ When `require_registered_invite_source = true`, initial `INVITE` requests from
 client-side peers must use a From AoR that has an active REGISTER binding, and
 the source must match the registered source IP by default. Use
 `registered_invite_source_match = "ip-port"` only for environments where the
-client NAT source port is stable.
+client NAT source port is stable. The default `"ip"` mode is a source-IP-level
+guard, not end-to-end identity authentication: multiple devices behind the same
+public NAT IP can satisfy this check for each other. `"ip-port"` is stricter but
+can reject legitimate clients when NAT source ports drift.
 
 Build or preseed the binary geo cache with:
 

@@ -122,6 +122,13 @@ message buffer. TCP has no STUN/CRLF UDP keepalive handling.
 `ACK` and `CANCEL` skip SIP identity limits so existing INVITE transactions can
 finish cleanly.
 
+`registered_invite_source_match = "ip"` is intentionally source-IP scoped. It
+protects against unrelated internet hosts sending initial INVITEs for an
+unregistered AoR, but it is not end-to-end identity authentication: devices
+behind the same public NAT IP can satisfy the source-IP check for each other.
+`"ip-port"` is stricter and can prevent that case, but it is only appropriate
+when client NAT source ports are stable enough to avoid false rejects.
+
 ## RFC Compatibility
 
 The proxy does not become a registrar, B2BUA, or authentication endpoint. It
@@ -184,8 +191,9 @@ Implemented XDP scope:
 8. bpffs must be mounted at `/sys/fs/bpf` and bind-mounted into containers;
    `fail_open=true` falls back to user-space security when the mount is
    missing, while `fail_open=false` rejects startup.
-5. Export XDP pass/drop counters through the existing metrics endpoint.
-6. If attach or map population fails and `fail_open = true`, log a warning and
+9. IPv4, IPv6, IPv6 extension headers, fragments, and nested VLAN tags are
+   parsed only far enough to classify listener protocol/port and source IP.
+10. If attach or map population fails and `fail_open = true`, log a warning and
    continue with user-space security only. If `fail_open = false`, fail startup.
 
 Runtime requirements for real XDP offload:

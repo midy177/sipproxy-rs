@@ -267,7 +267,7 @@ pub async fn run_leader_monitor(
             _ = ticker.tick() => {
                 let role = replicator.role().await;
                 let leader = replicator.leader().await;
-                observe_ha_state(&mut state, &node, &addon, role, leader).await;
+                observe_ha_state(&mut state, &node, &addon, role, leader).await?;
             }
         }
     }
@@ -277,7 +277,9 @@ pub async fn run_leader_monitor(
 
 pub async fn run_active_standby(
     config: HaActiveStandbyConfig,
+    node: NodeConfig,
     runtime: Arc<ActiveStandbyRuntime>,
+    addon: HaAddonRef,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     if !config.enabled {
@@ -295,9 +297,20 @@ pub async fn run_active_standby(
         .route("/ha/heartbeat", get(ha_heartbeat))
         .with_state(runtime.clone());
 
+    if runtime.role().await.accepts_writes() {
+        run_required_ha_hook(
+            addon
+                .on_become_leader(HaContext::from_node(&node, ClusterRole::Leader))
+                .await,
+            "on_become_leader",
+        )?;
+    }
+
     let monitor_task = tokio::spawn(run_active_standby_monitor(
         config,
+        node,
         runtime,
+        addon,
         shutdown.clone(),
     ));
     let http = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -315,7 +328,9 @@ async fn ha_heartbeat(State(runtime): State<Arc<ActiveStandbyRuntime>>) -> Json<
 
 async fn run_active_standby_monitor(
     config: HaActiveStandbyConfig,
+    node: NodeConfig,
     runtime: Arc<ActiveStandbyRuntime>,
+    addon: HaAddonRef,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let Some(peer_addr) = config.peer_heartbeat_addr else {
@@ -343,7 +358,7 @@ async fn run_active_standby_monitor(
                         match timeout(heartbeat_interval, response.json::<HaHeartbeat>()).await {
                             Ok(Ok(peer)) => {
                                 last_seen = Some(Instant::now());
-                                reconcile_active_standby(runtime.as_ref(), peer).await;
+                                reconcile_active_standby(runtime.as_ref(), &node, &addon, peer).await?;
                             }
                             Ok(Err(err)) => warn!(peer = %peer_addr, error = %err, "failed to decode active-standby heartbeat"),
                             Err(_) => warn!(peer = %peer_addr, "timed out decoding active-standby heartbeat"),
@@ -362,7 +377,7 @@ async fn run_active_standby_monitor(
                     && last_seen.is_none_or(|seen| seen.elapsed() >= failover_timeout)
                 {
                     info!(node_id = runtime.node_id, "active-standby peer timed out; promoting local node");
-                    runtime.promote().await;
+                    promote_active_standby(runtime.as_ref(), &node, &addon).await?;
                 }
             }
         }
@@ -370,7 +385,12 @@ async fn run_active_standby_monitor(
     Ok(())
 }
 
-async fn reconcile_active_standby(runtime: &ActiveStandbyRuntime, peer: HaHeartbeat) {
+async fn reconcile_active_standby(
+    runtime: &ActiveStandbyRuntime,
+    node: &NodeConfig,
+    addon: &HaAddonRef,
+    peer: HaHeartbeat,
+) -> Result<()> {
     let local = runtime.heartbeat().await;
     let local_active = local.role.accepts_writes();
     let peer_active = peer.role.accepts_writes();
@@ -384,7 +404,7 @@ async fn reconcile_active_standby(runtime: &ActiveStandbyRuntime, peer: HaHeartb
                 local_epoch = local.epoch,
                 "active-standby detected two active nodes; demoting local node"
             );
-            runtime.demote().await;
+            demote_active_standby(runtime, node, addon).await?;
         }
         (false, false) if local.node_id < peer.node_id => {
             info!(
@@ -392,10 +412,47 @@ async fn reconcile_active_standby(runtime: &ActiveStandbyRuntime, peer: HaHeartb
                 peer_node_id = peer.node_id,
                 "active-standby detected two standby nodes; promoting lower node id"
             );
-            runtime.promote().await;
+            promote_active_standby(runtime, node, addon).await?;
         }
         _ => {}
     }
+    Ok(())
+}
+
+async fn promote_active_standby(
+    runtime: &ActiveStandbyRuntime,
+    node: &NodeConfig,
+    addon: &HaAddonRef,
+) -> Result<bool> {
+    if runtime.role().await.accepts_writes() {
+        return Ok(false);
+    }
+    run_required_ha_hook(
+        addon
+            .on_become_leader(HaContext::from_node(node, ClusterRole::Leader))
+            .await,
+        "on_become_leader",
+    )?;
+    runtime.promote().await;
+    Ok(true)
+}
+
+async fn demote_active_standby(
+    runtime: &ActiveStandbyRuntime,
+    node: &NodeConfig,
+    addon: &HaAddonRef,
+) -> Result<bool> {
+    if !runtime.role().await.accepts_writes() {
+        return Ok(false);
+    }
+    run_required_ha_hook(
+        addon
+            .on_step_down(HaContext::from_node(node, ClusterRole::Follower))
+            .await,
+        "on_step_down",
+    )?;
+    runtime.demote().await;
+    Ok(true)
 }
 
 fn heartbeat_endpoint(addr: &str) -> String {
@@ -636,25 +693,25 @@ async fn observe_ha_state(
     addon: &HaAddonRef,
     role: ClusterRole,
     leader: Option<NodeId>,
-) {
+) -> Result<()> {
     let ctx = HaContext::from_node(node, role);
     let was_active = state.previous_role.is_some_and(is_active_role);
     let is_active = is_active_role(role);
 
     if !state.initialized {
         if is_active {
-            run_ha_hook(
+            run_required_ha_hook(
                 addon.on_become_leader(ctx.clone()).await,
                 "on_become_leader",
-            );
+            )?;
         }
     } else if was_active && !is_active {
-        run_ha_hook(addon.on_step_down(ctx.clone()).await, "on_step_down");
+        run_required_ha_hook(addon.on_step_down(ctx.clone()).await, "on_step_down")?;
     } else if !was_active && is_active {
-        run_ha_hook(
+        run_required_ha_hook(
             addon.on_become_leader(ctx.clone()).await,
             "on_become_leader",
-        );
+        )?;
     }
 
     if !state.initialized || state.previous_leader != leader {
@@ -668,6 +725,7 @@ async fn observe_ha_state(
     state.initialized = true;
     state.previous_role = Some(role);
     state.previous_leader = leader;
+    Ok(())
 }
 
 fn is_active_role(role: ClusterRole) -> bool {
@@ -678,6 +736,14 @@ fn run_ha_hook(result: Result<()>, hook: &'static str) {
     if let Err(err) = result {
         warn!(hook, error = %err, "HA addon hook failed");
     }
+}
+
+fn run_required_ha_hook(result: Result<()>, hook: &'static str) -> Result<()> {
+    if let Err(err) = result {
+        warn!(hook, error = %err, "required HA addon hook failed");
+        return Err(err).with_context(|| format!("required HA addon hook {hook} failed"));
+    }
+    Ok(())
 }
 
 struct NoopHaAddon;
@@ -740,6 +806,8 @@ mod tests {
         events: Mutex<Vec<Event>>,
     }
 
+    struct FailingAddon;
+
     impl RecordingAddon {
         fn events(&self) -> Vec<Event> {
             self.events.lock().unwrap().clone()
@@ -792,6 +860,13 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl HaAddon for FailingAddon {
+        async fn on_become_leader(&self, _ctx: HaContext) -> Result<()> {
+            bail!("injected promotion hook failure")
+        }
+    }
+
     #[tokio::test]
     async fn observes_leader_promotion_and_step_down() {
         let node = NodeConfig { id: 1 };
@@ -806,8 +881,11 @@ mod tests {
             ClusterRole::Follower,
             Some(2),
         )
-        .await;
-        observe_ha_state(&mut state, &node, &addon_ref, ClusterRole::Leader, Some(1)).await;
+        .await
+        .unwrap();
+        observe_ha_state(&mut state, &node, &addon_ref, ClusterRole::Leader, Some(1))
+            .await
+            .unwrap();
         observe_ha_state(
             &mut state,
             &node,
@@ -815,7 +893,8 @@ mod tests {
             ClusterRole::Follower,
             Some(2),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(
             addon.events(),
@@ -1198,6 +1277,7 @@ mod tests {
         drop(unused_peer);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let addon: HaAddonRef = Arc::new(NoopHaAddon);
         let task = tokio::spawn(run_active_standby(
             HaActiveStandbyConfig {
                 enabled: true,
@@ -1207,7 +1287,9 @@ mod tests {
                 heartbeat_interval_ms: 10,
                 failover_timeout_ms: 40,
             },
+            NodeConfig { id: 2 },
             runtime.clone(),
+            addon,
             shutdown_rx,
         ));
 
@@ -1221,6 +1303,35 @@ mod tests {
         assert_eq!(runtime.role().await, ClusterRole::Leader);
         let _ = shutdown_tx.send(true);
         task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_standby_promotion_hook_failure_keeps_node_standby() {
+        let runtime = ActiveStandbyRuntime::new(2, HaInitialRole::Standby);
+        let addon: HaAddonRef = Arc::new(FailingAddon);
+
+        let err = promote_active_standby(&runtime, &NodeConfig { id: 2 }, &addon)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("injected promotion hook failure"));
+        assert_eq!(runtime.role().await, ClusterRole::Follower);
+    }
+
+    #[tokio::test]
+    async fn command_hook_timeout_kills_child_and_returns_error() {
+        let err = run_hook(
+            "sleep 5",
+            &HaContext {
+                node_id: 1,
+                role: ClusterRole::Leader,
+            },
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("timed out"));
     }
 
     #[test]
@@ -1254,26 +1365,53 @@ mod tests {
 
 async fn run_hook(command: &str, ctx: &HaContext, limit: Duration) -> Result<()> {
     info!(command, node_id = ctx.node_id, "running HA command hook");
-    let mut child = Command::new("sh");
-    child
+    let mut command_builder = Command::new("sh");
+    command_builder
         .arg("-c")
         .arg(command)
         .env("SIGPROXY_NODE_ID", ctx.node_id.to_string())
         .env("SIGPROXY_ROLE", format!("{:?}", ctx.role));
+    #[cfg(unix)]
+    unsafe {
+        command_builder.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command_builder
+        .spawn()
+        .context("failed to spawn HA command hook")?;
 
-    let output = timeout(limit, child.output())
-        .await
-        .context("HA command hook timed out")?
-        .context("failed to execute HA command hook")?;
+    let status = match timeout(limit, child.wait()).await {
+        Ok(result) => result.context("failed to execute HA command hook")?,
+        Err(_) => {
+            warn!(
+                command,
+                timeout_ms = limit.as_millis(),
+                "HA command hook timed out; killing child process"
+            );
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            bail!("HA command hook timed out");
+        }
+    };
 
-    if !output.status.success() {
+    if !status.success() {
         warn!(
             command,
-            status = ?output.status,
-            stderr = %String::from_utf8_lossy(&output.stderr),
+            status = ?status,
             "HA command hook failed"
         );
-        anyhow::bail!("HA command hook failed: {}", output.status);
+        anyhow::bail!("HA command hook failed: {}", status);
     }
     Ok(())
 }

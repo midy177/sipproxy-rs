@@ -577,8 +577,8 @@ SQLite schema 草案：
 
 Active-standby 生产启用前必修：
 
-- HA command hook 用作 VIP/EIP fencing 时，promotion 不能在 hook 失败后继续宣称 active。
-- HA hook 超时需要确保子进程被终止。
+- HA command hook 用作 VIP/EIP fencing 时，promotion 不能在 hook 失败后继续宣称 active。（已实现）
+- HA hook 超时需要确保子进程被终止。（已实现）
 - 配置校验需要在 `active_standby.enabled`、`replication.enabled` 下强制校验必要 peer 字段。
 
 ## 当前执行状态
@@ -619,4 +619,3 @@ Active-standby 生产启用前必修：
 待完成：
 
 - 继续审计剩余薄封装，能稳定复用 `rsipstack` typed API 的地方继续替换。
-- 启用 active-standby 生产漂移前修复 HA fencing hook 失败处理和 hook 超时子进程终止。
