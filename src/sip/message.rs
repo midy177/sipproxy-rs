@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use rsipstack::sip::headers::{Header, Headers, untyped::Path as UntypedPath};
+use rsipstack::sip::headers::{
+    Header, Headers,
+    untyped::{Path as UntypedPath, Route as UntypedRoute},
+};
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
     Auth, ContentLength, HasHeaders, HostWithPort, MaxForwards, Method, Param, Request, Response,
@@ -130,7 +133,7 @@ impl SipMessage {
         let headers = self.inner.headers_mut();
         match rest {
             Some(rest) if !rest.trim().is_empty() => {
-                headers.0[index] = Header::Other(name.to_string(), rest.trim().to_string());
+                headers.0[index] = header_from_name_value(name, rest.trim());
             }
             _ => {
                 headers.0.remove(index);
@@ -480,6 +483,14 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
     Ok((value, None))
 }
 
+fn header_from_name_value(name: &str, value: &str) -> Header {
+    if name.eq_ignore_ascii_case("Route") {
+        Header::Route(UntypedRoute::new(value.to_string()))
+    } else {
+        Header::Other(name.to_string(), value.to_string())
+    }
+}
+
 fn rewrite_via_received_rport(value: &str, peer: SocketAddr) -> String {
     let mut parts = value.split(';');
     let sent_protocol = parts.next().unwrap_or_default().trim();
@@ -772,5 +783,7 @@ Content-Length: 0\r\n\r\n",
             request.top_header_value("Route").unwrap().as_deref(),
             Some("<sip:edge.example.com;lr>")
         );
+        let wire = String::from_utf8(request.to_bytes()).unwrap();
+        assert!(wire.contains("Route: <sip:edge.example.com;lr>"));
     }
 }
