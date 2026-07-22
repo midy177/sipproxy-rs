@@ -112,16 +112,13 @@ servers = ["172.30.12.228:5060", "172.30.11.57:5060"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-interval_ms = 30000
-timeout_ms = 8000
+interval_ms = 15000
+timeout_ms = 3000
 success_threshold = 2
 failure_threshold = 3
 
 [proxy.upstream_groups.health_check.probe]
-mode = "options"
-transport = "udp"
-uri = "sip:healthcheck@${POD_IP:-}"
-success_codes = [200, 202, 405, 481]
+mode = "tcp-connect"
 
 # 5092 — plain UDP + TCP.
 [[proxy.upstream_groups]]
@@ -131,16 +128,13 @@ servers = ["172.30.12.228:5092", "172.30.11.57:5092"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-interval_ms = 30000
-timeout_ms = 8000
+interval_ms = 15000
+timeout_ms = 3000
 success_threshold = 2
 failure_threshold = 3
 
 [proxy.upstream_groups.health_check.probe]
-mode = "options"
-transport = "udp"
-uri = "sip:healthcheck@${POD_IP:-}"
-success_codes = [200, 202, 405, 481]
+mode = "tcp-connect"
 
 # 5061 / 5093 are TLS-only. The proxy has no TLS transport today (SipTransport
 # is udp/tcp only — see src/config.rs), so these groups/listeners are commented
