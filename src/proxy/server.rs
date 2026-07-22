@@ -164,6 +164,7 @@ struct UdpClientTransactionRef<'a> {
     request_started_at: Instant,
 }
 
+#[derive(Debug)]
 struct UdpPacket {
     packet: Vec<u8>,
     peer: SocketAddr,
@@ -189,6 +190,37 @@ impl UdpHandlerQueueDropLog {
         self.suppressed = 0;
         Some(suppressed)
     }
+}
+
+fn try_send_udp_packet_to_handlers(
+    handlers: &[mpsc::Sender<UdpPacket>],
+    next_handler: &mut usize,
+    packet: UdpPacket,
+) -> Result<usize, UdpPacket> {
+    if handlers.is_empty() {
+        return Err(packet);
+    }
+
+    let start = *next_handler % handlers.len();
+    let mut packet = Some(packet);
+    for offset in 0..handlers.len() {
+        let index = (start + offset) % handlers.len();
+        let candidate = packet
+            .take()
+            .expect("UDP packet should be available while trying handler queues");
+        match handlers[index].try_send(candidate) {
+            Ok(()) => {
+                *next_handler = (index + 1) % handlers.len();
+                return Ok(index);
+            }
+            Err(mpsc::error::TrySendError::Full(candidate))
+            | Err(mpsc::error::TrySendError::Closed(candidate)) => {
+                packet = Some(candidate);
+            }
+        }
+    }
+    *next_handler = (start + 1) % handlers.len();
+    Err(packet.expect("UDP packet should be returned when all handler queues reject it"))
 }
 
 struct ProxyMetricHandles {
@@ -921,11 +953,14 @@ impl ProxyServer {
                         }
                     };
                     let packet = buf[..len].to_vec();
-                    let handler_index = next_handler;
-                    next_handler = (next_handler + 1) % handlers.len();
-                    match handlers[handler_index].try_send(UdpPacket { packet, peer }) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(UdpPacket { packet, peer })) => {
+                    let first_handler_index = next_handler;
+                    match try_send_udp_packet_to_handlers(
+                        &handlers,
+                        &mut next_handler,
+                        UdpPacket { packet, peer },
+                    ) {
+                        Ok(_) => {}
+                        Err(UdpPacket { packet, peer }) => {
                             self.record_udp_handler_queue_drop(&listener);
                             if let Some(suppressed) =
                                 self.udp_handler_queue_drop_log_suppressed(&listener)
@@ -934,24 +969,9 @@ impl ProxyServer {
                                     %peer,
                                     bytes = packet.len(),
                                     preview = %packet_preview(&packet),
-                                    handler_index,
+                                    first_handler_index,
                                     suppressed_udp_handler_queue_drops = suppressed,
-                                    "dropping UDP SIP packet because handler queue is full"
-                                );
-                            }
-                        }
-                        Err(mpsc::error::TrySendError::Closed(UdpPacket { packet, peer })) => {
-                            self.record_udp_handler_queue_drop(&listener);
-                            if let Some(suppressed) =
-                                self.udp_handler_queue_drop_log_suppressed(&listener)
-                            {
-                                warn!(
-                                    %peer,
-                                    bytes = packet.len(),
-                                    preview = %packet_preview(&packet),
-                                    handler_index,
-                                    suppressed_udp_handler_queue_drops = suppressed,
-                                    "dropping UDP SIP packet because handler queue is closed"
+                                    "dropping UDP SIP packet because all handler queues are full or closed"
                                 );
                             }
                         }
@@ -9587,6 +9607,68 @@ Content-Length: 0\r\n\r\n"
             log.warn_if_due(start + UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL * 2),
             Some(0)
         );
+    }
+
+    #[test]
+    fn udp_handler_queue_send_scans_for_available_worker() {
+        let (first_tx, mut first_rx) = mpsc::channel::<UdpPacket>(1);
+        let (second_tx, mut second_rx) = mpsc::channel::<UdpPacket>(1);
+        first_tx
+            .try_send(UdpPacket {
+                packet: b"occupied".to_vec(),
+                peer: "127.0.0.1:10000".parse().unwrap(),
+            })
+            .unwrap();
+
+        let handlers = vec![first_tx, second_tx];
+        let mut next_handler = 0;
+        let sent_to = try_send_udp_packet_to_handlers(
+            &handlers,
+            &mut next_handler,
+            UdpPacket {
+                packet: b"payload".to_vec(),
+                peer: "127.0.0.1:10001".parse().unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sent_to, 1);
+        assert_eq!(next_handler, 0);
+        assert_eq!(first_rx.try_recv().unwrap().packet, b"occupied");
+        assert_eq!(second_rx.try_recv().unwrap().packet, b"payload");
+    }
+
+    #[test]
+    fn udp_handler_queue_send_returns_packet_when_all_workers_full() {
+        let (first_tx, _first_rx) = mpsc::channel::<UdpPacket>(1);
+        let (second_tx, _second_rx) = mpsc::channel::<UdpPacket>(1);
+        first_tx
+            .try_send(UdpPacket {
+                packet: b"occupied-1".to_vec(),
+                peer: "127.0.0.1:10000".parse().unwrap(),
+            })
+            .unwrap();
+        second_tx
+            .try_send(UdpPacket {
+                packet: b"occupied-2".to_vec(),
+                peer: "127.0.0.1:10001".parse().unwrap(),
+            })
+            .unwrap();
+
+        let handlers = vec![first_tx, second_tx];
+        let mut next_handler = 1;
+        let returned = try_send_udp_packet_to_handlers(
+            &handlers,
+            &mut next_handler,
+            UdpPacket {
+                packet: b"payload".to_vec(),
+                peer: "127.0.0.1:10002".parse().unwrap(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(returned.packet, b"payload");
+        assert_eq!(next_handler, 0);
     }
 
     #[tokio::test]
