@@ -45,7 +45,11 @@ pub struct SipMessage {
 impl SipMessage {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let inner = RsipMessage::try_from(bytes).context("failed to parse SIP message")?;
-        Ok(Self::from_inner(inner))
+        let mut message = Self::from_inner(inner);
+        if let Some(start_line) = parse_start_line(bytes) {
+            message.start_line = start_line;
+        }
+        Ok(message)
     }
 
     pub fn method(&self) -> Option<&str> {
@@ -350,7 +354,7 @@ impl SipMessage {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.inner.to_bytes()
+        replace_start_line(self.inner.to_bytes(), &self.start_line)
     }
 
     pub fn response_like(request: &Self, code: u16, reason: &str) -> Self {
@@ -371,12 +375,18 @@ impl SipMessage {
 
         let status_code =
             StatusCode::try_from((code, reason)).unwrap_or_else(|_| StatusCode::from(code));
-        Self::from_inner(RsipMessage::Response(Response {
+        let mut response = Self::from_inner(RsipMessage::Response(Response {
             status_code,
             version: Version::V2,
             headers,
             body: Vec::new(),
-        }))
+        }));
+        response.start_line = SipStartLine::Response {
+            version: "SIP/2.0".to_string(),
+            code,
+            reason: reason.to_string(),
+        };
+        response
     }
 
     pub fn options_request(
@@ -481,6 +491,59 @@ fn split_first_header_value(value: &str) -> Result<(&str, Option<&str>)> {
         anyhow::bail!("unclosed quoted header value");
     }
     Ok((value, None))
+}
+
+fn parse_start_line(bytes: &[u8]) -> Option<SipStartLine> {
+    let line_end = bytes.iter().position(|byte| *byte == b'\n')?;
+    let line = std::str::from_utf8(&bytes[..line_end]).ok()?;
+    let line = line.trim_end_matches('\r');
+    if line.starts_with("SIP/") {
+        let mut parts = line.splitn(3, ' ');
+        let version = parts.next()?.to_string();
+        let code = parts.next()?.parse::<u16>().ok()?;
+        let reason = parts.next().unwrap_or_default().to_string();
+        return Some(SipStartLine::Response {
+            version,
+            code,
+            reason,
+        });
+    }
+
+    let mut parts = line.splitn(3, ' ');
+    Some(SipStartLine::Request {
+        method: parts.next()?.to_string(),
+        uri: parts.next()?.to_string(),
+        version: parts.next()?.to_string(),
+    })
+}
+
+fn replace_start_line(mut bytes: Vec<u8>, start_line: &SipStartLine) -> Vec<u8> {
+    let Some(line_end) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return bytes;
+    };
+    let newline_start = if line_end > 0 && bytes[line_end - 1] == b'\r' {
+        line_end - 1
+    } else {
+        line_end
+    };
+    let rendered = render_start_line(start_line);
+    bytes.splice(0..newline_start, rendered.bytes());
+    bytes
+}
+
+fn render_start_line(start_line: &SipStartLine) -> String {
+    match start_line {
+        SipStartLine::Request {
+            method,
+            uri,
+            version,
+        } => format!("{method} {uri} {version}"),
+        SipStartLine::Response {
+            version,
+            code,
+            reason,
+        } => format!("{version} {code} {reason}"),
+    }
 }
 
 fn header_from_name_value(name: &str, value: impl Into<String>) -> Header {
@@ -610,6 +673,26 @@ CSeq: 1 OPTIONS\r\n\r\n",
                 .unwrap()
                 .starts_with("SIP/2.0 200 OK")
         );
+    }
+
+    #[test]
+    fn preserves_response_reason_phrase_when_rewriting_headers() {
+        let mut msg = SipMessage::parse(
+            b"SIP/2.0 482 Request merged\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1;rport\r\n\
+Call-ID: c1\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        msg.apply_top_via_received_rport("127.0.0.1:9500".parse().unwrap())
+            .unwrap();
+        let wire = String::from_utf8(msg.to_bytes()).unwrap();
+
+        assert!(wire.starts_with("SIP/2.0 482 Request merged"));
+        assert!(!wire.starts_with("SIP/2.0 482 Loop Detected"));
+        assert!(wire.contains("rport=9500"));
     }
 
     #[test]
