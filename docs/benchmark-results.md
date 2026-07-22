@@ -4,6 +4,49 @@ This file records benchmark runs that are useful as local baselines. The
 methodology and benchmark tool usage are documented in
 [benchmark.md](benchmark.md).
 
+## 2026-07-22 SIP Method Token Hot-Path Optimization
+
+Changes under test:
+
+- UDP and TCP request entry paths no longer allocate an owned `String` for the
+  SIP method on every packet.
+- Common SIP methods are normalized to static tokens and passed through the
+  forwarding, security, policy, and metrics hot paths as `&str`.
+- Transaction state still allocates where the method must be retained beyond
+  the current request.
+
+Environment:
+
+- Same host, bind addresses, mock upstream, and release binary setup as the
+  local UDP matrix below.
+- Git revision: `8ff74af` with local uncommitted `Cargo.toml` and `Cargo.lock`
+  dependency metadata changes.
+- Config: `preset = "off"`, persistence disabled, `reuse_port = false`,
+  `workers_per_listener = 1`.
+- Requests: 100,000 per scenario.
+- Concurrency: 64.
+
+| Scenario | Sent | OK | Timeout | Error | RPS | Mean ms | p50 ms | p95 ms | p99 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OPTIONS | 100,000 | 100,000 | 0 | 0 | 25,184.48 | 1.863 | 1.658 | 4.095 | 5.487 | 10.982 |
+| REGISTER | 100,000 | 100,000 | 0 | 0 | 24,139.81 | 2.576 | 2.611 | 3.500 | 4.477 | 9.783 |
+| INVITE | 100,000 | 100,000 | 0 | 0 | 13,370.52 | 4.479 | 3.975 | 9.478 | 12.589 | 24.256 |
+
+Result:
+
+- All three response scenarios completed with zero timeout and zero client
+  socket errors.
+- OPTIONS remained in the same throughput band as the prior handle-based metric
+  run; REGISTER p99 improved in this local run, while INVITE remained the
+  heaviest scenario and was within normal local-run variance.
+
+Raw result files:
+
+- `target/bench/optimization/method-token/options-100k.json`
+- `target/bench/optimization/method-token/register-100k.json`
+- `target/bench/optimization/method-token/invite-100k.json`
+- `target/bench/optimization/method-token/metrics.txt`
+
 ## 2026-07-22 Local UDP Matrix
 
 Environment:
