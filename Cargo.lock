@@ -2034,6 +2034,7 @@ dependencies = [
  "aya",
  "bytes",
  "clap",
+ "if-addrs",
  "libc",
  "reqwest",
  "rsipstack",

@@ -21,6 +21,7 @@ use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
 use axum::{Router, extract::State, routing::get};
 use bytes::BytesMut;
+use if_addrs::get_if_addrs;
 use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::sip::{
     Transport as RsipTransport, Uri as RsipUri,
@@ -85,6 +86,7 @@ pub struct ProxyServer {
     local_invite_rejections: Mutex<HashMap<String, Instant>>,
     tcp_upstreams: TcpUpstreamPool,
     advertised_addrs: Mutex<HashMap<String, String>>,
+    local_ips: HashSet<IpAddr>,
 }
 
 struct UdpToTcpForward<'a> {
@@ -150,6 +152,7 @@ impl ProxyServer {
         let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
         let metrics = Arc::new(ProxyMetrics::default());
         let metric_handles = ProxyMetricHandles::new(&metrics);
+        let local_ips = local_interface_ips();
         Ok(Self {
             config,
             state,
@@ -167,6 +170,7 @@ impl ProxyServer {
             local_invite_rejections: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
             advertised_addrs: Mutex::new(HashMap::new()),
+            local_ips,
         })
     }
 
@@ -1398,7 +1402,7 @@ impl ProxyServer {
             } else {
                 None
             };
-        let target = if method == "ACK"
+        let mut target = if method == "ACK"
             && let Some(target) = direct_request_uri_target
         {
             self.record_affinity_lookup("request-uri-target");
@@ -1467,6 +1471,17 @@ impl ProxyServer {
             self.record_affinity_lookup("miss");
             self.select_upstream(&request_uri, listener)
         };
+        if !self.upstreams.contains(target.addr)
+            && self.is_advertised_or_listener_addr(target.addr, listener)
+        {
+            warn!(
+                listener = %listener.key(),
+                method,
+                target = %target.addr,
+                "selected proxy self address as SIP forward target; falling back to upstream group"
+            );
+            target = self.select_upstream(&request_uri, listener);
+        }
 
         self.pop_own_route_headers(&mut message, listener, target.addr)
             .await?;
@@ -1625,12 +1640,20 @@ impl ProxyServer {
         .any(|configured| {
             parse_socket_addr_with_default_port(configured, listener_port(listener))
                 .is_some_and(|external| external == addr)
-        }) || listener
-            .bind
-            .parse::<SocketAddr>()
-            .ok()
-            .filter(|bind| !bind.ip().is_unspecified())
-            .is_some_and(|bind| bind == addr)
+        }) || self.listener_bind_matches_addr(addr, listener)
+    }
+
+    fn listener_bind_matches_addr(&self, addr: SocketAddr, listener: &ProxyListenerConfig) -> bool {
+        let Ok(bind) = listener.bind.parse::<SocketAddr>() else {
+            return false;
+        };
+        if bind.port() != addr.port() {
+            return false;
+        }
+        if bind.ip().is_unspecified() {
+            return self.local_ips.contains(&addr.ip());
+        }
+        bind == addr
     }
 
     async fn advertised_sip_addr(
@@ -4801,6 +4824,19 @@ fn parse_socket_addr_with_default_port(value: &str, default_port: u16) -> Option
     render_advertised_addr(value, default_port)?.parse().ok()
 }
 
+fn local_interface_ips() -> HashSet<IpAddr> {
+    match get_if_addrs() {
+        Ok(addrs) => addrs.into_iter().map(|addr| addr.ip()).collect(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to enumerate local interface addresses; wildcard listener self-detection is limited"
+            );
+            HashSet::new()
+        }
+    }
+}
+
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.and_then(|value| {
         let value = value.trim();
@@ -5005,6 +5041,15 @@ mod tests {
         }
     }
 
+    fn test_wildcard_listener() -> ProxyListenerConfig {
+        ProxyListenerConfig {
+            bind: "0.0.0.0:5060".to_string(),
+            transport: SipTransport::Udp,
+            upstream_group: "default".to_string(),
+            security: None,
+        }
+    }
+
     fn test_tcp_listener() -> ProxyListenerConfig {
         ProxyListenerConfig {
             bind: "127.0.0.1:5060".to_string(),
@@ -5082,6 +5127,40 @@ mod tests {
                     affinity: Default::default(),
                     security: Default::default(),
                     listeners: vec![test_listener()],
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream.to_string()],
+                    }],
+                    routes: vec![],
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn test_server_with_wildcard_listener_and_trusted_peer(upstream: SocketAddr) -> ProxyServer {
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        ProxyServer::new(
+            Config {
+                proxy: ProxyConfig {
+                    record_route: true,
+                    register_routing: None,
+                    rewrite_register_contact: false,
+                    socket: ProxySocketConfig::default(),
+                    metrics: Default::default(),
+                    affinity: Default::default(),
+                    security: ProxySecurityConfig {
+                        trusted_cidrs: Some(vec!["127.0.0.0/8".to_string()]),
+                        ..ProxySecurityConfig::default()
+                    },
+                    listeners: vec![test_wildcard_listener()],
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -5971,6 +6050,39 @@ Content-Length: 0\r\n\r\n",
                 .contact,
             "sip:100@127.0.0.1:5061"
         );
+    }
+
+    #[tokio::test]
+    async fn wildcard_listener_treats_local_request_uri_as_proxy_address() {
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_wildcard_listener_and_trusted_peer(
+            upstream_socket.local_addr().unwrap(),
+        );
+        let listener = test_wildcard_listener();
+        let message = SipMessage::parse(
+            b"REGISTER sip:127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:9400;rport;branch=z9hG4bK-local-uri\r\n\
+From: <sip:11199@example.com>;tag=a\r\n\
+To: <sip:11199@example.com>\r\n\
+Contact: <sip:11199@127.0.0.1:9400;transport=UDP>\r\n\
+Call-ID: local-uri-register\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+        )
+        .unwrap();
+
+        assert!(server.request_uri_targets_this_proxy("sip:127.0.0.1:5060", &listener));
+        let (_message, target, _branch, _invite_transaction_key) = server
+            .prepare_forward(
+                message,
+                "127.0.0.1:9400".parse().unwrap(),
+                &listener,
+                "REGISTER",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(target.addr, upstream_socket.local_addr().unwrap());
     }
 
     #[tokio::test]
