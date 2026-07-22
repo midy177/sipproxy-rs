@@ -1836,16 +1836,18 @@ impl ProxyServer {
         let from_upstream = self.upstreams.contains(_peer);
         let from_trusted_peer =
             self.user_space_security_enabled && self.security.is_trusted_peer(listener, _peer.ip());
-        let route_set_targets_this_proxy = if from_upstream || from_trusted_peer {
-            self.top_route_targets_this_proxy(&message, listener, _peer)
-                .await?
-        } else {
-            false
-        };
-        let request_uri_targets_this_proxy =
-            self.request_uri_targets_this_proxy(&request_uri, listener);
+        let route_set_targets_this_proxy =
+            if from_upstream || from_trusted_peer || message.top_header_value("Route")?.is_some() {
+                self.top_route_targets_this_proxy(&message, listener, _peer)
+                    .await?
+            } else {
+                false
+            };
+        let request_uri_target = parse_contact_target(&request_uri, listener.transport);
         let direct_request_uri_target = if from_upstream || from_trusted_peer {
-            self.direct_request_uri_target(&request_uri, listener)
+            request_uri_target
+                .filter(|target| !self.upstreams.contains(target.addr))
+                .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
         } else {
             None
         };
@@ -1869,24 +1871,19 @@ impl ProxyServer {
         } else if let Some(route) = transaction_route.as_ref() {
             self.record_affinity_lookup("transaction-hit");
             route.target
-        } else if from_upstream
-            || request_uri_targets_this_proxy
-            || (from_trusted_peer && route_set_targets_this_proxy)
-        {
+        } else if from_upstream || route_set_targets_this_proxy {
             if let Some(binding) = self
                 .lookup_delivery_registration_binding(
                     &message,
                     &request_uri,
-                    from_upstream || (from_trusted_peer && route_set_targets_this_proxy),
+                    from_upstream || route_set_targets_this_proxy,
                 )
                 .await
             {
                 self.record_affinity_lookup("location-hit");
                 target_for_registration_binding(&binding, listener.transport)
                     .unwrap_or_else(|| self.select_upstream(&request_uri, listener))
-            } else if (from_upstream || (from_trusted_peer && route_set_targets_this_proxy))
-                && let Some(target) = self.direct_request_uri_target(&request_uri, listener)
-            {
+            } else if let Some(target) = direct_request_uri_target {
                 self.record_affinity_lookup("request-uri-target");
                 target
             } else if let Some(target) = self.affinity.lookup(&message).await? {
@@ -2006,16 +2003,7 @@ impl ProxyServer {
         Ok(self.route_targets_this_proxy(&route, listener, peer).await)
     }
 
-    fn direct_request_uri_target(
-        &self,
-        request_uri: &str,
-        listener: &ProxyListenerConfig,
-    ) -> Option<UpstreamTarget> {
-        parse_contact_target(request_uri, listener.transport)
-            .filter(|target| !self.upstreams.contains(target.addr))
-            .filter(|target| !self.is_advertised_or_listener_addr(target.addr, listener))
-    }
-
+    #[cfg(test)]
     fn request_uri_targets_this_proxy(
         &self,
         request_uri: &str,
@@ -7472,6 +7460,78 @@ Content-Length: 0\r\n\r\n",
         let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
         let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(forwarded.starts_with("INVITE sip:3001@example.com SIP/2.0"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                registered_client_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_invite_to_proxy_address_uses_upstream_not_registered_location() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let caller_peer: SocketAddr = "127.0.0.1:5061".parse().unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-3001-proxy-uri\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-3001-proxy-uri\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_client_socket.recv_from(&mut buf).await.unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-downstream-proxy-uri\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: downstream-proxy-uri-uses-upstream\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n",
+                caller_peer,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3001@127.0.0.1:5060 SIP/2.0"));
         assert!(
             timeout(
                 Duration::from_millis(100),
