@@ -35,8 +35,8 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -61,9 +61,26 @@ const SECURITY_MAP_SHARDS: usize = 64;
 const ROUTE_MAP_SHARDS: usize = 64;
 const METRIC_TRANSPORT_COUNT: usize = 2;
 const METRIC_METHOD_COUNT: usize = 8;
+const METRIC_STATUS_CLASS_COUNT: usize = 7;
+const METRIC_LOCAL_RESPONSE_CODE_COUNT: usize = 4;
+const METRIC_AFFINITY_LOOKUP_RESULT_COUNT: usize = 8;
 const METRIC_TRANSPORTS: [&str; METRIC_TRANSPORT_COUNT] = ["udp", "tcp"];
 const METRIC_METHODS: [&str; METRIC_METHOD_COUNT] = [
     "ACK", "BYE", "CANCEL", "INVITE", "MESSAGE", "OPTIONS", "REGISTER", "UNKNOWN",
+];
+const METRIC_STATUS_CLASSES: [&str; METRIC_STATUS_CLASS_COUNT] =
+    ["1xx", "2xx", "3xx", "4xx", "5xx", "6xx", "other"];
+const METRIC_LOCAL_RESPONSE_CODE_LABELS: [&str; METRIC_LOCAL_RESPONSE_CODE_COUNT] =
+    ["400", "403", "483", "503"];
+const METRIC_AFFINITY_LOOKUP_RESULTS: [&str; METRIC_AFFINITY_LOOKUP_RESULT_COUNT] = [
+    "hit",
+    "location-hit",
+    "miss",
+    "registered-upstream-hit",
+    "registered-upstream-unhealthy",
+    "request-uri-target",
+    "transaction-hit",
+    "wrong-side",
 ];
 const UPSTREAM_RESPONSE_LATENCY_MS_FINITE_BUCKET_COUNT: usize = 13;
 const UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT: usize =
@@ -98,7 +115,7 @@ pub struct ProxyServer {
     invite_transactions: ShardedStringMap<InviteTransactionRoute>,
     local_invite_rejections: Mutex<HashMap<String, Instant>>,
     tcp_upstreams: TcpUpstreamPool,
-    advertised_addrs: Mutex<HashMap<String, String>>,
+    advertised_addrs: StdRwLock<HashMap<String, String>>,
     local_ips: HashSet<IpAddr>,
 }
 
@@ -123,6 +140,10 @@ struct ProxyMetricHandles {
     sip_requests: [[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT],
     forwarded_requests:
         [[[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT]; METRIC_TRANSPORT_COUNT],
+    forward_errors: [CounterHandle; METRIC_TRANSPORT_COUNT],
+    local_responses: [[CounterHandle; METRIC_LOCAL_RESPONSE_CODE_COUNT]; METRIC_TRANSPORT_COUNT],
+    upstream_responses: [[CounterHandle; METRIC_STATUS_CLASS_COUNT]; METRIC_TRANSPORT_COUNT],
+    affinity_lookups: [CounterHandle; METRIC_AFFINITY_LOOKUP_RESULT_COUNT],
     upstream_response_latency_buckets: [[[[CounterHandle; UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT];
         METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT];
         METRIC_TRANSPORT_COUNT],
@@ -159,6 +180,40 @@ impl ProxyMetricHandles {
                         )
                     })
                 })
+            }),
+            forward_errors: std::array::from_fn(|transport| {
+                metrics.counter(
+                    "proxy_forward_errors_total",
+                    &[("downstream_transport", METRIC_TRANSPORTS[transport])],
+                )
+            }),
+            local_responses: std::array::from_fn(|transport| {
+                std::array::from_fn(|code| {
+                    metrics.counter(
+                        "sip_local_responses_total",
+                        &[
+                            ("transport", METRIC_TRANSPORTS[transport]),
+                            ("code", METRIC_LOCAL_RESPONSE_CODE_LABELS[code]),
+                        ],
+                    )
+                })
+            }),
+            upstream_responses: std::array::from_fn(|transport| {
+                std::array::from_fn(|class| {
+                    metrics.counter(
+                        "sip_upstream_responses_total",
+                        &[
+                            ("transport", METRIC_TRANSPORTS[transport]),
+                            ("class", METRIC_STATUS_CLASSES[class]),
+                        ],
+                    )
+                })
+            }),
+            affinity_lookups: std::array::from_fn(|result| {
+                metrics.counter(
+                    "proxy_affinity_lookup_total",
+                    &[("result", METRIC_AFFINITY_LOOKUP_RESULTS[result])],
+                )
             }),
             upstream_response_latency_buckets: std::array::from_fn(|downstream| {
                 std::array::from_fn(|upstream| {
@@ -242,7 +297,7 @@ impl ProxyServer {
             invite_transactions: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             local_invite_rejections: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
-            advertised_addrs: Mutex::new(HashMap::new()),
+            advertised_addrs: StdRwLock::new(HashMap::new()),
             local_ips,
         })
     }
@@ -1881,16 +1936,22 @@ impl ProxyServer {
         target: SocketAddr,
     ) -> String {
         let cache_key = format!("{}|{}|{}", side.as_str(), listener.key(), target);
-        if let Some(addr) = self.advertised_addrs.lock().await.get(&cache_key).cloned() {
-            return addr;
+        {
+            let cache = self
+                .advertised_addrs
+                .read()
+                .expect("advertised address cache rwlock poisoned");
+            if let Some(addr) = cache.get(&cache_key) {
+                return addr.clone();
+            }
         }
 
         let addr = self
             .resolve_advertised_sip_addr(side, listener, target)
             .await;
         self.advertised_addrs
-            .lock()
-            .await
+            .write()
+            .expect("advertised address cache rwlock poisoned")
             .insert(cache_key, addr.clone());
         addr
     }
@@ -2169,6 +2230,11 @@ impl ProxyServer {
     }
 
     fn record_forward_error(&self, downstream_transport: &str) {
+        if let Some(transport) = metric_transport_index(downstream_transport) {
+            self.metric_handles.forward_errors[transport].incr();
+            return;
+        }
+
         self.metrics.incr(
             "proxy_forward_errors_total",
             &[("downstream_transport", downstream_transport)],
@@ -2176,6 +2242,14 @@ impl ProxyServer {
     }
 
     fn record_local_response(&self, transport: &str, code: u16) {
+        if let (Some(transport), Some(code_index)) = (
+            metric_transport_index(transport),
+            metric_local_response_code_index(code),
+        ) {
+            self.metric_handles.local_responses[transport][code_index].incr();
+            return;
+        }
+
         let code = code.to_string();
         self.metrics.incr(
             "sip_local_responses_total",
@@ -2185,6 +2259,14 @@ impl ProxyServer {
 
     fn record_upstream_response(&self, transport: &str, code: u16) {
         let class = status_class(code);
+        if let (Some(transport), Some(class)) = (
+            metric_transport_index(transport),
+            metric_status_class_index(class),
+        ) {
+            self.metric_handles.upstream_responses[transport][class].incr();
+            return;
+        }
+
         self.metrics.incr(
             "sip_upstream_responses_total",
             &[("transport", transport), ("class", class)],
@@ -2267,6 +2349,11 @@ impl ProxyServer {
     }
 
     fn record_affinity_lookup(&self, result: &str) {
+        if let Some(result) = metric_affinity_lookup_result_index(result) {
+            self.metric_handles.affinity_lookups[result].incr();
+            return;
+        }
+
         self.metrics
             .incr("proxy_affinity_lookup_total", &[("result", result)]);
     }
@@ -4615,6 +4702,43 @@ fn metric_method_index(method: &str) -> Option<usize> {
         "OPTIONS" => Some(5),
         "REGISTER" => Some(6),
         "UNKNOWN" => Some(7),
+        _ => None,
+    }
+}
+
+fn metric_status_class_index(class: &str) -> Option<usize> {
+    match class {
+        "1xx" => Some(0),
+        "2xx" => Some(1),
+        "3xx" => Some(2),
+        "4xx" => Some(3),
+        "5xx" => Some(4),
+        "6xx" => Some(5),
+        "other" => Some(6),
+        _ => None,
+    }
+}
+
+fn metric_local_response_code_index(code: u16) -> Option<usize> {
+    match code {
+        400 => Some(0),
+        403 => Some(1),
+        483 => Some(2),
+        503 => Some(3),
+        _ => None,
+    }
+}
+
+fn metric_affinity_lookup_result_index(result: &str) -> Option<usize> {
+    match result {
+        "hit" => Some(0),
+        "location-hit" => Some(1),
+        "miss" => Some(2),
+        "registered-upstream-hit" => Some(3),
+        "registered-upstream-unhealthy" => Some(4),
+        "request-uri-target" => Some(5),
+        "transaction-hit" => Some(6),
+        "wrong-side" => Some(7),
         _ => None,
     }
 }
