@@ -1248,10 +1248,10 @@ impl ProxyServer {
             return Ok(());
         }
 
-        let Some(method) = message.method().map(str::to_string) else {
+        let Some(method) = message.method().and_then(canonical_sip_method) else {
             return Ok(());
         };
-        self.record_sip_request("tcp", method.as_str());
+        self.record_sip_request("tcp", method);
 
         let mut message = message;
         if method == "ACK" && self.consume_local_invite_ack(&message).await {
@@ -1260,7 +1260,7 @@ impl ProxyServer {
         }
         if let Some(reason) = self
             .security
-            .check_sip_request(listener, peer, &message, method.as_str())
+            .check_sip_request(listener, peer, &message, method)
             .await
         {
             self.record_security_drop(listener, reason);
@@ -1272,14 +1272,14 @@ impl ProxyServer {
                 self.record_security_drop(listener, reason);
             }
             let response = SipMessage::response_like(&message, 503, "Service Unavailable");
-            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&message, method)
                 .await;
             self.record_local_response("tcp", 503);
             stream.write_all(&response.to_bytes()).await?;
             return Ok(());
         }
         if let Some(reason) = self
-            .check_sip_policy(listener, peer, &message, method.as_str())
+            .check_sip_policy(listener, peer, &message, method)
             .await
         {
             self.record_security_drop(listener, reason);
@@ -1291,7 +1291,7 @@ impl ProxyServer {
                 self.record_security_drop(listener, reason);
             }
             let response = SipMessage::response_like(&message, 403, "Forbidden");
-            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&message, method)
                 .await;
             self.record_local_response("tcp", 403);
             stream.write_all(&response.to_bytes()).await?;
@@ -1301,7 +1301,7 @@ impl ProxyServer {
             Ok(true) => {}
             Ok(false) => {
                 let response = SipMessage::response_like(&message, 483, "Too Many Hops");
-                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                self.remember_local_invite_rejection_if_needed(&message, method)
                     .await;
                 self.record_local_response("tcp", 483);
                 stream.write_all(&response.to_bytes()).await?;
@@ -1310,7 +1310,7 @@ impl ProxyServer {
             Err(err) => {
                 warn!(%peer, error = %err, "invalid Max-Forwards header");
                 let response = SipMessage::response_like(&message, 400, "Bad Request");
-                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                self.remember_local_invite_rejection_if_needed(&message, method)
                     .await;
                 self.record_local_response("tcp", 400);
                 stream.write_all(&response.to_bytes()).await?;
@@ -1318,14 +1318,14 @@ impl ProxyServer {
             }
         }
         if let Err(err) = self
-            .forward_tcp_stream(stream, message, peer, listener, method.as_str())
+            .forward_tcp_stream(stream, message, peer, listener, method)
             .await
         {
             error!(error = %format!("{err:#}"), "failed to forward TCP SIP request");
             self.record_forward_error("tcp");
             let request = SipMessage::parse(packet)?;
             let response = SipMessage::response_like(&request, 503, "Service Unavailable");
-            self.remember_local_invite_rejection_if_needed(&request, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&request, method)
                 .await;
             self.record_local_response("tcp", 503);
             stream.write_all(&response.to_bytes()).await?;
@@ -1374,10 +1374,10 @@ impl ProxyServer {
             return self.handle_udp_response(socket, message, peer).await;
         }
 
-        let Some(method) = message.method().map(str::to_string) else {
+        let Some(method) = message.method().and_then(canonical_sip_method) else {
             return Ok(());
         };
-        self.record_sip_request("udp", method.as_str());
+        self.record_sip_request("udp", method);
 
         let mut message = message;
         if method == "ACK" && self.consume_local_invite_ack(&message).await {
@@ -1386,7 +1386,7 @@ impl ProxyServer {
         }
         if let Some(reason) = self
             .security
-            .check_sip_request(listener, peer, &message, method.as_str())
+            .check_sip_request(listener, peer, &message, method)
             .await
         {
             self.record_security_drop(listener, reason);
@@ -1399,14 +1399,14 @@ impl ProxyServer {
             }
             let mut response = SipMessage::response_like(&message, 503, "Service Unavailable");
             response.apply_top_via_received_rport(peer)?;
-            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&message, method)
                 .await;
             self.record_local_response("udp", 503);
             socket.send_to(&response.to_bytes(), peer).await?;
             return Ok(());
         }
         if let Some(reason) = self
-            .check_sip_policy(listener, peer, &message, method.as_str())
+            .check_sip_policy(listener, peer, &message, method)
             .await
         {
             self.record_security_drop(listener, reason);
@@ -1419,7 +1419,7 @@ impl ProxyServer {
             }
             let mut response = SipMessage::response_like(&message, 403, "Forbidden");
             response.apply_top_via_received_rport(peer)?;
-            self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&message, method)
                 .await;
             self.record_local_response("udp", 403);
             socket.send_to(&response.to_bytes(), peer).await?;
@@ -1430,7 +1430,7 @@ impl ProxyServer {
             Ok(false) => {
                 let mut response = SipMessage::response_like(&message, 483, "Too Many Hops");
                 response.apply_top_via_received_rport(peer)?;
-                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                self.remember_local_invite_rejection_if_needed(&message, method)
                     .await;
                 self.record_local_response("udp", 483);
                 socket.send_to(&response.to_bytes(), peer).await?;
@@ -1440,7 +1440,7 @@ impl ProxyServer {
                 warn!(%peer, error = %err, "invalid Max-Forwards header");
                 let mut response = SipMessage::response_like(&message, 400, "Bad Request");
                 response.apply_top_via_received_rport(peer)?;
-                self.remember_local_invite_rejection_if_needed(&message, method.as_str())
+                self.remember_local_invite_rejection_if_needed(&message, method)
                     .await;
                 self.record_local_response("udp", 400);
                 socket.send_to(&response.to_bytes(), peer).await?;
@@ -1448,7 +1448,7 @@ impl ProxyServer {
             }
         }
         if let Err(err) = self
-            .forward_udp(socket, message, peer, listener, method.as_str())
+            .forward_udp(socket, message, peer, listener, method)
             .await
         {
             error!(error = %format!("{err:#}"), "failed to forward UDP SIP request");
@@ -1456,7 +1456,7 @@ impl ProxyServer {
             let request = SipMessage::parse(packet)?;
             let mut response = SipMessage::response_like(&request, 503, "Service Unavailable");
             response.apply_top_via_received_rport(peer)?;
-            self.remember_local_invite_rejection_if_needed(&request, method.as_str())
+            self.remember_local_invite_rejection_if_needed(&request, method)
                 .await;
             self.record_local_response("udp", 503);
             socket.send_to(&response.to_bytes(), peer).await?;
@@ -3022,6 +3022,26 @@ struct PendingRegisterBinding {
 enum SecurityDecision {
     Allow,
     Drop(&'static str),
+}
+
+fn canonical_sip_method(method: &str) -> Option<&'static str> {
+    match method {
+        "INVITE" => Some("INVITE"),
+        "ACK" => Some("ACK"),
+        "BYE" => Some("BYE"),
+        "CANCEL" => Some("CANCEL"),
+        "REGISTER" => Some("REGISTER"),
+        "OPTIONS" => Some("OPTIONS"),
+        "SUBSCRIBE" => Some("SUBSCRIBE"),
+        "NOTIFY" => Some("NOTIFY"),
+        "REFER" => Some("REFER"),
+        "MESSAGE" => Some("MESSAGE"),
+        "UPDATE" => Some("UPDATE"),
+        "INFO" => Some("INFO"),
+        "PRACK" => Some("PRACK"),
+        "PUBLISH" => Some("PUBLISH"),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
