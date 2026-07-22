@@ -50,6 +50,11 @@ record_route = true
 #   do not support Path or need sigproxy to be stored as the reachable Contact.
 register_routing = "path"
 
+# Maximum cached UDP client transactions for retransmission handling.
+# Increase for very high concurrent UDP transaction counts; lower it to cap
+# memory during abnormal retransmission floods.
+udp_client_transaction_cache_entries = 65536
+
 # Legacy compatibility equivalent to register_routing = "contact-rewrite".
 # rewrite_register_contact = true
 

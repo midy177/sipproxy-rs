@@ -65,6 +65,9 @@ const METRIC_TRANSPORTS: [&str; METRIC_TRANSPORT_COUNT] = ["udp", "tcp"];
 const METRIC_METHODS: [&str; METRIC_METHOD_COUNT] = [
     "ACK", "BYE", "CANCEL", "INVITE", "MESSAGE", "OPTIONS", "REGISTER", "UNKNOWN",
 ];
+const UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS: [u64; 13] = [
+    1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000,
+];
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -104,6 +107,7 @@ struct UdpToTcpForward<'a> {
 struct UdpClientTransactionRef<'a> {
     branch: &'a str,
     key: Option<&'a str>,
+    request_started_at: Instant,
 }
 
 struct ProxyMetricHandles {
@@ -724,6 +728,10 @@ impl ProxyServer {
                 created_at: Instant::now(),
             },
         );
+        enforce_udp_client_transaction_shard_limit(
+            &mut transactions,
+            self.udp_client_transaction_shard_limit(),
+        );
     }
 
     async fn remember_udp_client_transaction_final_response(&self, key: &str, response: Vec<u8>) {
@@ -738,6 +746,14 @@ impl ProxyServer {
 
     async fn remove_udp_client_transaction(&self, key: &str) {
         self.udp_client_transactions.remove(key).await;
+    }
+
+    fn udp_client_transaction_shard_limit(&self) -> usize {
+        self.config
+            .proxy
+            .udp_client_transaction_cache_entries
+            .div_ceil(ROUTE_MAP_SHARDS)
+            .max(1)
     }
 
     async fn remember_successful_forward(
@@ -843,6 +859,12 @@ impl ProxyServer {
             if let SipStartLine::Response { code, .. } = &response_message.start_line {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams.record_passive_result(upstream, *code < 500);
+                self.record_upstream_response_latency(
+                    "udp",
+                    SipTransport::Tcp,
+                    method,
+                    transaction.request_started_at.elapsed(),
+                );
                 self.apply_register_response(transaction.branch, &response_message, *code)
                     .await;
             }
@@ -1204,6 +1226,12 @@ impl ProxyServer {
             self.record_upstream_response("udp", *code);
             self.upstreams
                 .record_passive_result(route.upstream, *code < 500);
+            self.record_upstream_response_latency(
+                "udp",
+                SipTransport::Udp,
+                route.method.as_str(),
+                route.created_at.elapsed(),
+            );
             self.apply_register_response(&branch, &message, *code).await;
         }
         message
@@ -1341,6 +1369,7 @@ impl ProxyServer {
                         UdpBranchRoute {
                             client_peer: peer,
                             upstream: target.addr,
+                            method: method.to_string(),
                             created_at: Instant::now(),
                             remove_on_final: method != "INVITE",
                             client_transaction_key: client_transaction_key.clone(),
@@ -1401,6 +1430,7 @@ impl ProxyServer {
             method,
         } = request;
         let packet = message.to_bytes();
+        let request_started_at = Instant::now();
         let mut responses = match self
             .tcp_upstreams
             .send_request(upstream, &branch, &packet)
@@ -1434,6 +1464,7 @@ impl ProxyServer {
             UdpClientTransactionRef {
                 branch: &branch,
                 key: client_transaction_key.as_deref(),
+                request_started_at,
             },
             method,
         )
@@ -1453,6 +1484,7 @@ impl ProxyServer {
             .await?;
         self.record_forwarded_request("tcp", target.transport, Some(method));
         let packet = message.to_bytes();
+        let request_started_at = Instant::now();
         let mut responses = match self
             .tcp_upstreams
             .send_request(target.addr, &branch, &packet)
@@ -1479,6 +1511,12 @@ impl ProxyServer {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams
                     .record_passive_result(target.addr, *code < 500);
+                self.record_upstream_response_latency(
+                    "tcp",
+                    target.transport,
+                    method,
+                    request_started_at.elapsed(),
+                );
                 self.apply_register_response(&branch, &response_message, *code)
                     .await;
             }
@@ -2092,6 +2130,57 @@ impl ProxyServer {
         );
     }
 
+    fn record_upstream_response_latency(
+        &self,
+        downstream_transport: &'static str,
+        upstream_transport: SipTransport,
+        method: &str,
+        elapsed: Duration,
+    ) {
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let upstream_transport = upstream_transport.as_str();
+        for bucket in UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS {
+            if elapsed_ms <= bucket {
+                let le = latency_bucket_label(bucket);
+                self.metrics.incr(
+                    "proxy_upstream_response_latency_ms_bucket",
+                    &[
+                        ("downstream_transport", downstream_transport),
+                        ("upstream_transport", upstream_transport),
+                        ("method", method),
+                        ("le", le),
+                    ],
+                );
+            }
+        }
+        self.metrics.incr(
+            "proxy_upstream_response_latency_ms_bucket",
+            &[
+                ("downstream_transport", downstream_transport),
+                ("upstream_transport", upstream_transport),
+                ("method", method),
+                ("le", "+Inf"),
+            ],
+        );
+        self.metrics.incr(
+            "proxy_upstream_response_latency_ms_count",
+            &[
+                ("downstream_transport", downstream_transport),
+                ("upstream_transport", upstream_transport),
+                ("method", method),
+            ],
+        );
+        self.metrics.incr_by(
+            "proxy_upstream_response_latency_ms_sum",
+            &[
+                ("downstream_transport", downstream_transport),
+                ("upstream_transport", upstream_transport),
+                ("method", method),
+            ],
+            elapsed_ms,
+        );
+    }
+
     fn record_affinity_lookup(&self, result: &str) {
         self.metrics
             .incr("proxy_affinity_lookup_total", &[("result", result)]);
@@ -2514,6 +2603,7 @@ struct UpstreamServerRef {
 struct UdpBranchRoute {
     client_peer: SocketAddr,
     upstream: SocketAddr,
+    method: String,
     created_at: Instant,
     remove_on_final: bool,
     client_transaction_key: Option<String>,
@@ -4385,6 +4475,22 @@ fn prune_udp_client_transactions(
     transactions.retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL);
 }
 
+fn enforce_udp_client_transaction_shard_limit(
+    transactions: &mut HashMap<String, UdpClientTransactionRoute>,
+    limit: usize,
+) {
+    while transactions.len() > limit {
+        let Some(oldest_key) = transactions
+            .iter()
+            .min_by_key(|(_, route)| route.created_at)
+            .map(|(key, _)| key.clone())
+        else {
+            return;
+        };
+        transactions.remove(&oldest_key);
+    }
+}
+
 fn prune_pending_registers(registers: &mut HashMap<String, PendingRegister>, now: Instant) {
     registers.retain(|_, pending| now.duration_since(pending.created_at) <= PENDING_REGISTER_TTL);
 }
@@ -4713,6 +4819,25 @@ fn status_class(code: u16) -> &'static str {
         500..=599 => "5xx",
         600..=699 => "6xx",
         _ => "unknown",
+    }
+}
+
+fn latency_bucket_label(bucket: u64) -> &'static str {
+    match bucket {
+        1 => "1",
+        5 => "5",
+        10 => "10",
+        25 => "25",
+        50 => "50",
+        100 => "100",
+        250 => "250",
+        500 => "500",
+        1_000 => "1000",
+        2_500 => "2500",
+        5_000 => "5000",
+        10_000 => "10000",
+        30_000 => "30000",
+        _ => "+Inf",
     }
 }
 
@@ -5245,6 +5370,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -5287,6 +5413,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -5318,6 +5445,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -5360,6 +5488,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -5402,6 +5531,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity,
@@ -5449,6 +5579,7 @@ mod tests {
                     record_route: true,
                     register_routing: None,
                     rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
                     socket: ProxySocketConfig::default(),
                     metrics: Default::default(),
                     affinity: Default::default(),
@@ -6333,6 +6464,34 @@ Content-Length: 0\r\n\r\n",
             .await
             .is_err()
         );
+    }
+
+    #[test]
+    fn udp_client_transaction_shard_limit_evicts_oldest() {
+        let mut transactions = HashMap::new();
+        let target = UpstreamTarget {
+            addr: "127.0.0.1:5080".parse().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let now = Instant::now();
+        for index in 0_u64..3 {
+            transactions.insert(
+                format!("tx-{index}"),
+                UdpClientTransactionRoute {
+                    target,
+                    packet: vec![index as u8],
+                    final_response: None,
+                    created_at: now + Duration::from_millis(index),
+                },
+            );
+        }
+
+        enforce_udp_client_transaction_shard_limit(&mut transactions, 2);
+
+        assert_eq!(transactions.len(), 2);
+        assert!(!transactions.contains_key("tx-0"));
+        assert!(transactions.contains_key("tx-1"));
+        assert!(transactions.contains_key("tx-2"));
     }
 
     #[tokio::test]
@@ -7833,6 +7992,14 @@ Content-Length: 0\r\n\r\n",
         assert!(response.contains("z9hG4bK-client-options"));
         assert_eq!(server.active_udp_branch_count().await, 0);
         assert_eq!(server.affinity.active_len().await, 0);
+
+        let metrics = server.render_metrics().await;
+        assert!(metrics.contains(
+            "proxy_upstream_response_latency_ms_bucket{downstream_transport=\"udp\",upstream_transport=\"udp\",method=\"OPTIONS\",le=\"+Inf\"} 1"
+        ));
+        assert!(metrics.contains(
+            "proxy_upstream_response_latency_ms_count{downstream_transport=\"udp\",upstream_transport=\"udp\",method=\"OPTIONS\"} 1"
+        ));
     }
 
     #[tokio::test]

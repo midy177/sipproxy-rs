@@ -19,6 +19,7 @@ max_message_bytes = 65535
 [proxy]
 record_route = true
 register_routing = "path"
+udp_client_transaction_cache_entries = 65536
 # Legacy compatibility equivalent to register_routing = "contact-rewrite".
 # rewrite_register_contact = true
 

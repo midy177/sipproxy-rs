@@ -79,6 +79,9 @@ impl Config {
         if self.proxy.upstream_groups.is_empty() {
             bail!("proxy.upstream_groups must contain at least one backend group");
         }
+        if self.proxy.udp_client_transaction_cache_entries == 0 {
+            bail!("proxy.udp_client_transaction_cache_entries must be greater than 0");
+        }
         if self.proxy.socket.workers_per_listener == 0 && !self.proxy.socket.reuse_port {
             bail!("proxy.socket.reuse_port must be true when workers_per_listener is 0 (auto)");
         }
@@ -926,6 +929,10 @@ fn default_max_message_bytes() -> usize {
     65_535
 }
 
+fn default_udp_client_transaction_cache_entries() -> usize {
+    65_536
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyConfig {
     #[serde(default)]
@@ -934,6 +941,8 @@ pub struct ProxyConfig {
     pub register_routing: Option<RegisterRoutingMode>,
     #[serde(default)]
     pub rewrite_register_contact: bool,
+    #[serde(default = "default_udp_client_transaction_cache_entries")]
+    pub udp_client_transaction_cache_entries: usize,
     #[serde(default)]
     pub socket: ProxySocketConfig,
     #[serde(default)]
@@ -956,6 +965,7 @@ impl Default for ProxyConfig {
             record_route: true,
             register_routing: None,
             rewrite_register_contact: false,
+            udp_client_transaction_cache_entries: default_udp_client_transaction_cache_entries(),
             socket: ProxySocketConfig::default(),
             metrics: ProxyMetricsConfig::default(),
             affinity: ProxyAffinityConfig::default(),
@@ -3048,6 +3058,18 @@ literal = "$-not-a-placeholder"
                     reuse_port: false,
                     ..ProxySocketConfig::default()
                 },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_udp_client_transaction_cache_entries() {
+        let config = Config {
+            proxy: ProxyConfig {
+                udp_client_transaction_cache_entries: 0,
                 ..ProxyConfig::default()
             },
             ..Config::default()

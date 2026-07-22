@@ -35,6 +35,10 @@ impl CounterHandle {
     pub fn incr(&self) {
         self.counter.value.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn incr_by(&self, value: u64) {
+        self.counter.value.fetch_add(value, Ordering::Relaxed);
+    }
 }
 
 impl Default for ProxyMetrics {
@@ -52,6 +56,12 @@ impl ProxyMetrics {
         self.counter_arc(name, labels)
             .value
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn incr_by(&self, name: &'static str, labels: &[(&'static str, &str)], value: u64) {
+        self.counter_arc(name, labels)
+            .value
+            .fetch_add(value, Ordering::Relaxed);
     }
 
     pub fn counter(
