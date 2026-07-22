@@ -1079,7 +1079,7 @@ impl AyaXdpBackend {
                         )?;
                         let synced = index + 1;
                         if synced % XDP_GEO_SYNC_PROGRESS_INTERVAL == 0 {
-                            info!(
+                            debug!(
                                 listener = %spec.listener_key,
                                 synced,
                                 total = geo_prefixes.len(),

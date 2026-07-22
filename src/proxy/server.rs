@@ -1,6 +1,4 @@
-use crate::cluster::{
-    ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at,
-};
+use crate::cluster::{ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at};
 use crate::config::{
     Config, EffectiveProxySecurityConfig, ProxyConfig, ProxyListenerConfig, ProxyMetricsConfig,
     ProxyRegisteredInviteSourceMatch, ProxySocketConfig, RegisterRoutingMode, SipTransport,
