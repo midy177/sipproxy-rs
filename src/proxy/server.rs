@@ -81,6 +81,7 @@ pub struct ProxyServer {
     metrics: Arc<ProxyMetrics>,
     metric_handles: ProxyMetricHandles,
     udp_branches: ShardedStringMap<UdpBranchRoute>,
+    udp_client_transactions: ShardedStringMap<UdpClientTransactionRoute>,
     pending_registers: Mutex<HashMap<String, PendingRegister>>,
     invite_transactions: ShardedStringMap<InviteTransactionRoute>,
     local_invite_rejections: Mutex<HashMap<String, Instant>>,
@@ -95,8 +96,14 @@ struct UdpToTcpForward<'a> {
     client_peer: SocketAddr,
     upstream: SocketAddr,
     branch: String,
+    client_transaction_key: Option<String>,
     invite_transaction_key: Option<String>,
     method: &'a str,
+}
+
+struct UdpClientTransactionRef<'a> {
+    branch: &'a str,
+    key: Option<&'a str>,
 }
 
 struct ProxyMetricHandles {
@@ -165,6 +172,7 @@ impl ProxyServer {
             metrics,
             metric_handles,
             udp_branches: ShardedStringMap::new(ROUTE_MAP_SHARDS),
+            udp_client_transactions: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             pending_registers: Mutex::new(HashMap::new()),
             invite_transactions: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             local_invite_rejections: Mutex::new(HashMap::new()),
@@ -675,6 +683,39 @@ impl ProxyServer {
         self.udp_branches.remove(branch).await;
     }
 
+    async fn lookup_udp_client_transaction(&self, key: &str) -> Option<UdpClientTransactionRoute> {
+        let now = Instant::now();
+        let mut transactions = self.udp_client_transactions.shard_for_key(key).lock().await;
+        prune_udp_client_transactions(&mut transactions, now);
+        transactions.get(key).cloned()
+    }
+
+    async fn remember_udp_client_transaction(
+        &self,
+        key: String,
+        target: UpstreamTarget,
+        packet: Vec<u8>,
+    ) {
+        let mut transactions = self
+            .udp_client_transactions
+            .shard_for_key(&key)
+            .lock()
+            .await;
+        prune_udp_client_transactions(&mut transactions, Instant::now());
+        transactions.insert(
+            key,
+            UdpClientTransactionRoute {
+                target,
+                packet,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    async fn remove_udp_client_transaction(&self, key: &str) {
+        self.udp_client_transactions.remove(key).await;
+    }
+
     async fn remember_successful_forward(
         &self,
         message: &SipMessage,
@@ -763,7 +804,7 @@ impl ProxyServer {
         responses: &mut mpsc::UnboundedReceiver<Vec<u8>>,
         client_peer: SocketAddr,
         upstream: SocketAddr,
-        branch: &str,
+        transaction: UdpClientTransactionRef<'_>,
         method: &str,
     ) -> Result<()> {
         loop {
@@ -778,7 +819,7 @@ impl ProxyServer {
             if let SipStartLine::Response { code, .. } = &response_message.start_line {
                 self.record_upstream_response("tcp", *code);
                 self.upstreams.record_passive_result(upstream, *code < 500);
-                self.apply_register_response(branch, &response_message, *code)
+                self.apply_register_response(transaction.branch, &response_message, *code)
                     .await;
             }
             response_message.apply_top_via_received_rport(client_peer)?;
@@ -786,6 +827,9 @@ impl ProxyServer {
                 .send_to(&response_message.to_bytes(), client_peer)
                 .await?;
             if is_final {
+                if let Some(key) = transaction.key {
+                    self.remove_udp_client_transaction(key).await;
+                }
                 break;
             }
         }
@@ -1109,7 +1153,7 @@ impl ProxyServer {
         let route = {
             let mut branches = self.udp_branches.shard_for_key(&branch).lock().await;
             prune_udp_branches(&mut branches, Instant::now());
-            branches.get(&branch).copied()
+            branches.get(&branch).cloned()
         };
         let Some(route) = route else {
             warn!(
@@ -1145,6 +1189,9 @@ impl ProxyServer {
         let send_result = socket.send_to(&message.to_bytes(), route.client_peer).await;
         if is_final && route.remove_on_final {
             self.remove_udp_branch(&branch).await;
+            if let Some(key) = route.client_transaction_key.as_deref() {
+                self.remove_udp_client_transaction(key).await;
+            }
         }
         send_result?;
         Ok(())
@@ -1219,6 +1266,26 @@ impl ProxyServer {
         listener: &ProxyListenerConfig,
         method: &str,
     ) -> Result<()> {
+        let client_transaction_key = udp_client_transaction_key(&message, peer, method)?;
+        if let Some(key) = client_transaction_key.as_deref()
+            && let Some(route) = self.lookup_udp_client_transaction(key).await
+        {
+            debug!(
+                %peer,
+                target = %route.target.addr,
+                transport = %route.target.transport.as_str(),
+                method,
+                "reusing upstream SIP request for UDP client retransmission"
+            );
+            if route.target.transport == SipTransport::Udp {
+                socket
+                    .send_to(&route.packet, route.target.addr)
+                    .await
+                    .context("failed to retransmit cached SIP request to upstream UDP socket")?;
+            }
+            return Ok(());
+        }
+
         let (message, target, branch, invite_transaction_key) = self
             .prepare_forward(message, peer, listener, method)
             .await?;
@@ -1234,6 +1301,7 @@ impl ProxyServer {
         match target.transport {
             SipTransport::Udp => {
                 self.record_forwarded_request("udp", target.transport, Some(method));
+                let packet = message.to_bytes();
                 {
                     let mut branches = self.udp_branches.shard_for_key(&branch).lock().await;
                     prune_udp_branches(&mut branches, Instant::now());
@@ -1244,11 +1312,19 @@ impl ProxyServer {
                             upstream: target.addr,
                             created_at: Instant::now(),
                             remove_on_final: method != "INVITE",
+                            client_transaction_key: client_transaction_key.clone(),
                         },
                     );
                 }
-                if let Err(err) = socket.send_to(&message.to_bytes(), target.addr).await {
+                if let Some(key) = client_transaction_key.clone() {
+                    self.remember_udp_client_transaction(key, target, packet.clone())
+                        .await;
+                }
+                if let Err(err) = socket.send_to(&packet, target.addr).await {
                     self.remove_udp_branch(&branch).await;
+                    if let Some(key) = client_transaction_key.as_deref() {
+                        self.remove_udp_client_transaction(key).await;
+                    }
                     self.upstreams.record_passive_result(target.addr, false);
                     return Err(err).context("failed to send SIP request to upstream UDP socket");
                 }
@@ -1270,6 +1346,7 @@ impl ProxyServer {
                     client_peer: peer,
                     upstream: target.addr,
                     branch,
+                    client_transaction_key,
                     invite_transaction_key,
                     method,
                 })
@@ -1288,6 +1365,7 @@ impl ProxyServer {
             client_peer,
             upstream,
             branch,
+            client_transaction_key,
             invite_transaction_key,
             method,
         } = request;
@@ -1299,6 +1377,9 @@ impl ProxyServer {
         {
             Ok(responses) => responses,
             Err(err) => {
+                if let Some(key) = client_transaction_key.as_deref() {
+                    self.remove_udp_client_transaction(key).await;
+                }
                 self.upstreams.record_passive_result(upstream, false);
                 return Err(err);
             }
@@ -1307,6 +1388,10 @@ impl ProxyServer {
             addr: upstream,
             transport: SipTransport::Tcp,
         };
+        if let Some(key) = client_transaction_key.clone() {
+            self.remember_udp_client_transaction(key, target, packet)
+                .await;
+        }
         self.remember_successful_forward(&message, target, &branch, invite_transaction_key, method)
             .await;
 
@@ -1315,7 +1400,10 @@ impl ProxyServer {
             &mut responses,
             client_peer,
             upstream,
-            &branch,
+            UdpClientTransactionRef {
+                branch: &branch,
+                key: client_transaction_key.as_deref(),
+            },
             method,
         )
         .await
@@ -2391,12 +2479,20 @@ struct UpstreamServerRef {
     index: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct UdpBranchRoute {
     client_peer: SocketAddr,
     upstream: SocketAddr,
     created_at: Instant,
     remove_on_final: bool,
+    client_transaction_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct UdpClientTransactionRoute {
+    target: UpstreamTarget,
+    packet: Vec<u8>,
+    created_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -4250,6 +4346,13 @@ fn prune_udp_branches(branches: &mut HashMap<String, UdpBranchRoute>, now: Insta
     branches.retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL);
 }
 
+fn prune_udp_client_transactions(
+    transactions: &mut HashMap<String, UdpClientTransactionRoute>,
+    now: Instant,
+) {
+    transactions.retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL);
+}
+
 fn prune_pending_registers(registers: &mut HashMap<String, PendingRegister>, now: Instant) {
     registers.retain(|_, pending| now.duration_since(pending.created_at) <= PENDING_REGISTER_TTL);
 }
@@ -4532,6 +4635,36 @@ fn invite_transaction_key(message: &SipMessage) -> Result<Option<String>> {
         branch.trim(),
         call_id.trim(),
         cseq_number
+    )))
+}
+
+fn udp_client_transaction_key(
+    message: &SipMessage,
+    peer: SocketAddr,
+    method: &str,
+) -> Result<Option<String>> {
+    let Some(branch) = message.top_via_branch()? else {
+        return Ok(None);
+    };
+    let Some(request) = message.as_request() else {
+        return Ok(None);
+    };
+    let call_id = request
+        .call_id_header()
+        .context("failed to read Call-ID header")?
+        .value();
+    let cseq_number = request
+        .cseq_header()
+        .context("failed to read CSeq header")?
+        .seq()
+        .context("failed to parse CSeq sequence number")?;
+    Ok(Some(format!(
+        "{}:{}:{}:{}:{}",
+        peer,
+        branch.trim(),
+        call_id.trim(),
+        cseq_number,
+        method
     )))
 }
 
@@ -6050,6 +6183,52 @@ Content-Length: 0\r\n\r\n",
                 .contact,
             "sip:100@127.0.0.1:5061"
         );
+    }
+
+    #[tokio::test]
+    async fn udp_register_retransmission_reuses_proxy_branch() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let request = b"REGISTER sip:127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:9500;rport;branch=z9hG4bK-register-retry\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Contact: <sip:100@127.0.0.1:9500;transport=UDP>\r\n\
+Call-ID: register-retry\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n";
+        let peer = "127.0.0.1:9500".parse().unwrap();
+
+        server
+            .handle_udp_packet(&proxy_socket, request, peer, &test_listener())
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let first = String::from_utf8(buf[..len].to_vec()).unwrap();
+
+        server
+            .handle_udp_packet(&proxy_socket, request, peer, &test_listener())
+            .await
+            .unwrap();
+        let (len, _) = timeout(Duration::from_secs(1), upstream_socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let second = String::from_utf8(buf[..len].to_vec()).unwrap();
+
+        assert_eq!(
+            SipMessage::parse(first.as_bytes())
+                .unwrap()
+                .top_via_branch()
+                .unwrap(),
+            SipMessage::parse(second.as_bytes())
+                .unwrap()
+                .top_via_branch()
+                .unwrap()
+        );
+        assert_eq!(server.active_udp_branch_count().await, 1);
     }
 
     #[tokio::test]
