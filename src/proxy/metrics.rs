@@ -64,11 +64,7 @@ impl ProxyMetrics {
             .fetch_add(value, Ordering::Relaxed);
     }
 
-    pub fn counter(
-        &self,
-        name: &'static str,
-        labels: &[(&'static str, &'static str)],
-    ) -> CounterHandle {
+    pub fn counter(&self, name: &'static str, labels: &[(&'static str, &str)]) -> CounterHandle {
         CounterHandle {
             counter: self.counter_arc(name, labels),
         }

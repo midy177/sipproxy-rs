@@ -64,6 +64,7 @@ const METRIC_METHOD_COUNT: usize = 8;
 const METRIC_STATUS_CLASS_COUNT: usize = 7;
 const METRIC_LOCAL_RESPONSE_CODE_COUNT: usize = 4;
 const METRIC_AFFINITY_LOOKUP_RESULT_COUNT: usize = 8;
+const METRIC_SECURITY_DROP_REASON_COUNT: usize = 23;
 const METRIC_TRANSPORTS: [&str; METRIC_TRANSPORT_COUNT] = ["udp", "tcp"];
 const METRIC_METHODS: [&str; METRIC_METHOD_COUNT] = [
     "ACK", "BYE", "CANCEL", "INVITE", "MESSAGE", "OPTIONS", "REGISTER", "UNKNOWN",
@@ -81,6 +82,31 @@ const METRIC_AFFINITY_LOOKUP_RESULTS: [&str; METRIC_AFFINITY_LOOKUP_RESULT_COUNT
     "request-uri-target",
     "transaction-hit",
     "wrong-side",
+];
+const METRIC_SECURITY_DROP_REASONS: [&str; METRIC_SECURITY_DROP_REASON_COUNT] = [
+    "denied-cidr",
+    "not-allowed-cidr",
+    "ip-blocked",
+    "geo-unavailable",
+    "geo-unknown-country",
+    "geo-deny-country",
+    "geo-not-allowed-country",
+    "threat-intel-unavailable",
+    "threat-intel",
+    "udp-flood-rate-limit",
+    "tcp-flood-rate-limit",
+    "tcp-udp-flood-rate-limit",
+    "ip-rate-limit",
+    "invalid-start-line",
+    "parse-error",
+    "parse-error-rate-limit",
+    "dynamic-ban",
+    "sip-register-rate-limit",
+    "sip-invite-rate-limit",
+    "sip-blocked",
+    "sip-invalid-from",
+    "sip-unregistered-invite",
+    "sip-unregistered-invite-source",
 ];
 const UPSTREAM_RESPONSE_LATENCY_MS_FINITE_BUCKET_COUNT: usize = 13;
 const UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT: usize =
@@ -144,6 +170,7 @@ struct ProxyMetricHandles {
     local_responses: [[CounterHandle; METRIC_LOCAL_RESPONSE_CODE_COUNT]; METRIC_TRANSPORT_COUNT],
     upstream_responses: [[CounterHandle; METRIC_STATUS_CLASS_COUNT]; METRIC_TRANSPORT_COUNT],
     affinity_lookups: [CounterHandle; METRIC_AFFINITY_LOOKUP_RESULT_COUNT],
+    security_drops: HashMap<String, [CounterHandle; METRIC_SECURITY_DROP_REASON_COUNT]>,
     upstream_response_latency_buckets: [[[[CounterHandle; UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT];
         METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT];
         METRIC_TRANSPORT_COUNT],
@@ -154,7 +181,26 @@ struct ProxyMetricHandles {
 }
 
 impl ProxyMetricHandles {
-    fn new(metrics: &ProxyMetrics) -> Self {
+    fn new(metrics: &ProxyMetrics, config: &ProxyConfig) -> Self {
+        let mut security_drops = HashMap::new();
+        for configured_listener in &config.listeners {
+            for listener in configured_listener.concrete_listeners() {
+                let listener_key = listener.key();
+                security_drops.insert(
+                    listener_key.clone(),
+                    std::array::from_fn(|reason| {
+                        metrics.counter(
+                            "proxy_security_dropped_packets_total",
+                            &[
+                                ("listener", listener_key.as_str()),
+                                ("reason", METRIC_SECURITY_DROP_REASONS[reason]),
+                            ],
+                        )
+                    }),
+                );
+            }
+        }
+
         Self {
             sip_requests: std::array::from_fn(|transport| {
                 std::array::from_fn(|method| {
@@ -215,6 +261,7 @@ impl ProxyMetricHandles {
                     &[("result", METRIC_AFFINITY_LOOKUP_RESULTS[result])],
                 )
             }),
+            security_drops,
             upstream_response_latency_buckets: std::array::from_fn(|downstream| {
                 std::array::from_fn(|upstream| {
                     std::array::from_fn(|method| {
@@ -278,7 +325,7 @@ impl ProxyServer {
         let affinity_config = config.proxy.affinity.clone();
         let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
         let metrics = Arc::new(ProxyMetrics::default());
-        let metric_handles = ProxyMetricHandles::new(&metrics);
+        let metric_handles = ProxyMetricHandles::new(&metrics, &config.proxy);
         let local_ips = local_interface_ips();
         Ok(Self {
             config,
@@ -2414,6 +2461,16 @@ impl ProxyServer {
 
     fn record_security_drop(&self, listener: &ProxyListenerConfig, reason: &str) {
         let listener_key = listener.key();
+        if let (Some(handles), Some(reason)) = (
+            self.metric_handles
+                .security_drops
+                .get(listener_key.as_str()),
+            metric_security_drop_reason_index(reason),
+        ) {
+            handles[reason].incr();
+            return;
+        }
+
         self.metrics.incr(
             "proxy_security_dropped_packets_total",
             &[("listener", listener_key.as_str()), ("reason", reason)],
@@ -4739,6 +4796,35 @@ fn metric_affinity_lookup_result_index(result: &str) -> Option<usize> {
         "request-uri-target" => Some(5),
         "transaction-hit" => Some(6),
         "wrong-side" => Some(7),
+        _ => None,
+    }
+}
+
+fn metric_security_drop_reason_index(reason: &str) -> Option<usize> {
+    match reason {
+        "denied-cidr" => Some(0),
+        "not-allowed-cidr" => Some(1),
+        "ip-blocked" => Some(2),
+        "geo-unavailable" => Some(3),
+        "geo-unknown-country" => Some(4),
+        "geo-deny-country" => Some(5),
+        "geo-not-allowed-country" => Some(6),
+        "threat-intel-unavailable" => Some(7),
+        "threat-intel" => Some(8),
+        "udp-flood-rate-limit" => Some(9),
+        "tcp-flood-rate-limit" => Some(10),
+        "tcp-udp-flood-rate-limit" => Some(11),
+        "ip-rate-limit" => Some(12),
+        "invalid-start-line" => Some(13),
+        "parse-error" => Some(14),
+        "parse-error-rate-limit" => Some(15),
+        "dynamic-ban" => Some(16),
+        "sip-register-rate-limit" => Some(17),
+        "sip-invite-rate-limit" => Some(18),
+        "sip-blocked" => Some(19),
+        "sip-invalid-from" => Some(20),
+        "sip-unregistered-invite" => Some(21),
+        "sip-unregistered-invite-source" => Some(22),
         _ => None,
     }
 }
