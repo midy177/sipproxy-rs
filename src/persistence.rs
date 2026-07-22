@@ -23,6 +23,7 @@ struct PersistenceInner {
     required: bool,
     event_retention_seconds: u64,
     background_tx: mpsc::UnboundedSender<PersistenceWrite>,
+    background_pending_events: AtomicU64,
     event_appends_succeeded: AtomicU64,
     event_appends_failed: AtomicU64,
     sqlite_writes_failed: AtomicU64,
@@ -73,6 +74,7 @@ pub struct PersistenceStats {
     pub latest_event_seq: u64,
     pub last_applied_seq: u64,
     pub event_rows: u64,
+    pub background_pending_events: u64,
     pub event_appends_succeeded: u64,
     pub event_appends_failed: u64,
     pub sqlite_writes_failed: u64,
@@ -107,6 +109,7 @@ impl Persistence {
                 required: config.required,
                 event_retention_seconds: config.event_retention_seconds,
                 background_tx,
+                background_pending_events: AtomicU64::new(0),
                 event_appends_succeeded: AtomicU64::new(0),
                 event_appends_failed: AtomicU64::new(0),
                 sqlite_writes_failed: AtomicU64::new(0),
@@ -160,18 +163,25 @@ impl Persistence {
     }
 
     pub fn apply_cluster_command_background(&self, command: ClusterCommand) {
-        if let Err(err) = self
-            .inner
-            .background_tx
-            .send(PersistenceWrite::ClusterCommand(command))
-        {
-            self.inner
-                .event_appends_failed
-                .fetch_add(1, Ordering::Relaxed);
-            warn!(
-                error = %format!("{err:#}"),
-                "failed to enqueue cluster command persistence write"
-            );
+        let write = PersistenceWrite::ClusterCommand(command);
+        let appended_events = write.event_count();
+        self.inner
+            .background_pending_events
+            .fetch_add(appended_events, Ordering::Relaxed);
+        match self.inner.background_tx.send(write) {
+            Ok(()) => {}
+            Err(err) => {
+                self.inner
+                    .background_pending_events
+                    .fetch_sub(appended_events, Ordering::Relaxed);
+                self.inner
+                    .event_appends_failed
+                    .fetch_add(appended_events, Ordering::Relaxed);
+                warn!(
+                    error = %format!("{err:#}"),
+                    "failed to enqueue cluster command persistence write"
+                );
+            }
         }
     }
 
@@ -210,19 +220,25 @@ impl Persistence {
         if bindings.is_empty() {
             return;
         }
-        let appended_events = bindings.len() as u64;
-        if let Err(err) = self
-            .inner
-            .background_tx
-            .send(PersistenceWrite::AffinityBindings(bindings))
-        {
-            self.inner
-                .event_appends_failed
-                .fetch_add(appended_events, Ordering::Relaxed);
-            warn!(
-                error = %format!("{err:#}"),
-                "failed to enqueue affinity persistence write"
-            );
+        let write = PersistenceWrite::AffinityBindings(bindings);
+        let appended_events = write.event_count();
+        self.inner
+            .background_pending_events
+            .fetch_add(appended_events, Ordering::Relaxed);
+        match self.inner.background_tx.send(write) {
+            Ok(()) => {}
+            Err(err) => {
+                self.inner
+                    .background_pending_events
+                    .fetch_sub(appended_events, Ordering::Relaxed);
+                self.inner
+                    .event_appends_failed
+                    .fetch_add(appended_events, Ordering::Relaxed);
+                warn!(
+                    error = %format!("{err:#}"),
+                    "failed to enqueue affinity persistence write"
+                );
+            }
         }
     }
 
@@ -248,6 +264,10 @@ impl Persistence {
                 .context("persistence background writer task failed")
                 .and_then(|result| result);
                 persistence.record_write_result(&result, appended_events);
+                persistence
+                    .inner
+                    .background_pending_events
+                    .fetch_sub(appended_events, Ordering::Relaxed);
                 if let Err(err) = result {
                     warn!(
                         error = %format!("{err:#}"),
@@ -368,6 +388,7 @@ impl Persistence {
         .await
         .context("persistence stats task failed")??;
         Ok(PersistenceStats {
+            background_pending_events: self.inner.background_pending_events.load(Ordering::Relaxed),
             event_appends_succeeded: self.inner.event_appends_succeeded.load(Ordering::Relaxed),
             event_appends_failed: self.inner.event_appends_failed.load(Ordering::Relaxed),
             sqlite_writes_failed: self.inner.sqlite_writes_failed.load(Ordering::Relaxed),
@@ -692,6 +713,7 @@ fn persistence_stats(conn: &Connection) -> Result<PersistenceStats> {
         latest_event_seq: latest_event_seq(conn)?,
         last_applied_seq: last_applied_seq(conn)?.unwrap_or(0),
         event_rows: event_row_count(conn)?,
+        background_pending_events: 0,
         event_appends_succeeded: 0,
         event_appends_failed: 0,
         sqlite_writes_failed: 0,
@@ -908,6 +930,7 @@ mod tests {
         assert_eq!(stats.latest_event_seq, 2);
         assert_eq!(stats.last_applied_seq, 0);
         assert_eq!(stats.event_rows, 2);
+        assert_eq!(stats.background_pending_events, 0);
         assert_eq!(stats.event_appends_succeeded, 2);
         assert_eq!(stats.event_appends_failed, 0);
         assert_eq!(stats.sqlite_writes_failed, 0);

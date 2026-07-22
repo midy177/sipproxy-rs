@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::Mutex;
 
@@ -76,7 +77,8 @@ impl AffinityTable {
         let now = Instant::now();
         for key in keys {
             let mut bindings = self.bindings.shard_for_key(&key).lock().await;
-            prune_affinity(&mut bindings, now);
+            self.bindings
+                .subtract_len(prune_affinity(&mut bindings, now));
             if let Some(binding) = bindings.get(&key) {
                 return Ok(Some(binding.target));
             }
@@ -89,7 +91,8 @@ impl AffinityTable {
             return None;
         }
         let mut bindings = self.bindings.shard_for_key(key).lock().await;
-        prune_affinity(&mut bindings, Instant::now());
+        self.bindings
+            .subtract_len(prune_affinity(&mut bindings, Instant::now()));
         bindings.get(key).map(|binding| binding.target)
     }
 
@@ -118,7 +121,12 @@ impl AffinityTable {
             .collect::<Vec<_>>();
         for key in keys {
             let mut bindings = self.bindings.shard_for_key(&key).lock().await;
-            bindings.insert(key, AffinityBinding { target, expires_at });
+            if bindings
+                .insert(key, AffinityBinding { target, expires_at })
+                .is_none()
+            {
+                self.bindings.add_len(1);
+            }
         }
         Ok(snapshots)
     }
@@ -143,7 +151,9 @@ impl AffinityTable {
             .shard_for_key(&key)
             .lock()
             .await
-            .insert(key, AffinityBinding { target, expires_at });
+            .insert(key, AffinityBinding { target, expires_at })
+            .is_none()
+            .then(|| self.bindings.add_len(1));
         vec![snapshot]
     }
 
@@ -153,7 +163,8 @@ impl AffinityTable {
         let mut snapshots = Vec::new();
         for shard in &self.bindings.shards {
             let mut bindings = shard.lock().await;
-            prune_affinity(&mut bindings, now);
+            self.bindings
+                .subtract_len(prune_affinity(&mut bindings, now));
             snapshots.extend(bindings.iter().map(|(key, binding)| {
                 AffinityBindingSnapshot {
                     key: key.clone(),
@@ -199,33 +210,52 @@ impl AffinityTable {
         for snapshot in snapshots {
             let mut bindings = self.bindings.shard_for_key(&snapshot.key).lock().await;
             if snapshot.expires_at_epoch_ms <= now_epoch_ms {
-                bindings.remove(&snapshot.key);
+                if bindings.remove(&snapshot.key).is_some() {
+                    self.bindings.subtract_len(1);
+                }
                 continue;
             }
             let ttl_ms = snapshot.expires_at_epoch_ms - now_epoch_ms;
-            bindings.insert(
-                snapshot.key,
-                AffinityBinding {
-                    target: snapshot.target,
-                    expires_at: now + Duration::from_millis(ttl_ms as u64),
-                },
-            );
+            if bindings
+                .insert(
+                    snapshot.key,
+                    AffinityBinding {
+                        target: snapshot.target,
+                        expires_at: now + Duration::from_millis(ttl_ms as u64),
+                    },
+                )
+                .is_none()
+            {
+                self.bindings.add_len(1);
+            }
         }
     }
 
     pub async fn remove_key(&self, key: &AffinityKey) {
-        self.bindings.shard_for_key(key).lock().await.remove(key);
+        if self
+            .bindings
+            .shard_for_key(key)
+            .lock()
+            .await
+            .remove(key)
+            .is_some()
+        {
+            self.bindings.subtract_len(1);
+        }
     }
 
     pub async fn active_len(&self) -> usize {
         let now = Instant::now();
-        let mut len = 0;
         for shard in &self.bindings.shards {
             let mut bindings = shard.lock().await;
-            prune_affinity(&mut bindings, now);
-            len += bindings.len();
+            self.bindings
+                .subtract_len(prune_affinity(&mut bindings, now));
         }
-        len
+        self.bindings.len()
+    }
+
+    pub fn binding_len(&self) -> usize {
+        self.bindings.len()
     }
 
     #[cfg(test)]
@@ -237,6 +267,7 @@ impl AffinityTable {
 #[derive(Debug)]
 struct ShardedAffinityBindings {
     shards: Vec<Mutex<HashMap<AffinityKey, AffinityBinding>>>,
+    len: AtomicUsize,
 }
 
 impl ShardedAffinityBindings {
@@ -246,6 +277,7 @@ impl ShardedAffinityBindings {
             shards: (0..shard_count)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
+            len: AtomicUsize::new(0),
         }
     }
 
@@ -263,6 +295,7 @@ impl ShardedAffinityBindings {
 
     async fn replace_all(&self, sharded_bindings: Vec<HashMap<AffinityKey, AffinityBinding>>) {
         debug_assert_eq!(self.shards.len(), sharded_bindings.len());
+        let len = sharded_bindings.iter().map(HashMap::len).sum();
         let mut guards = Vec::with_capacity(self.shards.len());
         for shard in &self.shards {
             guards.push(shard.lock().await);
@@ -270,6 +303,21 @@ impl ShardedAffinityBindings {
         for (guard, bindings) in guards.iter_mut().zip(sharded_bindings) {
             **guard = bindings;
         }
+        self.len.store(len, Ordering::Relaxed);
+    }
+
+    fn add_len(&self, count: usize) {
+        self.len.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn subtract_len(&self, count: usize) {
+        if count > 0 {
+            self.len.fetch_sub(count, Ordering::Relaxed);
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
     }
 }
 
@@ -343,8 +391,10 @@ fn call_id_key(message: &SipMessage) -> Result<AffinityKey> {
     )))
 }
 
-fn prune_affinity(bindings: &mut HashMap<AffinityKey, AffinityBinding>, now: Instant) {
+fn prune_affinity(bindings: &mut HashMap<AffinityKey, AffinityBinding>, now: Instant) -> usize {
+    let before = bindings.len();
     bindings.retain(|_, binding| binding.expires_at > now);
+    before - bindings.len()
 }
 
 fn affinity_shard_index(key: &AffinityKey) -> usize {
@@ -420,9 +470,11 @@ Content-Length: 0\r\n\r\n",
         };
 
         table.remember(&request, target).await.unwrap();
+        assert_eq!(table.binding_len(), 1);
         assert_eq!(table.lookup(&request).await.unwrap(), Some(target));
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(table.lookup(&request).await.unwrap(), None);
+        assert_eq!(table.binding_len(), 0);
         assert_eq!(table.len().await, 0);
     }
 

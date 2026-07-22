@@ -1,6 +1,7 @@
 use crate::config::{ProxyConfig, RouteConfig};
 use anyhow::Result;
 use rsipstack::sip::Uri;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct SelectedRoute {
@@ -24,10 +25,11 @@ struct RouteEntry {
 
 impl RouteTable {
     pub fn new(config: &ProxyConfig) -> Result<Self> {
+        let listener_aliases = listener_route_aliases(config);
         let routes = config
             .routes
             .iter()
-            .map(RouteEntry::try_from)
+            .flat_map(|route| expand_route_listeners(route, &listener_aliases))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { routes })
     }
@@ -41,6 +43,38 @@ impl RouteTable {
                 name: route.name.clone(),
                 upstream_group: route.upstream_group.clone(),
             })
+    }
+}
+
+fn listener_route_aliases(config: &ProxyConfig) -> HashMap<String, Vec<String>> {
+    let mut aliases = HashMap::new();
+    for listener in &config.listeners {
+        let concrete_keys = listener
+            .concrete_listeners()
+            .into_iter()
+            .map(|listener| listener.key())
+            .collect::<Vec<_>>();
+        aliases.insert(listener.key(), concrete_keys.clone());
+        for key in concrete_keys {
+            aliases.insert(key.clone(), vec![key]);
+        }
+    }
+    aliases
+}
+
+fn expand_route_listeners(
+    route: &RouteConfig,
+    listener_aliases: &HashMap<String, Vec<String>>,
+) -> Vec<Result<RouteEntry>> {
+    match &route.listener {
+        Some(listener) => listener_aliases
+            .get(listener)
+            .cloned()
+            .unwrap_or_else(|| vec![listener.clone()])
+            .into_iter()
+            .map(|listener| RouteEntry::try_from_with_listener(route, Some(listener)))
+            .collect(),
+        None => vec![RouteEntry::try_from_with_listener(route, None)],
     }
 }
 
@@ -79,9 +113,15 @@ impl TryFrom<&RouteConfig> for RouteEntry {
     type Error = anyhow::Error;
 
     fn try_from(value: &RouteConfig) -> Result<Self> {
+        Self::try_from_with_listener(value, value.listener.clone())
+    }
+}
+
+impl RouteEntry {
+    fn try_from_with_listener(value: &RouteConfig, listener: Option<String>) -> Result<Self> {
         Ok(Self {
             name: value.name.clone(),
-            listener: value.listener.clone(),
+            listener,
             domain: value.domain.clone(),
             prefix: value.prefix.clone(),
             upstream_group: value.upstream_group.clone(),
@@ -92,6 +132,7 @@ impl TryFrom<&RouteConfig> for RouteEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{ProxyListenerConfig, SipTransport};
 
     #[test]
     fn route_selection_prefers_matching_domain_and_prefix() {
@@ -138,6 +179,49 @@ mod tests {
             table
                 .select("udp/127.0.0.1:5060", "sip:tenant-a.example.com@evil.test")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn route_listener_alias_expands_tcp_udp_listener_key() {
+        let table = RouteTable::new(&ProxyConfig {
+            record_route: true,
+            register_routing: None,
+            rewrite_register_contact: false,
+            socket: Default::default(),
+            metrics: Default::default(),
+            affinity: Default::default(),
+            security: Default::default(),
+            routes: vec![RouteConfig {
+                name: "tenant-a".to_string(),
+                listener: Some("tcp_udp/127.0.0.1:5060".to_string()),
+                domain: None,
+                prefix: None,
+                upstream_group: "tenant-a".to_string(),
+            }],
+            listeners: vec![ProxyListenerConfig {
+                bind: "127.0.0.1:5060".to_string(),
+                transport: SipTransport::TcpUdp,
+                upstream_group: "default".to_string(),
+                security: None,
+            }],
+            upstream_groups: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(
+            table
+                .select("udp/127.0.0.1:5060", "sip:100@example.com")
+                .unwrap()
+                .upstream_group,
+            "tenant-a"
+        );
+        assert_eq!(
+            table
+                .select("tcp/127.0.0.1:5060", "sip:100@example.com")
+                .unwrap()
+                .upstream_group,
+            "tenant-a"
         );
     }
 }

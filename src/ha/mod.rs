@@ -99,6 +99,7 @@ impl HaStateSnapshot {
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+const HA_HEARTBEAT_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
@@ -344,6 +345,7 @@ async fn run_active_standby_monitor(
     let mut ticker = tokio::time::interval(heartbeat_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_seen = Some(Instant::now());
+    let mut failure_log = HeartbeatFailureLog::default();
 
     loop {
         tokio::select! {
@@ -358,19 +360,79 @@ async fn run_active_standby_monitor(
                         match timeout(heartbeat_interval, response.json::<HaHeartbeat>()).await {
                             Ok(Ok(peer)) => {
                                 last_seen = Some(Instant::now());
+                                if let Some(suppressed) = failure_log.recovered() {
+                                    info!(
+                                        peer = %peer_addr,
+                                        suppressed_heartbeat_failures = suppressed,
+                                        "active-standby heartbeat recovered"
+                                    );
+                                }
                                 reconcile_active_standby(runtime.as_ref(), &node, &addon, peer).await?;
                             }
-                            Ok(Err(err)) => warn!(peer = %peer_addr, error = %err, "failed to decode active-standby heartbeat"),
-                            Err(_) => warn!(peer = %peer_addr, "timed out decoding active-standby heartbeat"),
+                            Ok(Err(err)) => {
+                                if let Some(suppressed) = failure_log.warn_if_due(Instant::now()) {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        error = %err,
+                                        suppressed_heartbeat_failures = suppressed,
+                                        "failed to decode active-standby heartbeat"
+                                    );
+                                } else {
+                                    debug!(peer = %peer_addr, error = %err, "failed to decode active-standby heartbeat");
+                                }
+                            }
+                            Err(_) => {
+                                if let Some(suppressed) = failure_log.warn_if_due(Instant::now()) {
+                                    warn!(
+                                        peer = %peer_addr,
+                                        suppressed_heartbeat_failures = suppressed,
+                                        "timed out decoding active-standby heartbeat"
+                                    );
+                                } else {
+                                    debug!(peer = %peer_addr, "timed out decoding active-standby heartbeat");
+                                }
+                            }
                         }
                     }
-                    Ok(Ok(response)) => warn!(
-                        peer = %peer_addr,
-                        status = %response.status(),
-                        "active-standby peer returned non-success status"
-                    ),
-                    Ok(Err(err)) => warn!(peer = %peer_addr, error = %err, "failed to fetch active-standby heartbeat"),
-                    Err(_) => warn!(peer = %peer_addr, "timed out fetching active-standby heartbeat"),
+                    Ok(Ok(response)) => {
+                        if let Some(suppressed) = failure_log.warn_if_due(Instant::now()) {
+                            warn!(
+                                peer = %peer_addr,
+                                status = %response.status(),
+                                suppressed_heartbeat_failures = suppressed,
+                                "active-standby peer returned non-success status"
+                            );
+                        } else {
+                            debug!(
+                                peer = %peer_addr,
+                                status = %response.status(),
+                                "active-standby peer returned non-success status"
+                            );
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        if let Some(suppressed) = failure_log.warn_if_due(Instant::now()) {
+                            warn!(
+                                peer = %peer_addr,
+                                error = %err,
+                                suppressed_heartbeat_failures = suppressed,
+                                "failed to fetch active-standby heartbeat"
+                            );
+                        } else {
+                            debug!(peer = %peer_addr, error = %err, "failed to fetch active-standby heartbeat");
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(suppressed) = failure_log.warn_if_due(Instant::now()) {
+                            warn!(
+                                peer = %peer_addr,
+                                suppressed_heartbeat_failures = suppressed,
+                                "timed out fetching active-standby heartbeat"
+                            );
+                        } else {
+                            debug!(peer = %peer_addr, "timed out fetching active-standby heartbeat");
+                        }
+                    }
                 }
 
                 if !runtime.role().await.accepts_writes()
@@ -685,6 +747,37 @@ struct HaMonitorState {
     initialized: bool,
     previous_role: Option<ClusterRole>,
     previous_leader: Option<NodeId>,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatFailureLog {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+impl HeartbeatFailureLog {
+    fn warn_if_due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < HA_HEARTBEAT_FAILURE_LOG_INTERVAL)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+
+        let suppressed = self.suppressed;
+        self.suppressed = 0;
+        self.last_warning = Some(now);
+        Some(suppressed)
+    }
+
+    fn recovered(&mut self) -> Option<u64> {
+        self.last_warning?;
+        let suppressed = self.suppressed;
+        self.last_warning = None;
+        self.suppressed = 0;
+        Some(suppressed)
+    }
 }
 
 async fn observe_ha_state(
@@ -1413,5 +1506,25 @@ mod tests {
         assert!(peer_should_win(&local, &higher_epoch));
         assert!(peer_should_win(&local, &lower_node_same_epoch));
         assert!(!peer_should_win(&local, &higher_node_same_epoch));
+    }
+
+    #[test]
+    fn heartbeat_failure_log_throttles_repeated_failures() {
+        let mut log = HeartbeatFailureLog::default();
+        let start = Instant::now();
+
+        assert_eq!(log.warn_if_due(start), Some(0));
+        assert_eq!(log.warn_if_due(start + Duration::from_secs(1)), None);
+        assert_eq!(log.warn_if_due(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            log.warn_if_due(start + HA_HEARTBEAT_FAILURE_LOG_INTERVAL),
+            Some(2)
+        );
+        assert_eq!(
+            log.warn_if_due(start + HA_HEARTBEAT_FAILURE_LOG_INTERVAL),
+            None
+        );
+        assert_eq!(log.recovered(), Some(1));
+        assert_eq!(log.recovered(), None);
     }
 }

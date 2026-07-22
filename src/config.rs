@@ -149,9 +149,18 @@ impl Config {
                     );
                 }
                 if let UpstreamHealthProbeConfig::Options {
-                    uri, success_codes, ..
+                    uri,
+                    success_codes,
+                    transport,
+                    ..
                 } = &group.health_check.probe
                 {
+                    if *transport == SipTransport::TcpUdp {
+                        bail!(
+                            "proxy upstream group '{}' health_check.probe.transport must be udp or tcp",
+                            group.name
+                        );
+                    }
                     let parsed_uri = uri.parse::<Uri>().with_context(|| {
                         format!(
                             "proxy upstream group '{}' health_check.probe.uri must be a SIP URI",
@@ -185,6 +194,7 @@ impl Config {
         }
 
         let mut listener_keys = HashSet::new();
+        let mut route_listener_keys = HashSet::new();
         for listener in &self.proxy.listeners {
             listener.bind.parse::<SocketAddr>().with_context(|| {
                 format!(
@@ -211,9 +221,13 @@ impl Config {
                     ),
                 )?;
             }
-            let key = listener.key();
-            if !listener_keys.insert(key.clone()) {
-                bail!("duplicate proxy listener '{key}'");
+            route_listener_keys.insert(listener.key());
+            for concrete_listener in listener.concrete_listeners() {
+                let key = concrete_listener.key();
+                if !listener_keys.insert(key.clone()) {
+                    bail!("duplicate proxy listener '{key}'");
+                }
+                route_listener_keys.insert(key);
             }
         }
 
@@ -226,7 +240,7 @@ impl Config {
                 );
             }
             if let Some(listener) = &route.listener
-                && !listener_keys.contains(listener)
+                && !route_listener_keys.contains(listener)
             {
                 bail!(
                     "proxy route '{}' references unknown listener '{}'",
@@ -506,6 +520,15 @@ fn validate_xdp_security_config(config: &ProxyXdpSecurityConfig, path: &str) -> 
                 bail!("{path}.interfaces must not contain empty interface names");
             }
         }
+    }
+    if config
+        .max_deny_cidrs_entries
+        .is_some_and(|value| value == 0)
+    {
+        bail!("{path}.max_deny_cidrs_entries must be greater than 0 when set");
+    }
+    if config.max_geo_cidrs_entries.is_some_and(|value| value == 0) {
+        bail!("{path}.max_geo_cidrs_entries must be greater than 0 when set");
     }
     Ok(())
 }
@@ -1369,6 +1392,12 @@ pub struct ProxyXdpSecurityConfig {
     pub threat_intel: Option<bool>,
     #[serde(default)]
     pub ip_rate_limit: Option<bool>,
+    #[serde(default)]
+    pub auto_size_maps: Option<bool>,
+    #[serde(default)]
+    pub max_deny_cidrs_entries: Option<u32>,
+    #[serde(default)]
+    pub max_geo_cidrs_entries: Option<u32>,
 }
 
 impl ProxyXdpSecurityConfig {
@@ -1399,6 +1428,15 @@ impl ProxyXdpSecurityConfig {
         }
         if let Some(ip_rate_limit) = self.ip_rate_limit {
             effective.ip_rate_limit = ip_rate_limit;
+        }
+        if let Some(auto_size_maps) = self.auto_size_maps {
+            effective.auto_size_maps = auto_size_maps;
+        }
+        if let Some(max_deny_cidrs_entries) = self.max_deny_cidrs_entries {
+            effective.max_deny_cidrs_entries = max_deny_cidrs_entries;
+        }
+        if let Some(max_geo_cidrs_entries) = self.max_geo_cidrs_entries {
+            effective.max_geo_cidrs_entries = max_geo_cidrs_entries;
         }
     }
 }
@@ -1607,6 +1645,9 @@ pub struct EffectiveProxyXdpSecurityConfig {
     pub geo_filter: bool,
     pub threat_intel: bool,
     pub ip_rate_limit: bool,
+    pub auto_size_maps: bool,
+    pub max_deny_cidrs_entries: u32,
+    pub max_geo_cidrs_entries: u32,
 }
 
 impl Default for EffectiveProxyXdpSecurityConfig {
@@ -1621,6 +1662,9 @@ impl Default for EffectiveProxyXdpSecurityConfig {
             geo_filter: true,
             threat_intel: true,
             ip_rate_limit: true,
+            auto_size_maps: true,
+            max_deny_cidrs_entries: 262_144,
+            max_geo_cidrs_entries: 262_144,
         }
     }
 }
@@ -1892,6 +1936,8 @@ pub enum SipTransport {
     #[default]
     Udp,
     Tcp,
+    #[serde(rename = "tcp_udp", alias = "tcp-udp")]
+    TcpUdp,
 }
 
 impl SipTransport {
@@ -1899,6 +1945,7 @@ impl SipTransport {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
+            Self::TcpUdp => "tcp_udp",
         }
     }
 
@@ -1906,6 +1953,15 @@ impl SipTransport {
         match self {
             Self::Udp => "UDP",
             Self::Tcp => "TCP",
+            Self::TcpUdp => "TCP_UDP",
+        }
+    }
+
+    pub fn concrete_transports(self) -> &'static [SipTransport] {
+        match self {
+            Self::Udp => &[Self::Udp],
+            Self::Tcp => &[Self::Tcp],
+            Self::TcpUdp => &[Self::Udp, Self::Tcp],
         }
     }
 }
@@ -1922,6 +1978,20 @@ pub struct ProxyListenerConfig {
 impl ProxyListenerConfig {
     pub fn key(&self) -> String {
         format!("{}/{}", self.transport.as_str(), self.bind)
+    }
+
+    pub fn with_transport(&self, transport: SipTransport) -> Self {
+        let mut listener = self.clone();
+        listener.transport = transport;
+        listener
+    }
+
+    pub fn concrete_listeners(&self) -> Vec<Self> {
+        self.transport
+            .concrete_transports()
+            .iter()
+            .map(|transport| self.with_transport(*transport))
+            .collect()
     }
 }
 
@@ -1981,6 +2051,8 @@ pub enum UpstreamHealthProbeConfig {
         uri: String,
         #[serde(default = "default_health_success_codes")]
         success_codes: Vec<u16>,
+        #[serde(default)]
+        vary_call_id: bool,
     },
     TcpConnect,
 }
@@ -1991,6 +2063,7 @@ impl Default for UpstreamHealthProbeConfig {
             transport: SipTransport::Udp,
             uri: default_health_options_uri(),
             success_codes: default_health_success_codes(),
+            vary_call_id: false,
         }
     }
 }
@@ -2584,6 +2657,9 @@ sync_dynamic_ban = true
 cidr_filter = true
 geo_filter = false
 ip_rate_limit = true
+auto_size_maps = true
+max_deny_cidrs_entries = 524288
+max_geo_cidrs_entries = 524288
 
 [[proxy.listeners]]
 bind = "127.0.0.1:5060"
@@ -2612,6 +2688,81 @@ servers = ["127.0.0.1:5080"]
         assert!(effective.xdp.cidr_filter);
         assert!(effective.xdp.geo_filter);
         assert!(effective.xdp.ip_rate_limit);
+        assert!(effective.xdp.auto_size_maps);
+        assert_eq!(effective.xdp.max_deny_cidrs_entries, 524_288);
+        assert_eq!(effective.xdp.max_geo_cidrs_entries, 524_288);
+    }
+
+    #[test]
+    fn tcp_udp_listener_expands_to_udp_and_tcp() {
+        let config: Config = toml::from_str(
+            r#"
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "tcp_udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let concrete = config.proxy.listeners[0].concrete_listeners();
+        assert_eq!(concrete.len(), 2);
+        assert_eq!(concrete[0].key(), "udp/127.0.0.1:5060");
+        assert_eq!(concrete[1].key(), "tcp/127.0.0.1:5060");
+    }
+
+    #[test]
+    fn tcp_udp_route_listener_key_validates() {
+        let config: Config = toml::from_str(
+            r#"
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "tcp_udp"
+upstream_group = "default"
+
+[[proxy.routes]]
+name = "tenant-a"
+listener = "tcp_udp/127.0.0.1:5060"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn tcp_udp_listener_conflicts_with_explicit_same_protocol_listener() {
+        let config: Config = toml::from_str(
+            r#"
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "tcp_udp"
+upstream_group = "default"
+
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+"#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("duplicate proxy listener 'udp/127.0.0.1:5060'"));
     }
 
     #[test]
@@ -2849,6 +3000,7 @@ literal = "$-not-a-placeholder"
                 transport: SipTransport::Udp,
                 uri: "sip:healthcheck@example.com".to_string(),
                 success_codes: vec![99],
+                vary_call_id: false,
             },
             ..UpstreamHealthCheckConfig::default()
         };
@@ -2865,11 +3017,44 @@ literal = "$-not-a-placeholder"
                 transport: SipTransport::Udp,
                 uri: "http://healthcheck.example.com".to_string(),
                 success_codes: vec![200],
+                vary_call_id: false,
             },
             ..UpstreamHealthCheckConfig::default()
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn parses_health_check_options_vary_call_id() {
+        let config: Config = toml::from_str(
+            r#"
+[[proxy.listeners]]
+bind = "127.0.0.1:5060"
+transport = "udp"
+upstream_group = "default"
+
+[[proxy.upstream_groups]]
+name = "default"
+servers = ["127.0.0.1:5080"]
+
+[proxy.upstream_groups.health_check]
+enabled = true
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+vary_call_id = true
+"#,
+        )
+        .unwrap();
+
+        config.validate().unwrap();
+        let UpstreamHealthProbeConfig::Options { vary_call_id, .. } =
+            config.proxy.upstream_groups[0].health_check.probe
+        else {
+            panic!("expected OPTIONS health-check probe");
+        };
+        assert!(vary_call_id);
     }
 
     #[test]

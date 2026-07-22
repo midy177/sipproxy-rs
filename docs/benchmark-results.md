@@ -205,6 +205,198 @@ Raw result files:
 - `target/bench/optimization/branch-cleanup/100k/register-persistence.json`
 - `target/bench/optimization/branch-cleanup/100k/register-persistence-metrics.txt`
 
+## 2026-07-22 OPTIONS Affinity Write Filter
+
+Change under test:
+
+- Successfully forwarded `OPTIONS` requests no longer create or persist
+  affinity bindings.
+- Affinity lookup still runs before upstream selection.
+- Dialog/session methods continue to record affinity normally; existing
+  MESSAGE same-Call-ID affinity behavior is unchanged.
+
+Environment:
+
+- Same host, bind addresses, mock upstream, and release binary setup as the
+  local UDP matrix above.
+- Config: `preset = "off"`, persistence disabled, `reuse_port = false`,
+  `workers_per_listener = 1`.
+- Scenario: `udp --scenario options`.
+- Requests: 1,000,000.
+- Concurrency: 64.
+
+| Version | Sent | OK | Timeout | Error | RPS | Mean ms | p50 ms | p95 ms | p99 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Before branch cleanup | 1,000,000 | 1,000,000 | 0 | 0 | 17,278.79 | 3.394 | 3.566 | 7.134 | 8.517 | 42.678 |
+| After branch cleanup | 1,000,000 | 1,000,000 | 0 | 0 | 22,972.94 | 2.063 | 1.815 | 4.569 | 6.194 | 25.787 |
+| After OPTIONS affinity filter | 1,000,000 | 1,000,000 | 0 | 0 | 24,927.26 | 1.898 | 1.691 | 4.156 | 5.573 | 13.203 |
+
+Metrics after the optimized run:
+
+- `proxy_forwarded_requests_total{downstream_transport="udp",upstream_transport="udp",method="OPTIONS"} 1000000`
+- `sip_requests_total{transport="udp",method="OPTIONS"} 1000000`
+- `proxy_udp_branch_routes 0`
+- `proxy_invite_transaction_routes 0`
+- `proxy_affinity_bindings 0`
+
+Result:
+
+- Throughput improved by 8.51% versus the branch-cleanup-only run.
+- Throughput improved by 44.26% versus the original 1M OPTIONS baseline.
+- p99 latency fell from 6.194 ms to 5.573 ms versus the branch-cleanup-only
+  run.
+- Long-running OPTIONS traffic no longer leaves request-count-sized affinity
+  state behind.
+
+Raw result files:
+
+- `target/bench/optimization/options-affinity/1m/options.json`
+- `target/bench/optimization/options-affinity/1m/options-metrics.txt`
+
+## 2026-07-22 Persistence Pending Event Metric
+
+Change under test:
+
+- Optional persistence background writes now track pending HA event count with
+  `proxy_persistence_background_pending_events`.
+- The gauge counts queued or in-flight background events, not channel write
+  units, so multi-binding affinity writes are visible as their event count.
+- Enqueue failure rolls the pending count back and increments the existing
+  failed append counter.
+
+Environment:
+
+- Same host, bind addresses, mock upstream, and release binary setup as the
+  local UDP matrix above.
+- Config: `preset = "off"`, persistence enabled, `required = false`,
+  `reuse_port = false`, `workers_per_listener = 1`.
+- Scenario: `udp --scenario register`.
+- Requests: 100,000.
+- Concurrency: 64.
+
+| Version | Sent | OK | Timeout | Error | RPS | Mean ms | p50 ms | p95 ms | p99 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Background writer, batched transaction | 100,000 | 100,000 | 0 | 0 | 23,372.72 | 2.038 | 1.825 | 4.428 | 6.061 | 12.059 |
+| After UDP branch cleanup | 100,000 | 100,000 | 0 | 0 | 23,133.97 | 2.039 | 1.810 | 4.517 | 6.092 | 12.003 |
+| With pending event metric | 100,000 | 100,000 | 0 | 0 | 23,608.89 | 1.976 | 1.747 | 4.414 | 6.007 | 12.213 |
+
+Metrics after the run:
+
+- `proxy_udp_branch_routes 0`
+- `proxy_affinity_bindings 100002`
+- `proxy_persistence_latest_event_seq 500000`
+- `proxy_persistence_event_rows 500000`
+- `proxy_persistence_background_pending_events 0`
+- `proxy_persistence_event_appends_total{result="success"} 500000`
+- `proxy_persistence_event_appends_total{result="failure"} 0`
+- `proxy_persistence_sqlite_write_failures_total 0`
+
+Result:
+
+- The additional pending-event accounting did not introduce a measurable
+  regression in this local run.
+- The final pending-event gauge returned to `0`, confirming that all optional
+  persistence writes drained by the time metrics were captured.
+- This metric gives a guardrail for future bounded-queue or batch coalescing
+  work.
+
+Raw result files:
+
+- `target/bench/optimization/pending-events/100k/register-persistence-clean.json`
+- `target/bench/optimization/pending-events/100k/register-persistence-clean-metrics.txt`
+
+## 2026-07-22 Affinity Metrics Fast Count
+
+Change under test:
+
+- `proxy_affinity_bindings` no longer scans every affinity shard during
+  `/metrics` rendering.
+- `AffinityTable` now maintains an atomic binding count and updates it on
+  insert, remove, snapshot install, snapshot upsert, and expiry pruning.
+- `active_len()` still performs exact expiry pruning when callers need it;
+  metrics reads the current in-memory binding count in O(1).
+
+Environment:
+
+- Same host, bind addresses, mock upstream, and release binary setup as the
+  local UDP matrix above.
+- Config: `preset = "off"`, persistence disabled, `reuse_port = false`,
+  `workers_per_listener = 1`.
+- Scenario: `udp --scenario register`.
+- Requests: 100,000.
+- Concurrency: 64.
+
+| Scenario | Sent | OK | Timeout | Error | RPS | Mean ms | p50 ms | p95 ms | p99 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100k REGISTER, persistence off | 100,000 | 100,000 | 0 | 0 | 25,068.04 | 1.874 | 1.668 | 4.117 | 5.501 | 12.206 |
+
+Metrics after the run:
+
+- `proxy_forwarded_requests_total{downstream_transport="udp",upstream_transport="udp",method="REGISTER"} 100000`
+- `sip_requests_total{transport="udp",method="REGISTER"} 100000`
+- `proxy_udp_branch_routes 0`
+- `proxy_affinity_bindings 100002`
+
+Result:
+
+- The fast counter preserved the expected REGISTER affinity binding count while
+  removing the O(n) affinity-table scan from metrics rendering.
+
+Raw result files:
+
+- `target/bench/optimization/affinity-metric-register-100k.json`
+- `target/bench/optimization/affinity-metric-register-100k-metrics.txt`
+
+## 2026-07-22 Metrics Counter Handles
+
+Change under test:
+
+- `ProxyMetrics` now supports pre-resolved counter handles for fixed label sets.
+- Hot-path `sip_requests_total` and `proxy_forwarded_requests_total` counters
+  use direct atomic increments for common SIP methods instead of rebuilding the
+  counter key and re-checking the sharded map on every request.
+- Pre-registered counters remain hidden from Prometheus output until their value
+  is greater than zero, preserving the previous output behavior.
+
+Environment:
+
+- Same host, bind addresses, mock upstream, and release binary setup as the
+  local UDP matrix above.
+- Config: `preset = "off"`, persistence disabled, `reuse_port = false`,
+  `workers_per_listener = 1`.
+- Requests: 100,000 per scenario.
+- Concurrency: 64.
+
+| Scenario | Sent | OK | Timeout | Error | RPS | Mean ms | p50 ms | p95 ms | p99 ms | Max ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| OPTIONS | 100,000 | 100,000 | 0 | 0 | 25,860.43 | 1.811 | 1.606 | 4.003 | 5.407 | 16.738 |
+| REGISTER | 100,000 | 100,000 | 0 | 0 | 24,993.21 | 1.872 | 1.646 | 4.184 | 5.719 | 14.311 |
+| INVITE | 100,000 | 100,000 | 0 | 0 | 13,845.66 | 3.938 | 3.672 | 8.039 | 10.560 | 27.138 |
+
+Metrics after the run:
+
+- `sip_requests_total{transport="udp",method="OPTIONS"} 100000`
+- `sip_requests_total{transport="udp",method="REGISTER"} 100000`
+- `sip_requests_total{transport="udp",method="INVITE"} 100000`
+- `proxy_forwarded_requests_total{downstream_transport="udp",upstream_transport="udp",method="OPTIONS"} 100000`
+- `proxy_forwarded_requests_total{downstream_transport="udp",upstream_transport="udp",method="REGISTER"} 100000`
+- `proxy_forwarded_requests_total{downstream_transport="udp",upstream_transport="udp",method="INVITE"} 100000`
+- No zero-valued pre-registered counter series were emitted.
+
+Result:
+
+- The handle-based counters remove per-request metric key allocation and map
+  lookup from the common request and forwarded-request hot paths.
+- The 100k smoke matrix stayed in the same throughput band as the prior local
+  optimized runs, with zero timeouts and zero client socket errors.
+
+Raw result files:
+
+- `target/bench/optimization/metric-handles/options-100k.json`
+- `target/bench/optimization/metric-handles/register-100k.json`
+- `target/bench/optimization/metric-handles/invite-100k.json`
+- `target/bench/optimization/metric-handles/metrics.txt`
+
 ## 2026-07-22 Local UDP Baseline
 
 Environment:

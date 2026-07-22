@@ -12,6 +12,11 @@ pub struct ProxyMetrics {
     shards: Vec<RwLock<HashMap<String, Arc<Counter>>>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CounterHandle {
+    counter: Arc<Counter>,
+}
+
 #[derive(Debug)]
 struct Counter {
     name: String,
@@ -26,6 +31,12 @@ struct CounterSnapshot {
     value: u64,
 }
 
+impl CounterHandle {
+    pub fn incr(&self) {
+        self.counter.value.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 impl Default for ProxyMetrics {
     fn default() -> Self {
         Self {
@@ -38,31 +49,44 @@ impl Default for ProxyMetrics {
 
 impl ProxyMetrics {
     pub fn incr(&self, name: &'static str, labels: &[(&'static str, &str)]) {
+        self.counter_arc(name, labels)
+            .value
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn counter(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &'static str)],
+    ) -> CounterHandle {
+        CounterHandle {
+            counter: self.counter_arc(name, labels),
+        }
+    }
+
+    fn counter_arc(&self, name: &'static str, labels: &[(&'static str, &str)]) -> Arc<Counter> {
         let key = counter_key(name, labels);
         let shard = &self.shards[metric_shard_index(&key)];
         {
             let counters = shard.read().expect("metrics rwlock poisoned");
             if let Some(counter) = counters.get(&key) {
-                counter.value.fetch_add(1, Ordering::Relaxed);
-                return;
+                return counter.clone();
             }
         }
 
         let mut counters = shard.write().expect("metrics rwlock poisoned");
         match counters.entry(key) {
-            Entry::Occupied(entry) => {
-                entry.get().value.fetch_add(1, Ordering::Relaxed);
-            }
-            Entry::Vacant(entry) => {
-                entry.insert(Arc::new(Counter {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => entry
+                .insert(Arc::new(Counter {
                     name: name.to_string(),
                     labels: labels
                         .iter()
                         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                         .collect(),
-                    value: AtomicU64::new(1),
-                }));
-            }
+                    value: AtomicU64::new(0),
+                }))
+                .clone(),
         }
     }
 
@@ -70,10 +94,13 @@ impl ProxyMetrics {
         let mut values = Vec::new();
         for shard in &self.shards {
             let counters = shard.read().expect("metrics rwlock poisoned");
-            values.extend(counters.values().map(|counter| CounterSnapshot {
-                name: counter.name.clone(),
-                labels: counter.labels.clone(),
-                value: counter.value.load(Ordering::Relaxed),
+            values.extend(counters.values().filter_map(|counter| {
+                let value = counter.value.load(Ordering::Relaxed);
+                (value > 0).then(|| CounterSnapshot {
+                    name: counter.name.clone(),
+                    labels: counter.labels.clone(),
+                    value,
+                })
             }));
         }
         values.sort_by(|left, right| {
@@ -194,5 +221,20 @@ mod tests {
         assert!(
             rendered.contains("sip_requests_total{transport=\"udp\",method=\"REGISTER\"} 4000")
         );
+    }
+
+    #[test]
+    fn counter_handles_do_not_render_until_incremented() {
+        let metrics = ProxyMetrics::default();
+        let counter = metrics.counter(
+            "sip_requests_total",
+            &[("transport", "udp"), ("method", "OPTIONS")],
+        );
+
+        assert!(!metrics.render_prometheus().contains("sip_requests_total"));
+
+        counter.incr();
+        let rendered = metrics.render_prometheus();
+        assert!(rendered.contains("sip_requests_total{transport=\"udp\",method=\"OPTIONS\"} 1"));
     }
 }

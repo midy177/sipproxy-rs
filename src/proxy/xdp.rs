@@ -7,12 +7,15 @@ use anyhow::{Context, Result, bail};
 #[cfg(target_os = "linux")]
 use aya::{
     Ebpf, EbpfLoader, Pod,
+    maps::MapInfo,
     maps::{Array as AyaArray, HashMap as AyaHashMap, LpmTrie, MapData, lpm_trie::Key as LpmKey},
     programs::{Xdp, XdpMode},
 };
 #[cfg(target_os = "linux")]
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeSet, HashMap as StdHashMap};
+#[cfg(target_os = "linux")]
+use std::fs;
 #[cfg(target_os = "linux")]
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
@@ -79,7 +82,9 @@ const XDP_STAT_NAMES: [&str; 13] = [
 #[cfg(target_os = "linux")]
 const XDP_GEO_SYNC_PROGRESS_INTERVAL: usize = 10_000;
 #[cfg(target_os = "linux")]
-const XDP_GEO_CIDRS_MAX_ENTRIES: usize = 262_144;
+const XDP_DENY_CIDRS_DEFAULT_MAX_ENTRIES: u32 = 65_536;
+#[cfg(target_os = "linux")]
+const XDP_GEO_CIDRS_DEFAULT_MAX_ENTRIES: u32 = 262_144;
 
 pub struct XdpRuntime {
     requested: bool,
@@ -150,6 +155,33 @@ enum XdpBackend {
     Aya(AyaXdpBackend),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct XdpMapSizing {
+    auto_size_maps: bool,
+    max_deny_cidrs_entries: u32,
+    max_geo_cidrs_entries: u32,
+}
+
+impl XdpMapSizing {
+    fn apply(&mut self, config: &crate::config::EffectiveProxyXdpSecurityConfig) {
+        self.auto_size_maps &= config.auto_size_maps;
+        self.max_deny_cidrs_entries = self
+            .max_deny_cidrs_entries
+            .max(config.max_deny_cidrs_entries);
+        self.max_geo_cidrs_entries = self.max_geo_cidrs_entries.max(config.max_geo_cidrs_entries);
+    }
+}
+
+impl Default for XdpMapSizing {
+    fn default() -> Self {
+        Self {
+            auto_size_maps: true,
+            max_deny_cidrs_entries: 262_144,
+            max_geo_cidrs_entries: 262_144,
+        }
+    }
+}
+
 impl XdpRuntime {
     pub fn new(
         config: &ProxyConfig,
@@ -160,28 +192,32 @@ impl XdpRuntime {
         let mut fail_closed = false;
         let mut sync_dynamic_ban = false;
         let mut detach_stale = true;
+        let mut map_sizing = XdpMapSizing::default();
         let mut interfaces = BTreeSet::new();
         let mut listener_count = 0_usize;
         let mut listeners = Vec::new();
         let mut icmp_flood_policy: Option<XdpListenerPolicySpec> = None;
 
-        for listener in &config.listeners {
-            let effective = config.effective_security_for_listener(listener);
-            if !effective.xdp.enabled {
-                continue;
-            }
-            requested = true;
-            listener_count += 1;
-            fail_closed |= !effective.xdp.fail_open;
-            sync_dynamic_ban |= effective.xdp.sync_dynamic_ban;
-            detach_stale &= effective.xdp.detach_stale;
-            interfaces.extend(effective.xdp.interfaces.iter().cloned());
-            listeners.push(XdpListenerSpec::from_listener(listener, &effective)?);
-            if let Some(policy) = XdpListenerPolicySpec::icmp_flood_from_security(&effective) {
-                if let Some(existing) = &mut icmp_flood_policy {
-                    existing.merge_icmp_flood(policy);
-                } else {
-                    icmp_flood_policy = Some(policy);
+        for configured_listener in &config.listeners {
+            for listener in configured_listener.concrete_listeners() {
+                let effective = config.effective_security_for_listener(&listener);
+                if !effective.xdp.enabled {
+                    continue;
+                }
+                requested = true;
+                listener_count += 1;
+                fail_closed |= !effective.xdp.fail_open;
+                sync_dynamic_ban |= effective.xdp.sync_dynamic_ban;
+                detach_stale &= effective.xdp.detach_stale;
+                map_sizing.apply(&effective.xdp);
+                interfaces.extend(effective.xdp.interfaces.iter().cloned());
+                listeners.push(XdpListenerSpec::from_listener(&listener, &effective)?);
+                if let Some(policy) = XdpListenerPolicySpec::icmp_flood_from_security(&effective) {
+                    if let Some(existing) = &mut icmp_flood_policy {
+                        existing.merge_icmp_flood(policy);
+                    } else {
+                        icmp_flood_policy = Some(policy);
+                    }
                 }
             }
         }
@@ -195,7 +231,14 @@ impl XdpRuntime {
         }
 
         let backend = if requested {
-            match XdpBackend::attach(&interfaces, &listeners, geo, threat, detach_stale) {
+            match XdpBackend::attach(
+                &interfaces,
+                &listeners,
+                geo,
+                threat,
+                detach_stale,
+                map_sizing,
+            ) {
                 Ok(backend) => backend,
                 Err(err) if fail_closed => {
                     return Err(err.context("proxy.security.xdp is enabled with fail_open=false"));
@@ -374,6 +417,7 @@ impl XdpListenerSpec {
         let l4_proto = match listener.transport {
             SipTransport::Udp => XDP_PROTO_UDP,
             SipTransport::Tcp => XDP_PROTO_TCP,
+            SipTransport::TcpUdp => bail!("XDP listener transport must be expanded before attach"),
         };
         Ok(Self {
             listener_key: listener.key(),
@@ -614,8 +658,9 @@ impl XdpBackend {
         geo: Option<&Arc<GeoRuntime>>,
         threat: Option<&Arc<ThreatRuntime>>,
         detach_stale: bool,
+        map_sizing: XdpMapSizing,
     ) -> Result<Option<Self>> {
-        attach_backend(interfaces, listeners, geo, threat, detach_stale)
+        attach_backend(interfaces, listeners, geo, threat, detach_stale, map_sizing)
     }
 
     async fn sync_ip_block(&self, listener_key: &str, ip: IpAddr) -> Result<()> {
@@ -675,6 +720,7 @@ fn attach_backend(
     _geo: Option<&Arc<GeoRuntime>>,
     _threat: Option<&Arc<ThreatRuntime>>,
     _detach_stale: bool,
+    _map_sizing: XdpMapSizing,
 ) -> Result<Option<XdpBackend>> {
     bail!("XDP kernel offload is only supported on Linux")
 }
@@ -686,6 +732,7 @@ fn attach_backend(
     geo: Option<&Arc<GeoRuntime>>,
     threat: Option<&Arc<ThreatRuntime>>,
     detach_stale: bool,
+    map_sizing: XdpMapSizing,
 ) -> Result<Option<XdpBackend>> {
     Ok(Some(XdpBackend::Aya(AyaXdpBackend::attach(
         interfaces,
@@ -693,6 +740,7 @@ fn attach_backend(
         geo,
         threat,
         detach_stale,
+        map_sizing,
     )?)))
 }
 
@@ -732,6 +780,13 @@ struct XdpStaticKeys {
 struct XdpStaticPlan {
     keys: XdpStaticKeys,
     fingerprint: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy)]
+struct XdpMapCapacities {
+    deny_cidrs: u32,
+    geo_cidrs: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -828,13 +883,34 @@ impl AyaXdpBackend {
         geo: Option<&Arc<GeoRuntime>>,
         threat: Option<&Arc<ThreatRuntime>>,
         detach_stale: bool,
+        map_sizing: XdpMapSizing,
     ) -> Result<Self> {
         ensure_bpffs_dirs()?;
         if !Path::new(XDP_OBJECT_PATH).exists() {
             bail!("XDP object {XDP_OBJECT_PATH} is missing");
         }
+        let geo_prefixes = geo
+            .map(|runtime| runtime.xdp_prefixes())
+            .unwrap_or_default();
+        let threat_prefixes = threat
+            .map(|runtime| runtime.xdp_prefixes())
+            .unwrap_or_default();
+        let capacities =
+            compute_xdp_map_capacities(listeners, &geo_prefixes, &threat_prefixes, map_sizing)?;
+        prepare_pinned_map_capacity(
+            "deny_cidrs",
+            Path::new(XDP_DENY_CIDRS_MAP),
+            capacities.deny_cidrs,
+        )?;
+        prepare_pinned_map_capacity(
+            "geo_cidrs",
+            Path::new(XDP_GEO_CIDRS_MAP),
+            capacities.geo_cidrs,
+        )?;
 
         let mut ebpf = EbpfLoader::new()
+            .map_max_entries("deny_cidrs", capacities.deny_cidrs)
+            .map_max_entries("geo_cidrs", capacities.geo_cidrs)
             .map_pin_path("blocked_ips", Path::new(XDP_BLOCKED_IPS_MAP))
             .map_pin_path("listener_policies", Path::new(XDP_LISTENER_POLICIES_MAP))
             .map_pin_path("allow_cidrs", Path::new(XDP_ALLOW_CIDRS_MAP))
@@ -846,6 +922,8 @@ impl AyaXdpBackend {
             .context("failed to load XDP object with aya")?;
         info!(
             object = XDP_OBJECT_PATH,
+            deny_cidrs_max_entries = capacities.deny_cidrs,
+            geo_cidrs_max_entries = capacities.geo_cidrs,
             "XDP object loaded with aya; preparing maps"
         );
 
@@ -863,7 +941,7 @@ impl AyaXdpBackend {
         };
         backend.clear_dynamic_blocklist()?;
         info!("syncing initial XDP static policy maps");
-        backend.sync_static_policy(geo, threat)?;
+        backend.sync_static_policy_prefixes(&geo_prefixes, &threat_prefixes)?;
         let resolved_interfaces = resolve_interfaces(interfaces)?;
         info!(
             interfaces = %resolved_interfaces.join(","),
@@ -900,14 +978,22 @@ impl AyaXdpBackend {
         geo: Option<&Arc<GeoRuntime>>,
         threat: Option<&Arc<ThreatRuntime>>,
     ) -> Result<()> {
-        let started = StdInstant::now();
         let geo_prefixes = geo
             .map(|runtime| runtime.xdp_prefixes())
             .unwrap_or_default();
         let threat_prefixes = threat
             .map(|runtime| runtime.xdp_prefixes())
             .unwrap_or_default();
-        let plan = self.build_static_sync_plan(&geo_prefixes, &threat_prefixes)?;
+        self.sync_static_policy_prefixes(&geo_prefixes, &threat_prefixes)
+    }
+
+    fn sync_static_policy_prefixes(
+        &self,
+        geo_prefixes: &[crate::proxy::geo::GeoIpPrefix],
+        threat_prefixes: &[crate::proxy::threat::ThreatIpPrefix],
+    ) -> Result<()> {
+        let started = StdInstant::now();
+        let plan = self.build_static_sync_plan(geo_prefixes, threat_prefixes)?;
         {
             let current = self
                 .static_state
@@ -973,7 +1059,7 @@ impl AyaXdpBackend {
                     deny_cidrs.insert(&key, XdpCidrValue { enabled: 1 }, 0)?;
                 }
                 if spec.policy.threat_intel {
-                    for prefix in &threat_prefixes {
+                    for prefix in threat_prefixes {
                         let key =
                             make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
                         deny_cidrs.insert(&key, XdpCidrValue { enabled: 1 }, 0)?;
@@ -1019,35 +1105,17 @@ impl AyaXdpBackend {
         geo_prefixes: &[crate::proxy::geo::GeoIpPrefix],
         threat_prefixes: &[crate::proxy::threat::ThreatIpPrefix],
     ) -> Result<XdpStaticPlan> {
-        let mut keys = XdpStaticKeys::default();
+        let keys = build_xdp_static_keys(&self.listeners, geo_prefixes, threat_prefixes);
         let mut hasher = DefaultHasher::new();
         for spec in &self.listeners {
             spec.listener_key.hash(&mut hasher);
             spec.l4_proto.hash(&mut hasher);
             spec.port.hash(&mut hasher);
             spec.policy.hash(&mut hasher);
-
-            let listener_key = make_listener_key(spec.l4_proto, spec.port);
-            keys.listener_policies.insert(listener_key);
-
-            for cidr in &spec.policy.trusted_cidrs {
-                let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
-                keys.trusted_cidrs.insert(encode_lpm_key_bytes(&key));
-            }
-            for cidr in &spec.policy.allow_cidrs {
-                let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
-                keys.allow_cidrs.insert(encode_lpm_key_bytes(&key));
-            }
-            for cidr in &spec.policy.deny_cidrs {
-                let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
-                keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
-            }
             if spec.policy.threat_intel {
                 for prefix in threat_prefixes {
                     prefix.addr.hash(&mut hasher);
                     prefix.prefix.hash(&mut hasher);
-                    let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
-                    keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
                 }
             }
             if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
@@ -1055,17 +1123,8 @@ impl AyaXdpBackend {
                     prefix.addr.hash(&mut hasher);
                     prefix.prefix.hash(&mut hasher);
                     prefix.country.hash(&mut hasher);
-                    let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
-                    keys.geo_cidrs.insert(encode_lpm_key_bytes(&key));
                 }
             }
-        }
-        if keys.geo_cidrs.len() > XDP_GEO_CIDRS_MAX_ENTRIES {
-            bail!(
-                "XDP geo CIDR map requires {} entries but kernel map capacity is {}; reduce geo countries/listeners or rebuild the BPF object with a larger geo_cidrs max_entries",
-                keys.geo_cidrs.len(),
-                XDP_GEO_CIDRS_MAX_ENTRIES
-            );
         }
         keys.listener_policies.hash(&mut hasher);
         keys.allow_cidrs.hash(&mut hasher);
@@ -1192,6 +1251,146 @@ impl AyaXdpBackend {
             })
             .collect()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn build_xdp_static_keys(
+    listeners: &[XdpListenerSpec],
+    geo_prefixes: &[crate::proxy::geo::GeoIpPrefix],
+    threat_prefixes: &[crate::proxy::threat::ThreatIpPrefix],
+) -> XdpStaticKeys {
+    let mut keys = XdpStaticKeys::default();
+    for spec in listeners {
+        let listener_key = make_listener_key(spec.l4_proto, spec.port);
+        keys.listener_policies.insert(listener_key);
+
+        for cidr in &spec.policy.trusted_cidrs {
+            let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
+            keys.trusted_cidrs.insert(encode_lpm_key_bytes(&key));
+        }
+        for cidr in &spec.policy.allow_cidrs {
+            let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
+            keys.allow_cidrs.insert(encode_lpm_key_bytes(&key));
+        }
+        for cidr in &spec.policy.deny_cidrs {
+            let key = make_lpm_key(spec.l4_proto, spec.port, cidr.addr, cidr.prefix);
+            keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
+        }
+        if spec.policy.threat_intel {
+            for prefix in threat_prefixes {
+                let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
+                keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
+            }
+        }
+        if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
+            for prefix in geo_prefixes {
+                let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
+                keys.geo_cidrs.insert(encode_lpm_key_bytes(&key));
+            }
+        }
+    }
+    keys
+}
+
+#[cfg(target_os = "linux")]
+fn compute_xdp_map_capacities(
+    listeners: &[XdpListenerSpec],
+    geo_prefixes: &[crate::proxy::geo::GeoIpPrefix],
+    threat_prefixes: &[crate::proxy::threat::ThreatIpPrefix],
+    sizing: XdpMapSizing,
+) -> Result<XdpMapCapacities> {
+    let keys = build_xdp_static_keys(listeners, geo_prefixes, threat_prefixes);
+    Ok(XdpMapCapacities {
+        deny_cidrs: desired_xdp_map_entries(
+            "deny_cidrs",
+            keys.deny_cidrs.len(),
+            XDP_DENY_CIDRS_DEFAULT_MAX_ENTRIES,
+            sizing.max_deny_cidrs_entries,
+            sizing.auto_size_maps,
+        )?,
+        geo_cidrs: desired_xdp_map_entries(
+            "geo_cidrs",
+            keys.geo_cidrs.len(),
+            XDP_GEO_CIDRS_DEFAULT_MAX_ENTRIES,
+            sizing.max_geo_cidrs_entries,
+            sizing.auto_size_maps,
+        )?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn desired_xdp_map_entries(
+    map_name: &str,
+    required_entries: usize,
+    default_entries: u32,
+    max_entries: u32,
+    auto_size: bool,
+) -> Result<u32> {
+    let required_entries = u32::try_from(required_entries)
+        .with_context(|| format!("XDP {map_name} map requires too many entries"))?;
+    if max_entries < default_entries {
+        bail!(
+            "XDP {map_name} configured max_entries {} is below default capacity {}",
+            max_entries,
+            default_entries
+        );
+    }
+    if required_entries > default_entries && !auto_size {
+        bail!(
+            "XDP {map_name} map requires {} entries but object capacity is {}; enable proxy.security.xdp.auto_size_maps or increase the BPF map capacity",
+            required_entries,
+            default_entries
+        );
+    }
+    if required_entries > max_entries {
+        bail!(
+            "XDP {map_name} map requires {} entries but configured max_entries is {}; increase proxy.security.xdp.max_{}_entries or reduce enabled XDP listeners/prefix sources",
+            required_entries,
+            max_entries,
+            map_name
+        );
+    }
+    if !auto_size {
+        return Ok(default_entries);
+    }
+    if required_entries <= default_entries {
+        return Ok(default_entries);
+    }
+
+    let target = required_entries
+        .saturating_mul(2)
+        .checked_next_power_of_two()
+        .unwrap_or(max_entries)
+        .min(max_entries)
+        .max(default_entries);
+    Ok(target)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_pinned_map_capacity(map_name: &str, path: &Path, required_entries: u32) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let info = MapInfo::from_pin(path)
+        .with_context(|| format!("failed to inspect pinned XDP map {}", path.display()))?;
+    let current_entries = info.max_entries();
+    if current_entries >= required_entries {
+        return Ok(());
+    }
+    fs::remove_file(path).with_context(|| {
+        format!(
+            "failed to remove undersized pinned XDP map {} before recreating it",
+            path.display()
+        )
+    })?;
+    info!(
+        map = map_name,
+        path = %path.display(),
+        current_max_entries = current_entries,
+        required_max_entries = required_entries,
+        "removed undersized pinned XDP map so it can be recreated"
+    );
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1572,6 +1771,37 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_sizes_deny_cidrs_for_threat_prefix_fanout() {
+        assert_eq!(
+            desired_xdp_map_entries(
+                "deny_cidrs",
+                19_846 * 5,
+                XDP_DENY_CIDRS_DEFAULT_MAX_ENTRIES,
+                262_144,
+                true,
+            )
+            .unwrap(),
+            262_144
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reports_deny_cidrs_capacity_when_auto_size_is_disabled() {
+        let err = desired_xdp_map_entries(
+            "deny_cidrs",
+            19_846 * 5,
+            XDP_DENY_CIDRS_DEFAULT_MAX_ENTRIES,
+            262_144,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("requires 99230 entries"));
+    }
+
     #[test]
     fn encodes_country_bitset() {
         let mut bits = [0_u64; XDP_COUNTRY_WORDS];
@@ -1628,6 +1858,9 @@ mod tests {
                 geo_filter: true,
                 threat_intel: true,
                 ip_rate_limit: true,
+                auto_size_maps: true,
+                max_deny_cidrs_entries: 262_144,
+                max_geo_cidrs_entries: 262_144,
             },
         })
         .unwrap();

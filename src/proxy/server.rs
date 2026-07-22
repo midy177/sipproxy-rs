@@ -1,4 +1,6 @@
-use crate::cluster::{ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at};
+use crate::cluster::{
+    ClusterCommand, ClusterReplicator, ContactBinding, SharedState, expires_at,
+};
 use crate::config::{
     Config, EffectiveProxySecurityConfig, ProxyConfig, ProxyListenerConfig, ProxyMetricsConfig,
     ProxyRegisteredInviteSourceMatch, ProxySocketConfig, RegisterRoutingMode, SipTransport,
@@ -8,7 +10,7 @@ use crate::ha::HaStateSnapshot;
 use crate::persistence::{HaEventPayload, HaEventRecord, HaEventsResponse, Persistence};
 use crate::proxy::affinity::{AffinityKey, AffinityTable, AffinityTarget};
 use crate::proxy::geo::{GeoDecision, GeoPolicy, GeoRuntime, evaluate_geo_policy};
-use crate::proxy::metrics::ProxyMetrics;
+use crate::proxy::metrics::{CounterHandle, ProxyMetrics};
 use crate::proxy::registry::{
     extract_aor, extract_contact, extract_expires, extract_from_aor,
     extract_response_contact_expires, extract_to_aor,
@@ -29,7 +31,7 @@ use rsipstack::sip::{
 };
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{BTreeMap, HashMap, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -54,8 +56,15 @@ const INVITE_TRANSACTION_TTL: Duration = Duration::from_secs(300);
 const LOCAL_INVITE_REJECTION_TTL: Duration = Duration::from_secs(300);
 const SECURITY_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_BUCKET_IDLE_TTL: Duration = Duration::from_secs(600);
+const HEALTH_CHECK_STANDBY_ROLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const SECURITY_MAP_SHARDS: usize = 64;
 const ROUTE_MAP_SHARDS: usize = 64;
+const METRIC_TRANSPORT_COUNT: usize = 2;
+const METRIC_METHOD_COUNT: usize = 8;
+const METRIC_TRANSPORTS: [&str; METRIC_TRANSPORT_COUNT] = ["udp", "tcp"];
+const METRIC_METHODS: [&str; METRIC_METHOD_COUNT] = [
+    "ACK", "BYE", "CANCEL", "INVITE", "MESSAGE", "OPTIONS", "REGISTER", "UNKNOWN",
+];
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -70,6 +79,7 @@ pub struct ProxyServer {
     affinity: AffinityTable,
     security: Arc<SecurityRuntime>,
     metrics: Arc<ProxyMetrics>,
+    metric_handles: ProxyMetricHandles,
     udp_branches: ShardedStringMap<UdpBranchRoute>,
     pending_registers: Mutex<HashMap<String, PendingRegister>>,
     invite_transactions: ShardedStringMap<InviteTransactionRoute>,
@@ -88,6 +98,44 @@ struct UdpToTcpForward<'a> {
     method: &'a str,
 }
 
+struct ProxyMetricHandles {
+    sip_requests: [[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT],
+    forwarded_requests:
+        [[[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT]; METRIC_TRANSPORT_COUNT],
+}
+
+impl ProxyMetricHandles {
+    fn new(metrics: &ProxyMetrics) -> Self {
+        Self {
+            sip_requests: std::array::from_fn(|transport| {
+                std::array::from_fn(|method| {
+                    metrics.counter(
+                        "sip_requests_total",
+                        &[
+                            ("transport", METRIC_TRANSPORTS[transport]),
+                            ("method", METRIC_METHODS[method]),
+                        ],
+                    )
+                })
+            }),
+            forwarded_requests: std::array::from_fn(|downstream| {
+                std::array::from_fn(|upstream| {
+                    std::array::from_fn(|method| {
+                        metrics.counter(
+                            "proxy_forwarded_requests_total",
+                            &[
+                                ("downstream_transport", METRIC_TRANSPORTS[downstream]),
+                                ("upstream_transport", METRIC_TRANSPORTS[upstream]),
+                                ("method", METRIC_METHODS[method]),
+                            ],
+                        )
+                    })
+                })
+            }),
+        }
+    }
+}
+
 impl ProxyServer {
     pub fn new(
         config: Config,
@@ -101,6 +149,8 @@ impl ProxyServer {
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
         let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
+        let metrics = Arc::new(ProxyMetrics::default());
+        let metric_handles = ProxyMetricHandles::new(&metrics);
         Ok(Self {
             config,
             state,
@@ -110,7 +160,8 @@ impl ProxyServer {
             upstreams,
             affinity: AffinityTable::new(affinity_config),
             security,
-            metrics: Arc::new(ProxyMetrics::default()),
+            metrics,
+            metric_handles,
             udp_branches: ShardedStringMap::new(ROUTE_MAP_SHARDS),
             pending_registers: Mutex::new(HashMap::new()),
             invite_transactions: ShardedStringMap::new(ROUTE_MAP_SHARDS),
@@ -147,6 +198,7 @@ impl ProxyServer {
             if group.health_check.enabled {
                 tasks.push(tokio::spawn(run_health_checks(
                     group.clone(),
+                    this.replicator.clone(),
                     shutdown.clone(),
                 )));
             }
@@ -161,39 +213,45 @@ impl ProxyServer {
         }
 
         let workers_per_listener = this.config.proxy.socket.resolved_workers_per_listener();
-        for listener in &this.config.proxy.listeners {
-            this.log_listener_runtime_config(listener).await;
-            for worker in 0..workers_per_listener {
-                match listener.transport {
-                    SipTransport::Udp => {
-                        let socket =
-                            Arc::new(bind_udp_socket(listener, &this.config.proxy.socket).await?);
-                        info!(
-                            bind = %listener.bind,
-                            upstream_group = %listener.upstream_group,
-                            worker,
-                            "SIP UDP listener started"
-                        );
-                        tasks.push(tokio::spawn(this.clone().run_udp(
-                            socket,
-                            listener.clone(),
-                            shutdown.clone(),
-                        )));
-                    }
-                    SipTransport::Tcp => {
-                        let tcp_listener =
-                            bind_tcp_listener(listener, &this.config.proxy.socket).await?;
-                        info!(
-                            bind = %listener.bind,
-                            upstream_group = %listener.upstream_group,
-                            worker,
-                            "SIP TCP listener started"
-                        );
-                        tasks.push(tokio::spawn(this.clone().run_tcp(
-                            tcp_listener,
-                            listener.clone(),
-                            shutdown.clone(),
-                        )));
+        for configured_listener in &this.config.proxy.listeners {
+            for listener in configured_listener.concrete_listeners() {
+                this.log_listener_runtime_config(&listener).await;
+                for worker in 0..workers_per_listener {
+                    match listener.transport {
+                        SipTransport::Udp => {
+                            let socket = Arc::new(
+                                bind_udp_socket(&listener, &this.config.proxy.socket).await?,
+                            );
+                            info!(
+                                bind = %listener.bind,
+                                upstream_group = %listener.upstream_group,
+                                worker,
+                                "SIP UDP listener started"
+                            );
+                            tasks.push(tokio::spawn(this.clone().run_udp(
+                                socket,
+                                listener.clone(),
+                                shutdown.clone(),
+                            )));
+                        }
+                        SipTransport::Tcp => {
+                            let tcp_listener =
+                                bind_tcp_listener(&listener, &this.config.proxy.socket).await?;
+                            info!(
+                                bind = %listener.bind,
+                                upstream_group = %listener.upstream_group,
+                                worker,
+                                "SIP TCP listener started"
+                            );
+                            tasks.push(tokio::spawn(this.clone().run_tcp(
+                                tcp_listener,
+                                listener.clone(),
+                                shutdown.clone(),
+                            )));
+                        }
+                        SipTransport::TcpUdp => {
+                            unreachable!("tcp_udp listeners are expanded before run")
+                        }
                     }
                 }
             }
@@ -347,7 +405,7 @@ impl ProxyServer {
         let invite_transaction_routes = self.active_invite_transaction_count().await;
         let (tcp_upstream_connections, tcp_branch_routes) =
             self.tcp_upstreams.active_counts().await;
-        let affinity_bindings = self.affinity.active_len().await;
+        let affinity_bindings = self.affinity.binding_len();
         let location_bindings = self.state.contact_count().await;
         let upstream_health = self.upstreams.health_snapshots();
         let security_stats = self.security.stats().await;
@@ -447,6 +505,11 @@ impl ProxyServer {
                 &mut output,
                 "proxy_persistence_event_rows",
                 stats.event_rows,
+            );
+            append_gauge(
+                &mut output,
+                "proxy_persistence_background_pending_events",
+                stats.background_pending_events,
             );
             append_labeled_gauge(
                 &mut output,
@@ -617,33 +680,35 @@ impl ProxyServer {
         invite_transaction_key: Option<String>,
         method: &str,
     ) {
-        match self
-            .affinity
-            .remember(
-                message,
-                AffinityTarget {
-                    addr: target.addr,
-                    transport: target.transport,
-                },
-            )
-            .await
-        {
-            Ok(bindings) => {
-                if let Some(persistence) = &self.persistence {
-                    if persistence.required() {
-                        if let Err(err) = persistence.upsert_affinity_bindings(bindings).await {
-                            warn!(
-                                error = %format!("{err:#}"),
-                                "failed to persist SIP affinity bindings"
-                            );
+        if should_record_forward_affinity(method) {
+            match self
+                .affinity
+                .remember(
+                    message,
+                    AffinityTarget {
+                        addr: target.addr,
+                        transport: target.transport,
+                    },
+                )
+                .await
+            {
+                Ok(bindings) => {
+                    if let Some(persistence) = &self.persistence {
+                        if persistence.required() {
+                            if let Err(err) = persistence.upsert_affinity_bindings(bindings).await {
+                                warn!(
+                                    error = %format!("{err:#}"),
+                                    "failed to persist SIP affinity bindings"
+                                );
+                            }
+                        } else {
+                            persistence.upsert_affinity_bindings_background(bindings);
                         }
-                    } else {
-                        persistence.upsert_affinity_bindings_background(bindings);
                     }
                 }
-            }
-            Err(err) => {
-                warn!(error = %err, "failed to record SIP affinity for forwarded request");
+                Err(err) => {
+                    warn!(error = %err, "failed to record SIP affinity for forwarded request");
+                }
             }
         }
 
@@ -807,10 +872,7 @@ impl ProxyServer {
         let Some(method) = message.method().map(str::to_string) else {
             return Ok(());
         };
-        self.metrics.incr(
-            "sip_requests_total",
-            &[("transport", "tcp"), ("method", method.as_str())],
-        );
+        self.record_sip_request("tcp", method.as_str());
 
         let mut message = message;
         if method == "ACK" && self.consume_local_invite_ack(&message).await {
@@ -936,10 +998,7 @@ impl ProxyServer {
         let Some(method) = message.method().map(str::to_string) else {
             return Ok(());
         };
-        self.metrics.incr(
-            "sip_requests_total",
-            &[("transport", "udp"), ("method", method.as_str())],
-        );
+        self.record_sip_request("udp", method.as_str());
 
         let mut message = message;
         if method == "ACK" && self.consume_local_invite_ack(&message).await {
@@ -1212,6 +1271,9 @@ impl ProxyServer {
                     method,
                 })
                 .await
+            }
+            SipTransport::TcpUdp => {
+                bail!("tcp_udp upstream target must be expanded before forwarding")
             }
         }
     }
@@ -1825,18 +1887,43 @@ impl ProxyServer {
         Ok(pending_register(bindings, expires, target))
     }
 
+    fn record_sip_request(&self, transport: &str, method: &str) {
+        if let (Some(transport), Some(method)) = (
+            metric_transport_index(transport),
+            metric_method_index(method),
+        ) {
+            self.metric_handles.sip_requests[transport][method].incr();
+            return;
+        }
+
+        self.metrics.incr(
+            "sip_requests_total",
+            &[("transport", transport), ("method", method)],
+        );
+    }
+
     fn record_forwarded_request(
         &self,
         downstream_transport: &str,
         upstream_transport: SipTransport,
         method: Option<&str>,
     ) {
+        let method = method.unwrap_or("UNKNOWN");
+        if let (Some(downstream), Some(method)) = (
+            metric_transport_index(downstream_transport),
+            metric_method_index(method),
+        ) {
+            let upstream = sip_transport_metric_index(upstream_transport);
+            self.metric_handles.forwarded_requests[downstream][upstream][method].incr();
+            return;
+        }
+
         self.metrics.incr(
             "proxy_forwarded_requests_total",
             &[
                 ("downstream_transport", downstream_transport),
                 ("upstream_transport", upstream_transport.as_str()),
-                ("method", method.unwrap_or("UNKNOWN")),
+                ("method", method),
             ],
         );
     }
@@ -2273,6 +2360,13 @@ fn set_reuse_port(_socket: &Socket, enabled: bool) -> io::Result<()> {
 
 struct UpstreamGroups {
     groups: HashMap<String, Arc<UpstreamGroupRuntime>>,
+    servers_by_addr: HashMap<SocketAddr, Vec<UpstreamServerRef>>,
+}
+
+#[derive(Clone)]
+struct UpstreamServerRef {
+    group: Arc<UpstreamGroupRuntime>,
+    index: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2352,13 +2446,15 @@ impl SecurityRuntime {
     fn new(config: &ProxyConfig) -> Result<Self> {
         let mut listeners = HashMap::new();
         let mut effective_configs = Vec::new();
-        for listener in &config.listeners {
-            let effective = config.effective_security_for_listener(listener);
-            effective_configs.push(effective.clone());
-            listeners.insert(
-                listener.key(),
-                Arc::new(ListenerSecurityRuntime::new(effective)?),
-            );
+        for configured_listener in &config.listeners {
+            for listener in configured_listener.concrete_listeners() {
+                let effective = config.effective_security_for_listener(&listener);
+                effective_configs.push(effective.clone());
+                listeners.insert(
+                    listener.key(),
+                    Arc::new(ListenerSecurityRuntime::new(effective)?),
+                );
+            }
         }
         let geo = GeoRuntime::new(&effective_configs)?;
         let threat = ThreatRuntime::new(&effective_configs)?;
@@ -2482,6 +2578,13 @@ impl SecurityRuntime {
                     flood.tcp_packets_per_second,
                     flood.tcp_burst,
                     "tcp-flood-rate-limit",
+                ),
+                SipTransport::TcpUdp => (
+                    flood
+                        .udp_packets_per_second
+                        .max(flood.tcp_packets_per_second),
+                    flood.udp_burst.max(flood.tcp_burst),
+                    "tcp-udp-flood-rate-limit",
                 ),
             };
             if rate > 0 && burst > 0 {
@@ -3394,7 +3497,25 @@ impl UpstreamGroups {
                 ))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        Ok(Self { groups })
+        let mut servers_by_addr: HashMap<SocketAddr, Vec<UpstreamServerRef>> = HashMap::new();
+        for group in groups.values() {
+            let mut seen_in_group = HashSet::new();
+            for (index, server) in group.servers.iter().copied().enumerate() {
+                if seen_in_group.insert(server) {
+                    servers_by_addr
+                        .entry(server)
+                        .or_default()
+                        .push(UpstreamServerRef {
+                            group: group.clone(),
+                            index,
+                        });
+                }
+            }
+        }
+        Ok(Self {
+            groups,
+            servers_by_addr,
+        })
     }
 
     fn select(&self, name: &str) -> Result<SocketAddr> {
@@ -3405,26 +3526,26 @@ impl UpstreamGroups {
     }
 
     fn record_passive_result(&self, server: SocketAddr, healthy: bool) {
-        for group in self.groups.values() {
-            group.record_passive_result(server, healthy);
+        if let Some(servers) = self.servers_by_addr.get(&server) {
+            for server in servers {
+                server.group.record_passive_result_at(server.index, healthy);
+            }
         }
     }
 
     fn is_healthy(&self, server: SocketAddr) -> bool {
-        let mut found = false;
-        for group in self.groups.values() {
-            if group.contains(server) {
-                found = true;
-                if group.is_healthy(server) {
-                    return true;
-                }
-            }
-        }
-        !found
+        self.servers_by_addr
+            .get(&server)
+            .map(|servers| {
+                servers
+                    .iter()
+                    .any(|server| server.group.is_healthy_at(server.index))
+            })
+            .unwrap_or(true)
     }
 
     fn contains(&self, server: SocketAddr) -> bool {
-        self.groups.values().any(|group| group.contains(server))
+        self.servers_by_addr.contains_key(&server)
     }
 
     fn health_snapshots(&self) -> Vec<UpstreamHealthSnapshot> {
@@ -3527,31 +3648,16 @@ impl UpstreamGroupRuntime {
         }
     }
 
-    fn record_passive_result(&self, server: SocketAddr, healthy: bool) {
+    fn record_passive_result_at(&self, index: usize, healthy: bool) {
         if !self.health_check.enabled {
             return;
         }
-        if let Some(index) = self
-            .servers
-            .iter()
-            .position(|candidate| *candidate == server)
-        {
+        if index < self.servers.len() {
             self.record_health_result(index, healthy);
         }
     }
 
-    fn contains(&self, server: SocketAddr) -> bool {
-        self.servers.contains(&server)
-    }
-
-    fn is_healthy(&self, server: SocketAddr) -> bool {
-        let Some(index) = self
-            .servers
-            .iter()
-            .position(|candidate| *candidate == server)
-        else {
-            return false;
-        };
+    fn is_healthy_at(&self, index: usize) -> bool {
         self.health[index].load(Ordering::Relaxed)
     }
 
@@ -3584,6 +3690,7 @@ fn resolve_upstream_server(group: &str, server: &str) -> Result<SocketAddr> {
 
 async fn run_health_checks(
     group: Arc<UpstreamGroupRuntime>,
+    role_provider: Arc<dyn ClusterReplicator>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let probes = HealthCheckRuntime::new(&group).await?;
@@ -3592,14 +3699,25 @@ async fn run_health_checks(
         if *shutdown.borrow() {
             break;
         }
-        run_health_check_round(group.clone(), &probes).await;
+        let role = role_provider.role().await;
+        let sleep_interval = if role.accepts_writes() {
+            run_health_check_round(group.clone(), &probes).await;
+            interval
+        } else {
+            debug!(
+                group = %group.name,
+                role = ?role,
+                "skipping backend health check while node is not active"
+            );
+            HEALTH_CHECK_STANDBY_ROLE_POLL_INTERVAL
+        };
         tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     break;
                 }
             }
-            _ = tokio::time::sleep(interval) => {}
+            _ = tokio::time::sleep(sleep_interval) => {}
         }
     }
     Ok(())
@@ -3741,13 +3859,17 @@ async fn probe_upstream_health(
             transport,
             uri,
             success_codes,
+            vary_call_id,
         } => {
             probe_sip_options(
-                server,
-                *transport,
-                uri,
-                limit,
-                success_codes,
+                SipOptionsProbe {
+                    server,
+                    transport: *transport,
+                    uri,
+                    vary_call_id: *vary_call_id,
+                    limit,
+                    success_codes,
+                },
                 udp_socket,
                 tcp_stream,
             )
@@ -3764,29 +3886,35 @@ fn health_probe_mode(probe: &UpstreamHealthProbeConfig) -> &'static str {
     }
 }
 
-async fn probe_sip_options(
+struct SipOptionsProbe<'a> {
     server: SocketAddr,
     transport: SipTransport,
-    uri: &str,
+    uri: &'a str,
+    vary_call_id: bool,
     limit: Duration,
-    success_codes: &[u16],
+    success_codes: &'a [u16],
+}
+
+async fn probe_sip_options(
+    probe: SipOptionsProbe<'_>,
     udp_socket: Option<Arc<UdpSocket>>,
     tcp_stream: Option<Arc<Mutex<Option<TcpStream>>>>,
 ) -> HealthProbeResult {
     let future = async {
-        match transport {
+        match probe.transport {
             SipTransport::Udp => {
                 let socket = udp_socket.context("missing UDP health-check socket")?;
-                probe_sip_options_udp(server, uri, socket).await
+                probe_sip_options_udp(probe.server, probe.uri, probe.vary_call_id, socket).await
             }
             SipTransport::Tcp => {
                 let stream = tcp_stream.context("missing TCP health-check stream")?;
-                probe_sip_options_tcp(server, uri, stream).await
+                probe_sip_options_tcp(probe.server, probe.uri, probe.vary_call_id, stream).await
             }
+            SipTransport::TcpUdp => bail!("SIP OPTIONS health-check transport must be udp or tcp"),
         }
     };
-    let Ok(response) = timeout(limit, future).await else {
-        return HealthProbeResult::failed(format!("SIP OPTIONS timed out after {:?}", limit));
+    let Ok(response) = timeout(probe.limit, future).await else {
+        return HealthProbeResult::failed(format!("SIP OPTIONS timed out after {:?}", probe.limit));
     };
     let response = match response {
         Ok(response) => response,
@@ -3804,16 +3932,17 @@ async fn probe_sip_options(
     };
     match message.start_line {
         SipStartLine::Response { code, .. } => {
-            let accepted = if success_codes.is_empty() {
+            let accepted = if probe.success_codes.is_empty() {
                 code < 500
             } else {
-                success_codes.contains(&code)
+                probe.success_codes.contains(&code)
             };
             if accepted {
                 HealthProbeResult::healthy()
             } else {
                 HealthProbeResult::failed(format!(
-                    "SIP OPTIONS returned status {code}, expected one of {success_codes:?}"
+                    "SIP OPTIONS returned status {code}, expected one of {:?}",
+                    probe.success_codes
                 ))
             }
         }
@@ -3833,11 +3962,12 @@ fn build_health_options_request(
     uri: &str,
     transport: SipTransport,
     sent_by: SocketAddr,
+    vary_call_id: bool,
 ) -> Result<HealthOptionsRequest> {
     let id = unique_id();
     let branch = format!("z9hG4bK-health-{id}");
     let cseq = cseq_from_id(id);
-    let call_id = health_options_call_id(server, transport, uri);
+    let call_id = health_options_call_id(server, transport, uri, vary_call_id.then_some(id));
     let packet = SipMessage::options_request(
         uri,
         rsip_transport_from_sip(transport),
@@ -3855,14 +3985,30 @@ fn cseq_from_id(id: u64) -> u32 {
     ((id.saturating_sub(1) % u64::from(u32::MAX)) + 1) as u32
 }
 
-fn health_options_call_id(server: SocketAddr, transport: SipTransport, uri: &str) -> String {
-    let key = format!(
-        "health|{}|{}|{}|{}",
-        std::process::id(),
-        transport.as_str(),
-        server,
-        uri
-    );
+fn health_options_call_id(
+    server: SocketAddr,
+    transport: SipTransport,
+    uri: &str,
+    request_id: Option<u64>,
+) -> String {
+    let key = if let Some(request_id) = request_id {
+        format!(
+            "health|{}|{}|{}|{}|{}",
+            std::process::id(),
+            transport.as_str(),
+            server,
+            uri,
+            request_id
+        )
+    } else {
+        format!(
+            "health|{}|{}|{}|{}",
+            std::process::id(),
+            transport.as_str(),
+            server,
+            uri
+        )
+    };
     format!("{}@sipproxy-rs", uuid_like_id(&key))
 }
 
@@ -3911,10 +4057,16 @@ async fn bind_health_probe_udp_socket(server: SocketAddr) -> Result<UdpSocket> {
 async fn probe_sip_options_udp(
     server: SocketAddr,
     uri: &str,
+    vary_call_id: bool,
     socket: Arc<UdpSocket>,
 ) -> Result<Vec<u8>> {
-    let request =
-        build_health_options_request(server, uri, SipTransport::Udp, socket.local_addr()?)?;
+    let request = build_health_options_request(
+        server,
+        uri,
+        SipTransport::Udp,
+        socket.local_addr()?,
+        vary_call_id,
+    )?;
     socket.send(&request.packet).await?;
     let mut buf = vec![0; 65_535];
     loop {
@@ -3942,6 +4094,7 @@ fn health_options_response_matches_branch(response: &[u8], branch: &str) -> Resu
 async fn probe_sip_options_tcp(
     server: SocketAddr,
     uri: &str,
+    vary_call_id: bool,
     stream_slot: Arc<Mutex<Option<TcpStream>>>,
 ) -> Result<Vec<u8>> {
     let mut stream_guard = stream_slot.lock().await;
@@ -3950,8 +4103,13 @@ async fn probe_sip_options_tcp(
     }
 
     let stream = stream_guard.as_mut().expect("stream initialized above");
-    let request =
-        build_health_options_request(server, uri, SipTransport::Tcp, stream.local_addr()?)?;
+    let request = build_health_options_request(
+        server,
+        uri,
+        SipTransport::Tcp,
+        stream.local_addr()?,
+        vary_call_id,
+    )?;
     if let Err(err) = stream.write_all(&request.packet).await {
         *stream_guard = None;
         return Err(err).context("failed to write SIP OPTIONS to upstream TCP connection");
@@ -3995,6 +4153,40 @@ fn prune_pending_registers(registers: &mut HashMap<String, PendingRegister>, now
 fn prune_local_invite_rejections(rejections: &mut HashMap<String, Instant>, now: Instant) {
     rejections
         .retain(|_, created_at| now.duration_since(*created_at) <= LOCAL_INVITE_REJECTION_TTL);
+}
+
+fn should_record_forward_affinity(method: &str) -> bool {
+    !method.eq_ignore_ascii_case("OPTIONS")
+}
+
+fn metric_transport_index(transport: &str) -> Option<usize> {
+    match transport {
+        "udp" => Some(0),
+        "tcp" => Some(1),
+        _ => None,
+    }
+}
+
+fn sip_transport_metric_index(transport: SipTransport) -> usize {
+    match transport {
+        SipTransport::Udp => 0,
+        SipTransport::Tcp => 1,
+        SipTransport::TcpUdp => unreachable!("tcp_udp metrics transport must be expanded"),
+    }
+}
+
+fn metric_method_index(method: &str) -> Option<usize> {
+    match method {
+        "ACK" => Some(0),
+        "BYE" => Some(1),
+        "CANCEL" => Some(2),
+        "INVITE" => Some(3),
+        "MESSAGE" => Some(4),
+        "OPTIONS" => Some(5),
+        "REGISTER" => Some(6),
+        "UNKNOWN" => Some(7),
+        _ => None,
+    }
 }
 
 fn is_crlf_keepalive(packet: &[u8]) -> bool {
@@ -4547,6 +4739,7 @@ fn rsip_transport_from_sip(transport: SipTransport) -> RsipTransport {
     match transport {
         SipTransport::Udp => RsipTransport::Udp,
         SipTransport::Tcp => RsipTransport::Tcp,
+        SipTransport::TcpUdp => unreachable!("tcp_udp SIP transport must be expanded"),
     }
 }
 
@@ -4672,7 +4865,10 @@ fn unique_id() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cluster::{ClusterCommand, ContactBinding, StandaloneReplicator, expires_at};
+    use crate::cluster::{
+        ClusterApplyResult, ClusterCommand, ClusterRole, ContactBinding, NodeId,
+        StandaloneReplicator, expires_at,
+    };
     use crate::config::PersistenceConfig;
     use crate::config::{
         Config, ProxyAffinityConfig, ProxyAffinityKey, ProxyConfig, ProxyDynamicBanConfig,
@@ -4684,6 +4880,40 @@ mod tests {
     };
     use crate::proxy::geo::test_cache_bytes;
     use tokio::net::UdpSocket;
+
+    struct MutableRoleReplicator {
+        role: tokio::sync::RwLock<ClusterRole>,
+    }
+
+    impl MutableRoleReplicator {
+        fn new(role: ClusterRole) -> Self {
+            Self {
+                role: tokio::sync::RwLock::new(role),
+            }
+        }
+
+        async fn set_role(&self, role: ClusterRole) {
+            *self.role.write().await = role;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterReplicator for MutableRoleReplicator {
+        async fn submit(&self, _command: ClusterCommand) -> Result<ClusterApplyResult> {
+            Ok(ClusterApplyResult {
+                applied: false,
+                index: None,
+            })
+        }
+
+        async fn role(&self) -> ClusterRole {
+            *self.role.read().await
+        }
+
+        async fn leader(&self) -> Option<NodeId> {
+            None
+        }
+    }
 
     fn test_listener() -> ProxyListenerConfig {
         ProxyListenerConfig {
@@ -6825,7 +7055,7 @@ Content-Length: 0\r\n\r\n",
         assert!(metrics.contains("# TYPE proxy_udp_branch_routes gauge"));
         assert!(metrics.contains("proxy_udp_branch_routes 2"));
         assert!(metrics.contains("proxy_invite_transaction_routes 0"));
-        assert!(metrics.contains("proxy_affinity_bindings 2"));
+        assert!(metrics.contains("proxy_affinity_bindings 1"));
         assert!(metrics.contains("proxy_location_bindings 0"));
         assert!(metrics.contains(&format!(
             "proxy_upstream_healthy{{group=\"default\",server=\"{}\"}} 1",
@@ -6887,6 +7117,7 @@ Content-Length: 0\r\n\r\n",
         assert!(metrics.contains("proxy_persistence_latest_event_seq 1"));
         assert!(metrics.contains("proxy_persistence_last_applied_seq 0"));
         assert!(metrics.contains("proxy_persistence_event_rows 1"));
+        assert!(metrics.contains("proxy_persistence_background_pending_events 0"));
         assert!(metrics.contains("proxy_persistence_event_lag{role=\"standalone\"} 1"));
         assert!(metrics.contains("proxy_persistence_event_appends_total{result=\"success\"} 1"));
         assert!(metrics.contains("proxy_persistence_sqlite_write_failures_total 0"));
@@ -7123,6 +7354,7 @@ Content-Length: 0\r\n\r\n",
         assert!(!response.contains(PROXY_BRANCH_PREFIX));
         assert!(response.contains("z9hG4bK-client-options"));
         assert_eq!(server.active_udp_branch_count().await, 0);
+        assert_eq!(server.affinity.active_len().await, 0);
     }
 
     #[tokio::test]
@@ -7893,9 +8125,47 @@ Content-Length: 0\r\n\r\n",
         })
         .unwrap();
 
-        group.record_passive_result("127.0.0.1:5080".parse().unwrap(), false);
+        group.record_passive_result_at(0, false);
 
         assert_eq!(group.select().unwrap(), "127.0.0.1:5080".parse().unwrap());
+    }
+
+    #[test]
+    fn upstream_groups_index_updates_shared_server_in_each_group() {
+        let shared = "127.0.0.1:5080".parse().unwrap();
+        let groups = UpstreamGroups::new(&[
+            UpstreamGroupConfig {
+                name: "first".to_string(),
+                mode: UpstreamMode::RoundRobin,
+                health_check: UpstreamHealthCheckConfig {
+                    enabled: true,
+                    failure_threshold: 1,
+                    ..UpstreamHealthCheckConfig::default()
+                },
+                servers: vec!["127.0.0.1:5080".to_string(), "127.0.0.1:5081".to_string()],
+            },
+            UpstreamGroupConfig {
+                name: "second".to_string(),
+                mode: UpstreamMode::RoundRobin,
+                health_check: UpstreamHealthCheckConfig {
+                    enabled: true,
+                    failure_threshold: 1,
+                    ..UpstreamHealthCheckConfig::default()
+                },
+                servers: vec!["127.0.0.1:5080".to_string(), "127.0.0.1:5082".to_string()],
+            },
+        ])
+        .unwrap();
+
+        assert!(groups.contains(shared));
+        assert!(groups.is_healthy(shared));
+        assert!(groups.is_healthy("127.0.0.1:5999".parse().unwrap()));
+
+        groups.record_passive_result(shared, false);
+
+        assert!(!groups.groups["first"].is_healthy_at(0));
+        assert!(!groups.groups["second"].is_healthy_at(0));
+        assert!(!groups.is_healthy(shared));
     }
 
     #[test]
@@ -7907,6 +8177,7 @@ Content-Length: 0\r\n\r\n",
             "sip:healthcheck@example.com",
             SipTransport::Udp,
             sent_by,
+            false,
         )
         .unwrap();
         let second_request = build_health_options_request(
@@ -7914,6 +8185,7 @@ Content-Length: 0\r\n\r\n",
             "sip:healthcheck@example.com",
             SipTransport::Udp,
             sent_by,
+            false,
         )
         .unwrap();
         let first = SipMessage::parse(&first_request.packet).unwrap();
@@ -7923,6 +8195,37 @@ Content-Length: 0\r\n\r\n",
         let call_id = first.header("call-id").unwrap();
         assert!(call_id.ends_with("@sipproxy-rs"));
         assert_uuid_like(&call_id[..call_id.len() - "@sipproxy-rs".len()]);
+        assert_ne!(first.header("cseq"), second.header("cseq"));
+        assert_ne!(
+            first.top_via_branch().unwrap(),
+            second.top_via_branch().unwrap()
+        );
+    }
+
+    #[test]
+    fn health_options_can_vary_call_id_per_probe() {
+        let server = "127.0.0.1:5080".parse().unwrap();
+        let sent_by = "127.0.0.1:5099".parse().unwrap();
+        let first_request = build_health_options_request(
+            server,
+            "sip:healthcheck@example.com",
+            SipTransport::Udp,
+            sent_by,
+            true,
+        )
+        .unwrap();
+        let second_request = build_health_options_request(
+            server,
+            "sip:healthcheck@example.com",
+            SipTransport::Udp,
+            sent_by,
+            true,
+        )
+        .unwrap();
+        let first = SipMessage::parse(&first_request.packet).unwrap();
+        let second = SipMessage::parse(&second_request.packet).unwrap();
+
+        assert_ne!(first.header("call-id"), second.header("call-id"));
         assert_ne!(first.header("cseq"), second.header("cseq"));
         assert_ne!(
             first.top_via_branch().unwrap(),
@@ -8099,11 +8402,14 @@ Content-Length: 0\r\n\r\n"
         for _ in 0..2 {
             assert!(
                 probe_sip_options(
-                    upstream_addr,
-                    SipTransport::Udp,
-                    "sip:healthcheck@localhost",
-                    Duration::from_millis(500),
-                    &[200],
+                    SipOptionsProbe {
+                        server: upstream_addr,
+                        transport: SipTransport::Udp,
+                        uri: "sip:healthcheck@localhost",
+                        vary_call_id: false,
+                        limit: Duration::from_millis(500),
+                        success_codes: &[200],
+                    },
                     Some(socket.clone()),
                     None,
                 )
@@ -8135,11 +8441,14 @@ Content-Length: 0\r\n\r\n"
 
         assert!(
             probe_sip_options(
-                addr,
-                SipTransport::Udp,
-                "sip:healthcheck@localhost",
-                Duration::from_millis(500),
-                &[200, 405],
+                SipOptionsProbe {
+                    server: addr,
+                    transport: SipTransport::Udp,
+                    uri: "sip:healthcheck@localhost",
+                    vary_call_id: false,
+                    limit: Duration::from_millis(500),
+                    success_codes: &[200, 405],
+                },
                 Some(Arc::new(bind_health_probe_udp_socket(addr).await.unwrap())),
                 None,
             )
@@ -8174,11 +8483,14 @@ Content-Length: 0\r\n\r\n"
         for _ in 0..2 {
             assert!(
                 probe_sip_options(
-                    upstream_addr,
-                    SipTransport::Tcp,
-                    "sip:healthcheck@localhost",
-                    Duration::from_millis(500),
-                    &[200],
+                    SipOptionsProbe {
+                        server: upstream_addr,
+                        transport: SipTransport::Tcp,
+                        uri: "sip:healthcheck@localhost",
+                        vary_call_id: false,
+                        limit: Duration::from_millis(500),
+                        success_codes: &[200],
+                    },
                     None,
                     Some(stream_slot.clone()),
                 )
@@ -8230,7 +8542,9 @@ Content-Length: 0\r\n\r\n"
             .unwrap(),
         );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(run_health_checks(group.clone(), shutdown_rx));
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state, None));
+        let task = tokio::spawn(run_health_checks(group.clone(), replicator, shutdown_rx));
 
         timeout(Duration::from_secs(1), async {
             loop {
@@ -8242,6 +8556,65 @@ Content-Length: 0\r\n\r\n"
         })
         .await
         .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_check_skips_backend_probe_until_role_is_active() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let (probe_tx, mut probe_rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut buf = [0; 2048];
+            while let Ok((len, peer)) = upstream.recv_from(&mut buf).await {
+                let request = String::from_utf8_lossy(&buf[..len]);
+                let via = request
+                    .lines()
+                    .find(|line| line.starts_with("Via:"))
+                    .unwrap_or("Via: SIP/2.0/UDP 127.0.0.1;branch=z9hG4bK-health-test");
+                let response = format!("SIP/2.0 200 OK\r\n{via}\r\nContent-Length: 0\r\n\r\n");
+                upstream.send_to(response.as_bytes(), peer).await.unwrap();
+                let _ = probe_tx.send(()).await;
+            }
+        });
+
+        let group = Arc::new(
+            UpstreamGroupRuntime::new(&UpstreamGroupConfig {
+                name: "default".to_string(),
+                mode: UpstreamMode::RoundRobin,
+                health_check: UpstreamHealthCheckConfig {
+                    enabled: true,
+                    interval_ms: 20,
+                    timeout_ms: 100,
+                    probe: UpstreamHealthProbeConfig::Options {
+                        transport: SipTransport::Udp,
+                        uri: "sip:healthcheck@localhost".to_string(),
+                        success_codes: vec![200],
+                        vary_call_id: false,
+                    },
+                    ..UpstreamHealthCheckConfig::default()
+                },
+                servers: vec![upstream_addr.to_string()],
+            })
+            .unwrap(),
+        );
+        let replicator = Arc::new(MutableRoleReplicator::new(ClusterRole::Follower));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(run_health_checks(group, replicator.clone(), shutdown_rx));
+
+        assert!(
+            timeout(Duration::from_millis(200), probe_rx.recv())
+                .await
+                .is_err()
+        );
+
+        replicator.set_role(ClusterRole::Leader).await;
+        timeout(Duration::from_secs(2), probe_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
 
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();

@@ -213,6 +213,9 @@ preset = "off"
 # geo_filter = true
 # threat_intel = true
 # ip_rate_limit = true
+# auto_size_maps = true
+# max_deny_cidrs_entries = 262144 # increase for large threat feeds/listener fanout
+# max_geo_cidrs_entries = 262144
 
 [[proxy.upstream_groups]]
 # Upstream group name referenced by listeners and routes.
@@ -260,6 +263,10 @@ uri = "sip:healthcheck@pbx-a"
 # This field is used only for mode = "options".
 success_codes = [200, 202, 404, 405, 481]
 
+# Keep a stable Call-ID per backend by default. Set true if the upstream expects
+# each OPTIONS probe to use a fresh Call-ID.
+vary_call_id = false
+
 [[proxy.upstream_groups]]
 # Example group using tcp-connect health checks for TCP-only upstreams.
 name = "pbx-b"
@@ -280,7 +287,9 @@ mode = "tcp-connect"
 # SIP listener bind address.
 bind = "0.0.0.0:5060"
 
-# Listener transport. Supported: "udp", "tcp".
+# Listener transport. Supported: "udp", "tcp", "tcp_udp".
+# "tcp_udp" starts both UDP and TCP listeners on the same bind address and
+# preserves the inbound transport when forwarding to the upstream group.
 transport = "udp"
 
 # Default upstream group for requests received on this listener.
