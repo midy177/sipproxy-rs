@@ -1,16 +1,26 @@
 # Two-node active-standby config for node 1.
 # Node 1 starts active. Node 2 should use active-standby-node2.toml.
+# Mirrors examples/single-node.toml; the only addition is [ha] (enabled).
 
 [node]
 id = 1
 
 [sip]
-public_addr = "sip.example.com"
-internal_addr = "10.0.0.11"
+# Address advertised to public SIP clients.
+public_addr = "${PUBLIC_IP:-}"
+# Address advertised to upstream PBX servers on the private network.
+internal_addr = "${POD_IP:-}"
+# Used only when public_addr is empty/unset.
+public_stun_server = "${PUBLIC_STUN_SERVER:-}"
+# Used only when internal_addr is empty/unset.
+internal_probe_addr = "${INTERNAL_PROBE_ADDR:-8.8.8.8:53}"
 max_message_bytes = 65535
 
 [proxy]
 record_route = true
+register_routing = "path"
+# Legacy compatibility equivalent to register_routing = "contact-rewrite".
+# rewrite_register_contact = true
 
 [proxy.socket]
 reuse_port = false
@@ -28,53 +38,185 @@ enabled = true
 key = "dialog-id"
 ttl_seconds = 3600
 
+[proxy.security]
+# Public is the recommended baseline for an internet-facing UDP listener.
+# Use "off" only for private lab deployments.
+preset = "public"
+trusted_cidrs = ["172.30.0.0/16"]
+
+[proxy.security.geo]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/geo"
+startup_refresh = "disabled"
+fail_open = true
+unknown_country = "allow"
+request_retries = 3
+allow_partial = true
+
+[proxy.security.geo.deny]
+countries = []
+
+[proxy.security.threat_intel]
+enabled = true
+cache_dir = "/var/lib/sigproxy-rs/threat"
+startup_refresh = "disabled"
+fail_open = true
+request_retries = 3
+allow_partial = true
+
+[proxy.security.dynamic_ban]
+enabled = true
+ban_seconds = 3600
+invalid_packets_per_minute = 30
+parse_errors_per_minute = 20
+sip_rate_violations_per_minute = 10
+
+[proxy.security.flood]
+enabled = true
+udp_packets_per_second = 200
+udp_burst = 400
+tcp_packets_per_second = 200
+tcp_burst = 400
+tcp_syn_packets_per_second = 100
+tcp_syn_burst = 200
+tcp_ack_packets_per_second = 200
+tcp_ack_burst = 400
+icmp_packets_per_second = 50
+icmp_burst = 100
+block_seconds = 300
+
+[proxy.security.sip_policy]
+require_registered_invite_source = true
+registered_invite_source_match = "ip"
+
+[proxy.security.xdp]
+enabled = true
+interfaces = []
+detach_stale = true
+fail_open = true
+sync_dynamic_ban = true
+cidr_filter = true
+geo_filter = true
+threat_intel = true
+ip_rate_limit = true
+
+# Backends: 172.30.12.228 and 172.30.11.57, each serving several SIP ports.
+# One upstream group per backend port; the listener transport matches the
+# backend transport on that port.
+
+# 5060 — plain UDP + TCP.
 [[proxy.upstream_groups]]
-name = "pbx-a"
+name = "sip-5060"
 mode = "round-robin"
-servers = ["10.0.1.10:5060", "10.0.1.11:5060"]
+servers = ["172.30.12.228:5060", "172.30.11.57:5060"]
 
 [proxy.upstream_groups.health_check]
 enabled = true
-interval_ms = 5000
-timeout_ms = 1000
+interval_ms = 30000
+timeout_ms = 2000
 success_threshold = 2
 failure_threshold = 3
 
 [proxy.upstream_groups.health_check.probe]
 mode = "options"
 transport = "udp"
-uri = "sip:healthcheck@pbx-a"
+uri = "sip:healthcheck@${POD_IP:-}"
 success_codes = [200, 202, 405, 481]
 
-[[proxy.listeners]]
-bind = "0.0.0.0:5060"
-transport = "udp"
-upstream_group = "pbx-a"
+# 5092 — plain UDP + TCP.
+[[proxy.upstream_groups]]
+name = "sip-5092"
+mode = "round-robin"
+servers = ["172.30.12.228:5092", "172.30.11.57:5092"]
 
-[[proxy.listeners]]
-bind = "0.0.0.0:5060"
-transport = "tcp"
-upstream_group = "pbx-a"
-
-[ha]
+[proxy.upstream_groups.health_check]
 enabled = true
-initial_role = "active"
-heartbeat_bind = "10.0.0.11:7900"
-peer_heartbeat_addr = "10.0.0.12:7900"
-heartbeat_interval_ms = 1000
-failover_timeout_ms = 5000
-replication_bind_addr = "10.0.0.11:7901"
-peer_replication_addr = "10.0.0.12:7901"
-replication_pull_interval_ms = 1000
-replication_request_timeout_ms = 2000
-leader_check_interval_ms = 1000
+interval_ms = 30000
+timeout_ms = 2000
+success_threshold = 2
+failure_threshold = 3
+
+[proxy.upstream_groups.health_check.probe]
+mode = "options"
+transport = "udp"
+uri = "sip:healthcheck@${POD_IP:-}"
+success_codes = [200, 202, 405, 481]
+
+# 5061 / 5093 are TLS-only. The proxy has no TLS transport today (SipTransport
+# is udp/tcp only — see src/config.rs), so these groups/listeners are commented
+# out. Uncomment and switch transport to "tls" once TLS support lands.
+# [[proxy.upstream_groups]]
+# name = "sip-5061"
+# mode = "round-robin"
+# servers = ["172.30.12.228:5061", "172.30.11.57:5061"]
+# [proxy.upstream_groups.health_check]
+# enabled = true
+# interval_ms = 5000
+# timeout_ms = 2000
+# success_threshold = 2
+# failure_threshold = 3
+# [proxy.upstream_groups.health_check.probe]
+# mode = "options"
+# transport = "tls"
+# uri = "sip:healthcheck@${POD_IP:-172.30.0.101}"
+# success_codes = [200, 202, 405, 481]
+#
+# [[proxy.upstream_groups]]
+# name = "sip-5093"
+# mode = "round-robin"
+# servers = ["172.30.12.228:5093", "172.30.11.57:5093"]
+# [proxy.upstream_groups.health_check]
+# enabled = true
+# interval_ms = 5000
+# timeout_ms = 2000
+# success_threshold = 2
+# failure_threshold = 3
+# [proxy.upstream_groups.health_check.probe]
+# mode = "options"
+# transport = "tls"
+# uri = "sip:healthcheck@${POD_IP:-172.30.0.101}"
+# success_codes = [200, 202, 405, 481]
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5060"
+transport = "tcp_udp"
+upstream_group = "sip-5060"
+
+[[proxy.listeners]]
+bind = "0.0.0.0:5092"
+transport = "tcp_udp"
+upstream_group = "sip-5092"
+
+# 5061 / 5093 listeners — disabled pending TLS transport support.
+# [[proxy.listeners]]
+# bind = "0.0.0.0:5061"
+# transport = "tls"
+# upstream_group = "sip-5061"
+#
+# [[proxy.listeners]]
+# bind = "0.0.0.0:5093"
+# transport = "tls"
+# upstream_group = "sip-5093"
 
 [persistence]
 enabled = true
 path = "/var/lib/sigproxy-rs/ha/state-node1.db"
 required = false
 event_retention_seconds = 3600
-cleanup_interval_ms = 60000
+cleanup_interval_ms = 600000
+
+[ha]
+enabled = true
+initial_role = "active"
+heartbeat_bind = "172.30.0.254:7900"
+peer_heartbeat_addr = "172.30.4.63:7900"
+heartbeat_interval_ms = 1000
+failover_timeout_ms = 5000
+replication_bind_addr = "172.30.0.254:7901"
+peer_replication_addr = "172.30.4.63:7901"
+replication_pull_interval_ms = 1000
+replication_request_timeout_ms = 2000
+leader_check_interval_ms = 1000
 
 [ha.addon]
 type = "noop"
