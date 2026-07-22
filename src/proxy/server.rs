@@ -1834,10 +1834,14 @@ impl ProxyServer {
             .context("request forwarding requires a request URI")?
             .to_string();
         let from_upstream = self.upstreams.contains(_peer);
-        let from_trusted_peer = self.security.is_trusted_peer(listener, _peer.ip());
-        let route_set_targets_this_proxy = self
-            .top_route_targets_this_proxy(&message, listener, _peer)
-            .await?;
+        let from_trusted_peer =
+            self.user_space_security_enabled && self.security.is_trusted_peer(listener, _peer.ip());
+        let route_set_targets_this_proxy = if from_upstream || from_trusted_peer {
+            self.top_route_targets_this_proxy(&message, listener, _peer)
+                .await?
+        } else {
+            false
+        };
         let request_uri_targets_this_proxy =
             self.request_uri_targets_this_proxy(&request_uri, listener);
         let direct_request_uri_target = if from_upstream || from_trusted_peer {
