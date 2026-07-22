@@ -30,7 +30,7 @@ use rsipstack::sip::{
 };
 use rsipstack::transport::stream::{SipCodec, SipCodecType};
 use socket2::{Domain, Protocol, Socket, Type};
-use std::collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, hash_map::DefaultHasher};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -395,8 +395,10 @@ impl ProxyServer {
             .context("failed to build upstream groups")?;
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
-        let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
-        let user_space_security_enabled = user_space_security_enabled(&config.proxy);
+        let security_config =
+            proxy_config_with_automatic_upstream_trusted_cidrs(&config.proxy, &upstreams);
+        let security = Arc::new(SecurityRuntime::new(&security_config)?);
+        let user_space_security_enabled = user_space_security_enabled(&security_config);
         let metrics = Arc::new(ProxyMetrics::default());
         let metric_handles = ProxyMetricHandles::new(&metrics, &config.proxy);
         let local_ips = local_interface_ips();
@@ -3052,6 +3054,34 @@ fn user_space_security_enabled(config: &ProxyConfig) -> bool {
         .any(|listener| config.effective_security_for_listener(&listener).enabled())
 }
 
+fn proxy_config_with_automatic_upstream_trusted_cidrs(
+    config: &ProxyConfig,
+    upstreams: &UpstreamGroups,
+) -> ProxyConfig {
+    let automatic = upstreams.automatic_trusted_cidrs();
+    if automatic.is_empty() {
+        return config.clone();
+    }
+
+    let mut merged = config.clone();
+    merge_trusted_cidrs(&mut merged.security.trusted_cidrs, &automatic);
+    for listener in &mut merged.listeners {
+        if let Some(security) = &mut listener.security {
+            merge_trusted_cidrs(&mut security.trusted_cidrs, &automatic);
+        }
+    }
+    merged
+}
+
+fn merge_trusted_cidrs(configured: &mut Option<Vec<String>>, automatic: &[String]) {
+    let cidrs = configured.get_or_insert_with(Vec::new);
+    for cidr in automatic {
+        if !cidrs.iter().any(|existing| existing == cidr) {
+            cidrs.push(cidr.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DynamicOffense {
     InvalidPacket,
@@ -4163,6 +4193,14 @@ impl UpstreamGroups {
         })
     }
 
+    fn automatic_trusted_cidrs(&self) -> Vec<String> {
+        let mut ips = BTreeSet::new();
+        for server in self.servers_by_addr.keys() {
+            ips.insert(server.ip());
+        }
+        ips.into_iter().map(exact_ip_cidr).collect()
+    }
+
     fn select(&self, name: &str) -> Result<SocketAddr> {
         let Some(group) = self.groups.get(name) else {
             bail!("unknown upstream group '{name}'");
@@ -4198,6 +4236,13 @@ impl UpstreamGroups {
             .values()
             .flat_map(|group| group.health_snapshots())
             .collect()
+    }
+}
+
+fn exact_ip_cidr(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(addr) => format!("{addr}/32"),
+        IpAddr::V6(addr) => format!("{addr}/128"),
     }
 }
 
@@ -5849,6 +5894,66 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn automatic_upstream_trusted_cidrs_are_merged_into_listener_overrides() {
+        let mut listener = test_listener();
+        listener.security = Some(ProxySecurityConfig {
+            trusted_cidrs: Some(vec!["192.0.2.10/32".to_string()]),
+            ..ProxySecurityConfig::default()
+        });
+        let config =
+            test_proxy_config_with_security(ProxySecurityConfig::default(), vec![listener]);
+        let upstreams = UpstreamGroups::new(&config.upstream_groups).unwrap();
+        let merged = proxy_config_with_automatic_upstream_trusted_cidrs(&config, &upstreams);
+        let effective = merged.effective_security_for_listener(&merged.listeners[0]);
+
+        assert!(
+            effective
+                .trusted_cidrs
+                .contains(&"127.0.0.1/32".to_string())
+        );
+        assert!(
+            effective
+                .trusted_cidrs
+                .contains(&"192.0.2.10/32".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_ips_are_packet_trusted_without_manual_trusted_cidrs() {
+        let upstream: SocketAddr = "127.0.0.1:5080".parse().unwrap();
+        let server = test_server_with_security(
+            upstream,
+            ProxySecurityConfig {
+                preset: Some(ProxySecurityPreset::Public),
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        let upstream_decision = server
+            .security
+            .check_packet(
+                &test_listener(),
+                "127.0.0.1:5999".parse().unwrap(),
+                b"GET / HTTP/1.0\r\n\r\n",
+            )
+            .await;
+        assert!(matches!(upstream_decision, SecurityDecision::Allow));
+
+        let client_decision = server
+            .security
+            .check_packet(
+                &test_listener(),
+                "192.0.2.10:5999".parse().unwrap(),
+                b"GET / HTTP/1.0\r\n\r\n",
+            )
+            .await;
+        assert!(matches!(
+            client_decision,
+            SecurityDecision::Drop("invalid-start-line")
+        ));
+    }
+
     fn test_server_with_upstream(upstream: SocketAddr) -> ProxyServer {
         test_server_with_upstream_config(upstream, false)
     }
@@ -6584,7 +6689,7 @@ Content-Length: 0\r\n\r\n"
         let cache_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             cache_dir.path().join("geo.sgeo"),
-            test_cache_bytes("US", "127.0.0.0/8\n"),
+            test_cache_bytes("US", "192.0.2.0/24\n"),
         )
         .unwrap();
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -6609,13 +6714,13 @@ Content-Length: 0\r\n\r\n"
             .handle_udp_packet(
                 &proxy_socket,
                 b"OPTIONS sip:example.com SIP/2.0\r\n\
-Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-geo-drop\r\n\
+Via: SIP/2.0/UDP 192.0.2.10:5061;branch=z9hG4bK-geo-drop\r\n\
 From: <sip:100@example.com>;tag=a\r\n\
 To: <sip:example.com>\r\n\
 Call-ID: geo-drop\r\n\
 CSeq: 1 OPTIONS\r\n\
 Content-Length: 0\r\n\r\n",
-                "127.0.0.1:5061".parse().unwrap(),
+                "192.0.2.10:5061".parse().unwrap(),
                 &test_listener(),
             )
             .await
@@ -6654,7 +6759,7 @@ Content-Length: 0\r\n\r\n",
                 ..ProxySecurityConfig::default()
             },
         );
-        let peer = "127.0.0.1:5061".parse().unwrap();
+        let peer = "192.0.2.10:5061".parse().unwrap();
 
         for _ in 0..2 {
             server
@@ -6671,7 +6776,7 @@ Content-Length: 0\r\n\r\n",
             .handle_udp_packet(
                 &proxy_socket,
                 b"OPTIONS sip:example.com SIP/2.0\r\n\
-Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-dynamic-block\r\n\
+Via: SIP/2.0/UDP 192.0.2.10:5061;branch=z9hG4bK-dynamic-block\r\n\
 From: <sip:100@example.com>;tag=a\r\n\
 To: <sip:example.com>\r\n\
 Call-ID: dynamic-block\r\n\

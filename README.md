@@ -312,8 +312,9 @@ default; set `preset = "off"` to explicitly disable all listener security.
 ```toml
 [proxy.security]
 preset = "public"
-# Exact PBX/backend addresses only; do not include the phone/client subnet.
-trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
+# Upstream PBX/backend IPs are trusted automatically from proxy.upstream_groups.
+# Add trusted_cidrs only for extra non-upstream packet-level trusted sources.
+# trusted_cidrs = ["10.0.1.20/32"]
 
 [proxy.security.ip_rate_limit]
 packets_per_second = 50
@@ -380,10 +381,12 @@ from a binary `geo.sgeo` cache in `cache_dir`; threat intel is loaded from
 default, runtime refresh is disabled so container deployments use the caches
 built into the image.
 
-`trusted_cidrs` is for exact PBX/backend source IPs. Trusted peers skip
-packet-level geo/threat/flood checks, but non-upstream clients still pass
-through SIP identity policy, SIP method rate limits, and SIP dynamic bans.
-Avoid broad VPC or phone-subnet ranges here.
+Upstream PBX/backend IPs from `proxy.upstream_groups` are automatically added
+to the packet-level trusted set. `trusted_cidrs` is only for extra exact
+non-upstream trusted source IPs. Trusted peers skip packet-level
+geo/threat/flood checks, but non-upstream clients still pass through SIP
+identity policy, SIP method rate limits, and SIP dynamic bans. Avoid broad VPC
+or phone-subnet ranges here.
 
 `[proxy.security.flood]` is a raw packet flood guard applied before SIP method
 rate limits. It is listener-scoped and source-IP based. XDP offloads UDP flood,

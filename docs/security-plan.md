@@ -17,8 +17,9 @@ Global defaults live under `[proxy.security]`:
 ```toml
 [proxy.security]
 preset = "public"
-# Exact PBX/backend addresses only; do not include the phone/client subnet.
-trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
+# Upstream PBX/backend IPs are trusted automatically from proxy.upstream_groups.
+# Add trusted_cidrs only for extra non-upstream packet-level trusted sources.
+# trusted_cidrs = ["10.0.1.20/32"]
 deny_cidrs = []
 allow_cidrs = []
 
@@ -67,7 +68,9 @@ upstream_group = "default"
 
 [proxy.listeners.security]
 preset = "strict"
-trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
+# Upstream PBX/backend IPs are still trusted automatically when a listener
+# overrides security.
+# trusted_cidrs = ["10.0.1.20/32"]
 ```
 
 Preset values are `off`, `trusted`, `public`, and `strict`. Without an explicit
