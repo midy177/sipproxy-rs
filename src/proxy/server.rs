@@ -993,12 +993,7 @@ impl ProxyServer {
         transactions.get(key).cloned()
     }
 
-    async fn remember_udp_client_transaction(
-        &self,
-        key: String,
-        target: UpstreamTarget,
-        packet: Vec<u8>,
-    ) {
+    async fn remember_udp_client_transaction(&self, key: String, target: UpstreamTarget) {
         let now = Instant::now();
         let mut transactions = self
             .udp_client_transactions
@@ -1010,7 +1005,6 @@ impl ProxyServer {
             key,
             UdpClientTransactionRoute {
                 target,
-                packet,
                 final_response: None,
                 created_at: now,
             },
@@ -1623,11 +1617,14 @@ impl ProxyServer {
                     .send_to(&response, peer)
                     .await
                     .context("failed to retransmit cached SIP response to UDP client")?;
-            } else if route.target.transport == SipTransport::Udp {
-                socket
-                    .send_to(&route.packet, route.target.addr)
-                    .await
-                    .context("failed to retransmit cached SIP request to upstream UDP socket")?;
+            } else {
+                debug!(
+                    %peer,
+                    target = %route.target.addr,
+                    transport = %route.target.transport.as_str(),
+                    method,
+                    "absorbing UDP client retransmission while upstream response is pending"
+                );
             }
             return Ok(());
         }
@@ -1665,8 +1662,7 @@ impl ProxyServer {
                     );
                 }
                 if let Some(key) = client_transaction_key.clone() {
-                    self.remember_udp_client_transaction(key, target, packet.clone())
-                        .await;
+                    self.remember_udp_client_transaction(key, target).await;
                 }
                 if let Err(err) = socket.send_to(&packet, target.addr).await {
                     self.remove_udp_branch(&branch).await;
@@ -1738,8 +1734,7 @@ impl ProxyServer {
             transport: SipTransport::Tcp,
         };
         if let Some(key) = client_transaction_key.clone() {
-            self.remember_udp_client_transaction(key, target, packet)
-                .await;
+            self.remember_udp_client_transaction(key, target).await;
         }
         self.remember_successful_forward(&message, target, &branch, invite_transaction_key, method)
             .await;
@@ -2994,7 +2989,6 @@ struct UdpBranchRoute {
 #[derive(Debug, Clone)]
 struct UdpClientTransactionRoute {
     target: UpstreamTarget,
-    packet: Vec<u8>,
     final_response: Option<Vec<u8>>,
     created_at: Instant,
 }
@@ -6798,7 +6792,7 @@ Content-Length: 0\r\n\r\n",
     }
 
     #[tokio::test]
-    async fn udp_register_retransmission_reuses_proxy_branch() {
+    async fn udp_register_retransmission_is_absorbed_while_pending() {
         let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
@@ -6819,28 +6813,27 @@ Content-Length: 0\r\n\r\n";
         let mut buf = [0_u8; 4096];
         let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
         let first = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let first_branch = SipMessage::parse(first.as_bytes())
+            .unwrap()
+            .top_via_branch()
+            .unwrap()
+            .unwrap();
+        assert!(first_branch.starts_with(PROXY_BRANCH_PREFIX));
 
         server
             .handle_udp_packet(&proxy_socket, request, peer, &test_listener())
             .await
             .unwrap();
-        let (len, _) = timeout(Duration::from_secs(1), upstream_socket.recv_from(&mut buf))
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
             .await
-            .unwrap()
-            .unwrap();
-        let second = String::from_utf8(buf[..len].to_vec()).unwrap();
-
-        assert_eq!(
-            SipMessage::parse(first.as_bytes())
-                .unwrap()
-                .top_via_branch()
-                .unwrap(),
-            SipMessage::parse(second.as_bytes())
-                .unwrap()
-                .top_via_branch()
-                .unwrap()
+            .is_err()
         );
         assert_eq!(server.active_udp_branch_count().await, 1);
+        assert_eq!(server.active_udp_client_transaction_count().await, 1);
     }
 
     #[tokio::test]
@@ -6928,7 +6921,6 @@ Content-Length: 0\r\n\r\n",
                 format!("tx-{index}"),
                 UdpClientTransactionRoute {
                     target,
-                    packet: vec![index as u8],
                     final_response: None,
                     created_at: now + Duration::from_millis(index),
                 },

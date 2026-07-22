@@ -545,10 +545,11 @@ framing, metrics, and selected active-standby HA boundary modules.
 
 ## Design Notes
 
-The current proxy is intentionally stateless at the SIP transaction layer. It
-does not own retransmission behavior, fork aggregation, response caching, or
-dialog state as a B2BUA would. Instead, it keeps the smallest routing state
-needed for SIP-aware affinity and correct response return paths.
+The current proxy is intentionally lightweight at the SIP transaction layer. It
+keeps the smallest routing state needed for SIP-aware affinity, correct
+response return paths, UDP client retransmission de-duplication, and final
+response replay. It does not own fork aggregation or dialog state as a B2BUA
+would.
 
 This keeps the proxy closer to a SIP-aware load balancer while still handling
 important Layer-7 correctness that a pure Layer-4 load balancer cannot provide.
