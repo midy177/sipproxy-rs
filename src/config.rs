@@ -1664,7 +1664,7 @@ impl Default for EffectiveProxyXdpSecurityConfig {
             ip_rate_limit: true,
             auto_size_maps: true,
             max_deny_cidrs_entries: 262_144,
-            max_geo_cidrs_entries: 262_144,
+            max_geo_cidrs_entries: 1_048_576,
         }
     }
 }

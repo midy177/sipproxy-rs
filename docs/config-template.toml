@@ -215,7 +215,7 @@ preset = "off"
 # ip_rate_limit = true
 # auto_size_maps = true
 # max_deny_cidrs_entries = 262144 # increase for large threat feeds/listener fanout
-# max_geo_cidrs_entries = 262144
+# max_geo_cidrs_entries = 1048576 # increase for large geo feeds/listener fanout
 
 [[proxy.upstream_groups]]
 # Upstream group name referenced by listeners and routes.

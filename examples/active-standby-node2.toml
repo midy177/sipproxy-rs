@@ -113,7 +113,7 @@ servers = ["172.30.12.228:5060", "172.30.11.57:5060"]
 [proxy.upstream_groups.health_check]
 enabled = true
 interval_ms = 30000
-timeout_ms = 2000
+timeout_ms = 8000
 success_threshold = 2
 failure_threshold = 3
 
@@ -132,7 +132,7 @@ servers = ["172.30.12.228:5092", "172.30.11.57:5092"]
 [proxy.upstream_groups.health_check]
 enabled = true
 interval_ms = 30000
-timeout_ms = 2000
+timeout_ms = 8000
 success_threshold = 2
 failure_threshold = 3
 

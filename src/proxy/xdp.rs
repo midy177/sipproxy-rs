@@ -85,6 +85,7 @@ const XDP_GEO_SYNC_PROGRESS_INTERVAL: usize = 10_000;
 const XDP_DENY_CIDRS_DEFAULT_MAX_ENTRIES: u32 = 65_536;
 #[cfg(target_os = "linux")]
 const XDP_GEO_CIDRS_DEFAULT_MAX_ENTRIES: u32 = 262_144;
+const XDP_GEO_CIDRS_DEFAULT_MAX_CONFIG_ENTRIES: u32 = 1_048_576;
 
 pub struct XdpRuntime {
     requested: bool,
@@ -177,7 +178,7 @@ impl Default for XdpMapSizing {
         Self {
             auto_size_maps: true,
             max_deny_cidrs_entries: 262_144,
-            max_geo_cidrs_entries: 262_144,
+            max_geo_cidrs_entries: XDP_GEO_CIDRS_DEFAULT_MAX_CONFIG_ENTRIES,
         }
     }
 }
