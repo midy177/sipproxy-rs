@@ -1045,10 +1045,6 @@ impl AyaXdpBackend {
                 .deny_cidrs
                 .lock()
                 .expect("XDP deny CIDR map lock poisoned");
-            let mut geo_cidrs = self
-                .geo_cidrs
-                .lock()
-                .expect("XDP geo CIDR map lock poisoned");
             for spec in &self.listeners {
                 let listener_key = make_listener_key(spec.l4_proto, spec.port);
                 let policy = encode_listener_policy(&spec.policy);
@@ -1077,26 +1073,29 @@ impl AyaXdpBackend {
                         deny_cidrs.insert(&key, XdpCidrValue { enabled: 1 }, 0)?;
                     }
                 }
-                if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
-                    for (index, prefix) in geo_prefixes.iter().enumerate() {
-                        let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
-                        geo_cidrs.insert(
-                            &key,
-                            XdpGeoValue {
-                                country: prefix.country,
-                            },
-                            0,
-                        )?;
-                        let synced = index + 1;
-                        if synced % XDP_GEO_SYNC_PROGRESS_INTERVAL == 0 {
-                            debug!(
-                                listener = %spec.listener_key,
-                                synced,
-                                total = geo_prefixes.len(),
-                                "XDP geo CIDR map sync progress"
-                            );
-                        }
-                    }
+            }
+        }
+        if xdp_geo_enabled(&self.listeners) {
+            let mut geo_cidrs = self
+                .geo_cidrs
+                .lock()
+                .expect("XDP geo CIDR map lock poisoned");
+            for (index, prefix) in geo_prefixes.iter().enumerate() {
+                let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
+                geo_cidrs.insert(
+                    &key,
+                    XdpGeoValue {
+                        country: prefix.country,
+                    },
+                    0,
+                )?;
+                let synced = index + 1;
+                if synced % XDP_GEO_SYNC_PROGRESS_INTERVAL == 0 {
+                    debug!(
+                        synced,
+                        total = geo_prefixes.len(),
+                        "XDP geo CIDR map sync progress"
+                    );
                 }
             }
         }
@@ -1129,12 +1128,12 @@ impl AyaXdpBackend {
                     prefix.prefix.hash(&mut hasher);
                 }
             }
-            if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
-                for prefix in geo_prefixes {
-                    prefix.addr.hash(&mut hasher);
-                    prefix.prefix.hash(&mut hasher);
-                    prefix.country.hash(&mut hasher);
-                }
+        }
+        if xdp_geo_enabled(&self.listeners) {
+            for prefix in geo_prefixes {
+                prefix.addr.hash(&mut hasher);
+                prefix.prefix.hash(&mut hasher);
+                prefix.country.hash(&mut hasher);
             }
         }
         keys.listener_policies.hash(&mut hasher);
@@ -1293,14 +1292,21 @@ fn build_xdp_static_keys(
                 keys.deny_cidrs.insert(encode_lpm_key_bytes(&key));
             }
         }
-        if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
-            for prefix in geo_prefixes {
-                let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
-                keys.geo_cidrs.insert(encode_geo_lpm_key_bytes(&key));
-            }
+    }
+    if xdp_geo_enabled(listeners) {
+        for prefix in geo_prefixes {
+            let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
+            keys.geo_cidrs.insert(encode_geo_lpm_key_bytes(&key));
         }
     }
     keys
+}
+
+#[cfg(target_os = "linux")]
+fn xdp_geo_enabled(listeners: &[XdpListenerSpec]) -> bool {
+    listeners
+        .iter()
+        .any(|spec| spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0)
 }
 
 #[cfg(target_os = "linux")]
