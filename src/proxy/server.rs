@@ -134,6 +134,7 @@ pub struct ProxyServer {
     upstreams: UpstreamGroups,
     affinity: AffinityTable,
     security: Arc<SecurityRuntime>,
+    user_space_security_enabled: bool,
     metrics: Arc<ProxyMetrics>,
     metric_handles: ProxyMetricHandles,
     udp_branches: ShardedStringMap<UdpBranchRoute>,
@@ -395,6 +396,7 @@ impl ProxyServer {
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
         let security = Arc::new(SecurityRuntime::new(&config.proxy)?);
+        let user_space_security_enabled = user_space_security_enabled(&config.proxy);
         let metrics = Arc::new(ProxyMetrics::default());
         let metric_handles = ProxyMetricHandles::new(&metrics, &config.proxy);
         let local_ips = local_interface_ips();
@@ -407,6 +409,7 @@ impl ProxyServer {
             upstreams,
             affinity: AffinityTable::new(affinity_config),
             security,
+            user_space_security_enabled,
             metrics,
             metric_handles,
             udp_branches: ShardedStringMap::new(ROUTE_MAP_SHARDS),
@@ -1222,17 +1225,19 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
-        match self.security.check_packet(listener, peer, packet).await {
-            SecurityDecision::Allow => {}
-            SecurityDecision::Drop(reason) => {
-                self.handle_security_drop(listener, peer, reason).await;
-                return Ok(());
+        if self.user_space_security_enabled {
+            match self.security.check_packet(listener, peer, packet).await {
+                SecurityDecision::Allow => {}
+                SecurityDecision::Drop(reason) => {
+                    self.handle_security_drop(listener, peer, reason).await;
+                    return Ok(());
+                }
             }
         }
 
         let message = match SipMessage::parse(packet) {
             Ok(message) => message,
-            Err(err) if self.security.enabled(listener) => {
+            Err(err) if self.user_space_security_enabled && self.security.enabled(listener) => {
                 self.handle_parse_error(listener, peer, packet, err).await;
                 return Ok(());
             }
@@ -1253,44 +1258,46 @@ impl ProxyServer {
             debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
             return Ok(());
         }
-        if let Some(reason) = self
-            .security
-            .check_sip_request(listener, peer, &message, method)
-            .await
-        {
-            self.record_security_drop(listener, reason);
+        if self.user_space_security_enabled {
             if let Some(reason) = self
                 .security
-                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .check_sip_request(listener, peer, &message, method)
                 .await
             {
                 self.record_security_drop(listener, reason);
+                if let Some(reason) = self
+                    .security
+                    .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                    .await
+                {
+                    self.record_security_drop(listener, reason);
+                }
+                let response = SipMessage::response_like(&message, 503, "Service Unavailable");
+                self.remember_local_invite_rejection_if_needed(&message, method)
+                    .await;
+                self.record_local_response("tcp", 503);
+                stream.write_all(&response.to_bytes()).await?;
+                return Ok(());
             }
-            let response = SipMessage::response_like(&message, 503, "Service Unavailable");
-            self.remember_local_invite_rejection_if_needed(&message, method)
-                .await;
-            self.record_local_response("tcp", 503);
-            stream.write_all(&response.to_bytes()).await?;
-            return Ok(());
-        }
-        if let Some(reason) = self
-            .check_sip_policy(listener, peer, &message, method)
-            .await
-        {
-            self.record_security_drop(listener, reason);
             if let Some(reason) = self
-                .security
-                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .check_sip_policy(listener, peer, &message, method)
                 .await
             {
                 self.record_security_drop(listener, reason);
+                if let Some(reason) = self
+                    .security
+                    .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                    .await
+                {
+                    self.record_security_drop(listener, reason);
+                }
+                let response = SipMessage::response_like(&message, 403, "Forbidden");
+                self.remember_local_invite_rejection_if_needed(&message, method)
+                    .await;
+                self.record_local_response("tcp", 403);
+                stream.write_all(&response.to_bytes()).await?;
+                return Ok(());
             }
-            let response = SipMessage::response_like(&message, 403, "Forbidden");
-            self.remember_local_invite_rejection_if_needed(&message, method)
-                .await;
-            self.record_local_response("tcp", 403);
-            stream.write_all(&response.to_bytes()).await?;
-            return Ok(());
         }
         match decrement_max_forwards(&mut message) {
             Ok(true) => {}
@@ -1349,17 +1356,19 @@ impl ProxyServer {
             return Ok(());
         }
 
-        match self.security.check_packet(listener, peer, packet).await {
-            SecurityDecision::Allow => {}
-            SecurityDecision::Drop(reason) => {
-                self.handle_security_drop(listener, peer, reason).await;
-                return Ok(());
+        if self.user_space_security_enabled {
+            match self.security.check_packet(listener, peer, packet).await {
+                SecurityDecision::Allow => {}
+                SecurityDecision::Drop(reason) => {
+                    self.handle_security_drop(listener, peer, reason).await;
+                    return Ok(());
+                }
             }
         }
 
         let message = match SipMessage::parse(packet) {
             Ok(message) => message,
-            Err(err) if self.security.enabled(listener) => {
+            Err(err) if self.user_space_security_enabled && self.security.enabled(listener) => {
                 self.handle_parse_error(listener, peer, packet, err).await;
                 return Ok(());
             }
@@ -1379,46 +1388,48 @@ impl ProxyServer {
             debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
             return Ok(());
         }
-        if let Some(reason) = self
-            .security
-            .check_sip_request(listener, peer, &message, method)
-            .await
-        {
-            self.record_security_drop(listener, reason);
+        if self.user_space_security_enabled {
             if let Some(reason) = self
                 .security
-                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .check_sip_request(listener, peer, &message, method)
                 .await
             {
                 self.record_security_drop(listener, reason);
+                if let Some(reason) = self
+                    .security
+                    .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                    .await
+                {
+                    self.record_security_drop(listener, reason);
+                }
+                let mut response = SipMessage::response_like(&message, 503, "Service Unavailable");
+                response.apply_top_via_received_rport(peer)?;
+                self.remember_local_invite_rejection_if_needed(&message, method)
+                    .await;
+                self.record_local_response("udp", 503);
+                socket.send_to(&response.to_bytes(), peer).await?;
+                return Ok(());
             }
-            let mut response = SipMessage::response_like(&message, 503, "Service Unavailable");
-            response.apply_top_via_received_rport(peer)?;
-            self.remember_local_invite_rejection_if_needed(&message, method)
-                .await;
-            self.record_local_response("udp", 503);
-            socket.send_to(&response.to_bytes(), peer).await?;
-            return Ok(());
-        }
-        if let Some(reason) = self
-            .check_sip_policy(listener, peer, &message, method)
-            .await
-        {
-            self.record_security_drop(listener, reason);
             if let Some(reason) = self
-                .security
-                .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                .check_sip_policy(listener, peer, &message, method)
                 .await
             {
                 self.record_security_drop(listener, reason);
+                if let Some(reason) = self
+                    .security
+                    .record_dynamic_offense(listener, peer, Some(DynamicOffense::SipRateViolation))
+                    .await
+                {
+                    self.record_security_drop(listener, reason);
+                }
+                let mut response = SipMessage::response_like(&message, 403, "Forbidden");
+                response.apply_top_via_received_rport(peer)?;
+                self.remember_local_invite_rejection_if_needed(&message, method)
+                    .await;
+                self.record_local_response("udp", 403);
+                socket.send_to(&response.to_bytes(), peer).await?;
+                return Ok(());
             }
-            let mut response = SipMessage::response_like(&message, 403, "Forbidden");
-            response.apply_top_via_received_rport(peer)?;
-            self.remember_local_invite_rejection_if_needed(&message, method)
-                .await;
-            self.record_local_response("udp", 403);
-            socket.send_to(&response.to_bytes(), peer).await?;
-            return Ok(());
         }
         match decrement_max_forwards(&mut message) {
             Ok(true) => {}
@@ -3038,6 +3049,14 @@ fn canonical_sip_method(method: &str) -> Option<&'static str> {
         "PUBLISH" => Some("PUBLISH"),
         _ => None,
     }
+}
+
+fn user_space_security_enabled(config: &ProxyConfig) -> bool {
+    config
+        .listeners
+        .iter()
+        .flat_map(ProxyListenerConfig::concrete_listeners)
+        .any(|listener| config.effective_security_for_listener(&listener).enabled())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5790,6 +5809,54 @@ mod tests {
             upstream_group: "default".to_string(),
             security: None,
         }
+    }
+
+    fn test_proxy_config_with_security(
+        security: ProxySecurityConfig,
+        listeners: Vec<ProxyListenerConfig>,
+    ) -> ProxyConfig {
+        ProxyConfig {
+            record_route: true,
+            register_routing: None,
+            rewrite_register_contact: false,
+            udp_client_transaction_cache_entries: 65_536,
+            socket: ProxySocketConfig::default(),
+            metrics: Default::default(),
+            affinity: Default::default(),
+            security,
+            listeners,
+            upstream_groups: vec![UpstreamGroupConfig {
+                name: "default".to_string(),
+                mode: UpstreamMode::RoundRobin,
+                health_check: UpstreamHealthCheckConfig::default(),
+                servers: vec!["127.0.0.1:5080".to_string()],
+            }],
+            routes: vec![],
+        }
+    }
+
+    #[test]
+    fn user_space_security_fast_path_tracks_effective_listener_security() {
+        let explicit_off = ProxySecurityConfig {
+            preset: Some(ProxySecurityPreset::Off),
+            ..ProxySecurityConfig::default()
+        };
+        assert!(!user_space_security_enabled(
+            &test_proxy_config_with_security(explicit_off.clone(), vec![test_listener()],)
+        ));
+
+        assert!(user_space_security_enabled(
+            &test_proxy_config_with_security(ProxySecurityConfig::default(), vec![test_listener()])
+        ));
+
+        let mut listener = test_listener();
+        listener.security = Some(ProxySecurityConfig {
+            preset: Some(ProxySecurityPreset::Public),
+            ..ProxySecurityConfig::default()
+        });
+        assert!(user_space_security_enabled(
+            &test_proxy_config_with_security(explicit_off, vec![listener],)
+        ));
     }
 
     fn test_server_with_upstream(upstream: SocketAddr) -> ProxyServer {
