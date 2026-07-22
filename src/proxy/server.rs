@@ -55,6 +55,7 @@ const LOCAL_INVITE_REJECTION_TTL: Duration = Duration::from_secs(300);
 const SECURITY_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_BUCKET_IDLE_TTL: Duration = Duration::from_secs(600);
 const HEALTH_CHECK_STANDBY_ROLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HEALTH_CHECK_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_MAP_SHARDS: usize = 64;
 const ROUTE_MAP_SHARDS: usize = 64;
 const METRIC_TRANSPORT_COUNT: usize = 2;
@@ -3724,6 +3725,7 @@ async fn run_health_checks(
 struct HealthCheckRuntime {
     udp_sockets: Vec<Option<Arc<UdpSocket>>>,
     tcp_streams: Vec<Option<Arc<Mutex<Option<TcpStream>>>>>,
+    failure_logs: Vec<Mutex<HealthCheckFailureLog>>,
 }
 
 impl HealthCheckRuntime {
@@ -3754,6 +3756,11 @@ impl HealthCheckRuntime {
         Ok(Self {
             udp_sockets,
             tcp_streams,
+            failure_logs: group
+                .servers
+                .iter()
+                .map(|_| Mutex::new(HealthCheckFailureLog::default()))
+                .collect(),
         })
     }
 
@@ -3763,6 +3770,47 @@ impl HealthCheckRuntime {
 
     fn tcp_stream(&self, index: usize) -> Option<Arc<Mutex<Option<TcpStream>>>> {
         self.tcp_streams.get(index).cloned().flatten()
+    }
+
+    async fn failure_warning_due(&self, index: usize, now: Instant) -> Option<Option<u64>> {
+        let log = self.failure_logs.get(index)?;
+        Some(log.lock().await.warn_if_due(now))
+    }
+
+    async fn recover_failure_log(&self, index: usize) -> Option<u64> {
+        let log = self.failure_logs.get(index)?;
+        log.lock().await.recovered()
+    }
+}
+
+#[derive(Debug, Default)]
+struct HealthCheckFailureLog {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+impl HealthCheckFailureLog {
+    fn warn_if_due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_warning
+            .is_some_and(|last| now.duration_since(last) < HEALTH_CHECK_FAILURE_LOG_INTERVAL)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+
+        let suppressed = self.suppressed;
+        self.suppressed = 0;
+        self.last_warning = Some(now);
+        Some(suppressed)
+    }
+
+    fn recovered(&mut self) -> Option<u64> {
+        self.last_warning?;
+        let suppressed = self.suppressed;
+        self.last_warning = None;
+        self.suppressed = 0;
+        Some(suppressed)
     }
 }
 
@@ -3786,16 +3834,51 @@ async fn run_health_check_round(group: Arc<UpstreamGroupRuntime>, probes: &Healt
         let update = group.record_health_result(index, result.healthy);
         let mode = health_probe_mode(&group.health_check.probe);
         if !result.healthy {
-            warn!(
-                group = %group.name,
-                %server,
-                mode,
-                reason = %result.reason.as_deref().unwrap_or("probe returned unhealthy"),
-                consecutive_failures = update.consecutive_failures,
-                failure_threshold = group.health_check.failure_threshold,
-                currently_healthy = update.is_healthy,
-                "backend health check failed"
-            );
+            let reason = result
+                .reason
+                .as_deref()
+                .unwrap_or("probe returned unhealthy");
+            match probes.failure_warning_due(index, Instant::now()).await {
+                Some(Some(suppressed)) => {
+                    warn!(
+                        group = %group.name,
+                        %server,
+                        mode,
+                        reason,
+                        consecutive_failures = update.consecutive_failures,
+                        failure_threshold = group.health_check.failure_threshold,
+                        currently_healthy = update.is_healthy,
+                        suppressed_health_check_failures = suppressed,
+                        "backend health check failed"
+                    );
+                }
+                Some(None) => {
+                    debug!(
+                        group = %group.name,
+                        %server,
+                        mode,
+                        reason,
+                        consecutive_failures = update.consecutive_failures,
+                        failure_threshold = group.health_check.failure_threshold,
+                        currently_healthy = update.is_healthy,
+                        "backend health check failed"
+                    );
+                }
+                None => {
+                    warn!(
+                        group = %group.name,
+                        %server,
+                        mode,
+                        reason,
+                        consecutive_failures = update.consecutive_failures,
+                        failure_threshold = group.health_check.failure_threshold,
+                        currently_healthy = update.is_healthy,
+                        "backend health check failed"
+                    );
+                }
+            }
+        } else {
+            let _ = probes.recover_failure_log(index).await;
         }
         if update.was_healthy && !update.is_healthy {
             warn!(
@@ -8616,6 +8699,27 @@ Content-Length: 0\r\n\r\n"
 
         shutdown_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn health_check_failure_log_throttles_repeated_failures() {
+        let mut log = HealthCheckFailureLog::default();
+        let start = Instant::now();
+
+        assert_eq!(log.warn_if_due(start), Some(0));
+        assert_eq!(log.warn_if_due(start + Duration::from_secs(1)), None);
+        assert_eq!(log.warn_if_due(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            log.warn_if_due(start + HEALTH_CHECK_FAILURE_LOG_INTERVAL),
+            Some(2)
+        );
+        assert_eq!(
+            log.warn_if_due(start + HEALTH_CHECK_FAILURE_LOG_INTERVAL),
+            None
+        );
+        assert_eq!(log.recovered(), Some(1));
+        assert_eq!(log.recovered(), None);
+        assert_eq!(log.warn_if_due(start), Some(0));
     }
 
     #[test]
