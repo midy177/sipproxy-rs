@@ -429,10 +429,10 @@ fn collect_json_cidrs(value: &Value, prefixes: &mut Vec<ThreatIpPrefix>) -> Resu
             }
         }
         Value::Object(map) => {
-            if let Some(Value::String(cidr)) = map.get("cidr").or_else(|| map.get("prefix")) {
-                if let Some(prefix) = parse_prefix(cidr)? {
-                    prefixes.push(prefix);
-                }
+            if let Some(Value::String(cidr)) = map.get("cidr").or_else(|| map.get("prefix"))
+                && let Some(prefix) = parse_prefix(cidr)?
+            {
+                prefixes.push(prefix);
             }
         }
         _ => {}

@@ -142,3 +142,8 @@ BENCH_OUT=target/bench/$(git rev-parse --short HEAD) make bench-options
 BENCH_OUT=target/bench/$(git rev-parse --short HEAD) make bench-register
 BENCH_OUT=target/bench/$(git rev-parse --short HEAD) make bench-drop
 ```
+
+## Recorded Results
+
+- [benchmark-results.md](benchmark-results.md) keeps checked-in benchmark
+  summaries for runs that are useful as comparison baselines.

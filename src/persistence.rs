@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::mpsc;
 use tokio::task;
 use tracing::{info, warn};
 
@@ -21,9 +22,25 @@ struct PersistenceInner {
     conn: Arc<StdMutex<Connection>>,
     required: bool,
     event_retention_seconds: u64,
+    background_tx: mpsc::UnboundedSender<PersistenceWrite>,
     event_appends_succeeded: AtomicU64,
     event_appends_failed: AtomicU64,
     sqlite_writes_failed: AtomicU64,
+}
+
+#[derive(Debug, Clone)]
+enum PersistenceWrite {
+    ClusterCommand(ClusterCommand),
+    AffinityBindings(Vec<AffinityBindingSnapshot>),
+}
+
+impl PersistenceWrite {
+    fn event_count(&self) -> u64 {
+        match self {
+            Self::ClusterCommand(_) => 1,
+            Self::AffinityBindings(bindings) => bindings.len() as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,16 +99,21 @@ impl Persistence {
             required = config.required,
             "persistence database opened"
         );
-        Ok(Some(Self {
+        let conn = Arc::new(StdMutex::new(conn));
+        let (background_tx, background_rx) = mpsc::unbounded_channel();
+        let persistence = Self {
             inner: Arc::new(PersistenceInner {
-                conn: Arc::new(StdMutex::new(conn)),
+                conn: conn.clone(),
                 required: config.required,
                 event_retention_seconds: config.event_retention_seconds,
+                background_tx,
                 event_appends_succeeded: AtomicU64::new(0),
                 event_appends_failed: AtomicU64::new(0),
                 sqlite_writes_failed: AtomicU64::new(0),
             }),
-        }))
+        };
+        persistence.spawn_background_writer(background_rx);
+        Ok(Some(persistence))
     }
 
     pub fn required(&self) -> bool {
@@ -113,13 +135,12 @@ impl Persistence {
         let conn = self.inner.conn.clone();
         task::spawn_blocking(move || {
             let conn = conn.lock().expect("persistence connection lock poisoned");
-            Ok(HaStateSnapshot {
+            Ok(HaStateSnapshot::with_checksum(HaStateSnapshot {
                 last_seq: latest_event_seq(&conn)?,
                 checksum: String::new(),
                 contacts: load_contacts(&conn)?,
                 affinity: load_affinity(&conn)?,
-            })
-            .map(HaStateSnapshot::with_checksum)
+            }))
         })
         .await
         .context("persistence load task failed")?
@@ -136,6 +157,22 @@ impl Persistence {
         .context("persistence command task failed")?;
         self.record_write_result(&result, 1);
         result
+    }
+
+    pub fn apply_cluster_command_background(&self, command: ClusterCommand) {
+        if let Err(err) = self
+            .inner
+            .background_tx
+            .send(PersistenceWrite::ClusterCommand(command))
+        {
+            self.inner
+                .event_appends_failed
+                .fetch_add(1, Ordering::Relaxed);
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to enqueue cluster command persistence write"
+            );
+        }
     }
 
     pub async fn upsert_affinity_bindings(
@@ -167,6 +204,59 @@ impl Persistence {
         .context("persistence affinity task failed")?;
         self.record_write_result(&result, appended_events);
         result
+    }
+
+    pub fn upsert_affinity_bindings_background(&self, bindings: Vec<AffinityBindingSnapshot>) {
+        if bindings.is_empty() {
+            return;
+        }
+        let appended_events = bindings.len() as u64;
+        if let Err(err) = self
+            .inner
+            .background_tx
+            .send(PersistenceWrite::AffinityBindings(bindings))
+        {
+            self.inner
+                .event_appends_failed
+                .fetch_add(appended_events, Ordering::Relaxed);
+            warn!(
+                error = %format!("{err:#}"),
+                "failed to enqueue affinity persistence write"
+            );
+        }
+    }
+
+    fn spawn_background_writer(&self, mut rx: mpsc::UnboundedReceiver<PersistenceWrite>) {
+        let persistence = self.clone();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut writes = vec![first];
+                while writes.len() < 1024 {
+                    match rx.try_recv() {
+                        Ok(write) => writes.push(write),
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let appended_events = writes.iter().map(PersistenceWrite::event_count).sum();
+                let conn = persistence.inner.conn.clone();
+                let result = task::spawn_blocking(move || {
+                    let mut conn = conn.lock().expect("persistence connection lock poisoned");
+                    apply_background_writes(&mut conn, writes)
+                })
+                .await
+                .context("persistence background writer task failed")
+                .and_then(|result| result);
+                persistence.record_write_result(&result, appended_events);
+                if let Err(err) = result {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        appended_events,
+                        "failed to persist background write batch"
+                    );
+                }
+            }
+        });
     }
 
     pub async fn install_snapshot(&self, snapshot: &HaStateSnapshot) -> Result<()> {
@@ -377,23 +467,61 @@ fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn apply_background_writes(conn: &mut Connection, writes: Vec<PersistenceWrite>) -> Result<()> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for write in writes {
+        match write {
+            PersistenceWrite::ClusterCommand(command) => {
+                apply_cluster_command_in_tx(&tx, &command, true)?;
+            }
+            PersistenceWrite::AffinityBindings(bindings) => {
+                for binding in bindings {
+                    let seq = append_event(
+                        &tx,
+                        &event_key_for_affinity(&binding),
+                        &HaEventPayload::UpsertAffinity {
+                            binding: binding.clone(),
+                        },
+                    )?;
+                    upsert_affinity_binding(&tx, &binding, Some(seq))?;
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn apply_cluster_command(
     conn: &mut Connection,
     command: &ClusterCommand,
     append: bool,
 ) -> Result<Option<u64>> {
     let tx = conn.transaction()?;
+    let seq = apply_cluster_command_in_tx(&tx, command, append)?;
+    tx.commit()?;
+    Ok(seq)
+}
+
+fn apply_cluster_command_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    command: &ClusterCommand,
+    append: bool,
+) -> Result<Option<u64>> {
     let seq = if append {
         Some(match command {
             ClusterCommand::RegisterContact(binding) => append_event(
-                &tx,
+                tx,
                 &binding.aor,
                 &HaEventPayload::RegisterContact {
                     binding: binding.clone(),
                 },
             )?,
             ClusterCommand::UnregisterContact { aor } => append_event(
-                &tx,
+                tx,
                 aor,
                 &HaEventPayload::UnregisterContact { aor: aor.clone() },
             )?,
@@ -402,12 +530,11 @@ fn apply_cluster_command(
         None
     };
     match command {
-        ClusterCommand::RegisterContact(binding) => upsert_contact(&tx, binding, seq)?,
+        ClusterCommand::RegisterContact(binding) => upsert_contact(tx, binding, seq)?,
         ClusterCommand::UnregisterContact { aor } => {
             tx.execute("delete from contacts where aor = ?1", [aor])?;
         }
     }
-    tx.commit()?;
     Ok(seq)
 }
 

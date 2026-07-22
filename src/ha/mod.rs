@@ -782,6 +782,59 @@ impl HaAddon for CommandHaAddon {
     }
 }
 
+async fn run_hook(command: &str, ctx: &HaContext, limit: Duration) -> Result<()> {
+    info!(command, node_id = ctx.node_id, "running HA command hook");
+    let mut command_builder = Command::new("sh");
+    command_builder
+        .arg("-c")
+        .arg(command)
+        .env("SIGPROXY_NODE_ID", ctx.node_id.to_string())
+        .env("SIGPROXY_ROLE", format!("{:?}", ctx.role));
+    #[cfg(unix)]
+    unsafe {
+        command_builder.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = command_builder
+        .spawn()
+        .context("failed to spawn HA command hook")?;
+
+    let status = match timeout(limit, child.wait()).await {
+        Ok(result) => result.context("failed to execute HA command hook")?,
+        Err(_) => {
+            warn!(
+                command,
+                timeout_ms = limit.as_millis(),
+                "HA command hook timed out; killing child process"
+            );
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            bail!("HA command hook timed out");
+        }
+    };
+
+    if !status.success() {
+        warn!(
+            command,
+            status = ?status,
+            "HA command hook failed"
+        );
+        anyhow::bail!("HA command hook failed: {}", status);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1361,57 +1414,4 @@ mod tests {
         assert!(peer_should_win(&local, &lower_node_same_epoch));
         assert!(!peer_should_win(&local, &higher_node_same_epoch));
     }
-}
-
-async fn run_hook(command: &str, ctx: &HaContext, limit: Duration) -> Result<()> {
-    info!(command, node_id = ctx.node_id, "running HA command hook");
-    let mut command_builder = Command::new("sh");
-    command_builder
-        .arg("-c")
-        .arg(command)
-        .env("SIGPROXY_NODE_ID", ctx.node_id.to_string())
-        .env("SIGPROXY_ROLE", format!("{:?}", ctx.role));
-    #[cfg(unix)]
-    unsafe {
-        command_builder.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        });
-    }
-    let mut child = command_builder
-        .spawn()
-        .context("failed to spawn HA command hook")?;
-
-    let status = match timeout(limit, child.wait()).await {
-        Ok(result) => result.context("failed to execute HA command hook")?,
-        Err(_) => {
-            warn!(
-                command,
-                timeout_ms = limit.as_millis(),
-                "HA command hook timed out; killing child process"
-            );
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
-            }
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            bail!("HA command hook timed out");
-        }
-    };
-
-    if !status.success() {
-        warn!(
-            command,
-            status = ?status,
-            "HA command hook failed"
-        );
-        anyhow::bail!("HA command hook failed: {}", status);
-    }
-    Ok(())
 }

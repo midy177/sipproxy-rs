@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::warn;
 
 pub type NodeId = u64;
 
@@ -146,13 +145,8 @@ impl ClusterReplicator for StandaloneReplicator {
             return Ok(self.state.apply(command).await);
         }
         let result = self.state.apply(command.clone()).await;
-        if let Some(persistence) = &self.persistence
-            && let Err(err) = persistence.apply_cluster_command(&command).await
-        {
-            warn!(
-                error = %format!("{err:#}"),
-                "failed to persist cluster command; continuing with in-memory state"
-            );
+        if let Some(persistence) = &self.persistence {
+            persistence.apply_cluster_command_background(command);
         }
         Ok(result)
     }

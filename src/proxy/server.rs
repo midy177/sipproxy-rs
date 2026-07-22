@@ -78,6 +78,16 @@ pub struct ProxyServer {
     advertised_addrs: Mutex<HashMap<String, String>>,
 }
 
+struct UdpToTcpForward<'a> {
+    socket: &'a UdpSocket,
+    message: SipMessage,
+    client_peer: SocketAddr,
+    upstream: SocketAddr,
+    branch: String,
+    invite_transaction_key: Option<String>,
+    method: &'a str,
+}
+
 impl ProxyServer {
     pub fn new(
         config: Config,
@@ -619,13 +629,17 @@ impl ProxyServer {
             .await
         {
             Ok(bindings) => {
-                if let Some(persistence) = &self.persistence
-                    && let Err(err) = persistence.upsert_affinity_bindings(bindings).await
-                {
-                    warn!(
-                        error = %format!("{err:#}"),
-                        "failed to persist SIP affinity bindings"
-                    );
+                if let Some(persistence) = &self.persistence {
+                    if persistence.required() {
+                        if let Err(err) = persistence.upsert_affinity_bindings(bindings).await {
+                            warn!(
+                                error = %format!("{err:#}"),
+                                "failed to persist SIP affinity bindings"
+                            );
+                        }
+                    } else {
+                        persistence.upsert_affinity_bindings_background(bindings);
+                    }
                 }
             }
             Err(err) => {
@@ -729,11 +743,11 @@ impl ProxyServer {
                             continue;
                         }
                     };
-                    if self.config.proxy.socket.tcp_nodelay {
-                        if let Err(err) = stream.set_nodelay(true) {
-                            warn!(%peer, error = %err, "failed to set TCP_NODELAY on SIP connection");
-                            continue;
-                        }
+                    if self.config.proxy.socket.tcp_nodelay
+                        && let Err(err) = stream.set_nodelay(true)
+                    {
+                        warn!(%peer, error = %err, "failed to set TCP_NODELAY on SIP connection");
+                        continue;
                     }
                     let this = self.clone();
                     let proxy_listener = proxy_listener.clone();
@@ -1052,6 +1066,10 @@ impl ProxyServer {
             );
         }
 
+        let is_final = matches!(
+            &message.start_line,
+            SipStartLine::Response { code, .. } if *code >= 200
+        );
         if let SipStartLine::Response { code, .. } = &message.start_line {
             self.record_upstream_response("udp", *code);
             self.upstreams
@@ -1062,9 +1080,11 @@ impl ProxyServer {
             .pop_top_via()?
             .context("upstream response is missing Via")?;
         message.apply_top_via_received_rport(route.client_peer)?;
-        socket
-            .send_to(&message.to_bytes(), route.client_peer)
-            .await?;
+        let send_result = socket.send_to(&message.to_bytes(), route.client_peer).await;
+        if is_final && route.remove_on_final {
+            self.remove_udp_branch(&branch).await;
+        }
+        send_result?;
         Ok(())
     }
 
@@ -1161,6 +1181,7 @@ impl ProxyServer {
                             client_peer: peer,
                             upstream: target.addr,
                             created_at: Instant::now(),
+                            remove_on_final: method != "INVITE",
                         },
                     );
                 }
@@ -1181,30 +1202,30 @@ impl ProxyServer {
             }
             SipTransport::Tcp => {
                 self.record_forwarded_request("udp", target.transport, Some(method));
-                self.forward_udp_to_tcp_upstream(
+                self.forward_udp_to_tcp_upstream(UdpToTcpForward {
                     socket,
                     message,
-                    peer,
-                    target.addr,
+                    client_peer: peer,
+                    upstream: target.addr,
                     branch,
                     invite_transaction_key,
                     method,
-                )
+                })
                 .await
             }
         }
     }
 
-    async fn forward_udp_to_tcp_upstream(
-        &self,
-        socket: &UdpSocket,
-        message: SipMessage,
-        client_peer: SocketAddr,
-        upstream: SocketAddr,
-        branch: String,
-        invite_transaction_key: Option<String>,
-        method: &str,
-    ) -> Result<()> {
+    async fn forward_udp_to_tcp_upstream(&self, request: UdpToTcpForward<'_>) -> Result<()> {
+        let UdpToTcpForward {
+            socket,
+            message,
+            client_peer,
+            upstream,
+            branch,
+            invite_transaction_key,
+            method,
+        } = request;
         let packet = message.to_bytes();
         let mut responses = match self
             .tcp_upstreams
@@ -2041,15 +2062,20 @@ impl ProxyServer {
                 .await;
             }
         }
-        if let Some(persistence) = &self.persistence
-            && let Err(err) = persistence
-                .upsert_affinity_bindings(upstream_affinity_bindings)
-                .await
-        {
-            warn!(
-                error = %format!("{err:#}"),
-                "failed to persist REGISTER upstream affinity bindings"
-            );
+        if let Some(persistence) = &self.persistence {
+            if persistence.required() {
+                if let Err(err) = persistence
+                    .upsert_affinity_bindings(upstream_affinity_bindings)
+                    .await
+                {
+                    warn!(
+                        error = %format!("{err:#}"),
+                        "failed to persist REGISTER upstream affinity bindings"
+                    );
+                }
+            } else {
+                persistence.upsert_affinity_bindings_background(upstream_affinity_bindings);
+            }
         }
     }
 
@@ -2254,6 +2280,7 @@ struct UdpBranchRoute {
     client_peer: SocketAddr,
     upstream: SocketAddr,
     created_at: Instant,
+    remove_on_final: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3259,12 +3286,9 @@ impl TcpUpstreamConnection {
             );
         }
 
-        let write_result = timeout(
-            UPSTREAM_TIMEOUT,
-            self.writer.lock().await.write_all(&packet),
-        )
-        .await
-        .context("upstream SIP TCP write timed out")?;
+        let write_result = timeout(UPSTREAM_TIMEOUT, self.writer.lock().await.write_all(packet))
+            .await
+            .context("upstream SIP TCP write timed out")?;
         if let Err(err) = write_result {
             self.branches.lock().await.remove(branch);
             self.alive.store(false, Ordering::Relaxed);
@@ -7029,6 +7053,76 @@ Content-Length: 0\r\n\r\n",
         }
 
         assert_eq!(server.active_udp_branch_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_non_invite_final_response_removes_branch_route() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let listener = test_listener();
+        let client_addr = client_socket.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let mut buf = [0_u8; 4096];
+            let (len, proxy_addr) = upstream_socket.recv_from(&mut buf).await.unwrap();
+            let request = String::from_utf8(buf[..len].to_vec()).unwrap();
+            let vias = request
+                .lines()
+                .filter(|line| line.starts_with("Via:"))
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(vias.len(), 2);
+            assert!(vias[0].contains(PROXY_BRANCH_PREFIX));
+            let response = format!(
+                "SIP/2.0 200 OK\r\n\
+{proxy_via}\r\n\
+{client_via}\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:example.com>;tag=b\r\n\
+Call-ID: options-branch-cleanup\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+                proxy_via = vias[0],
+                client_via = vias[1],
+            );
+            upstream_socket
+                .send_to(response.as_bytes(), proxy_addr)
+                .await
+                .unwrap();
+        });
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"OPTIONS sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP 127.0.0.1:5061;branch=z9hG4bK-client-options\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:example.com>\r\n\
+Call-ID: options-branch-cleanup\r\n\
+CSeq: 1 OPTIONS\r\n\
+Content-Length: 0\r\n\r\n",
+                client_addr,
+                &listener,
+            )
+            .await
+            .unwrap();
+
+        let mut proxy_buf = [0_u8; 4096];
+        let (len, upstream_peer) = proxy_socket.recv_from(&mut proxy_buf).await.unwrap();
+        server
+            .handle_udp_packet(&proxy_socket, &proxy_buf[..len], upstream_peer, &listener)
+            .await
+            .unwrap();
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 200 OK"));
+        assert!(!response.contains(PROXY_BRANCH_PREFIX));
+        assert!(response.contains("z9hG4bK-client-options"));
+        assert_eq!(server.active_udp_branch_count().await, 0);
     }
 
     #[tokio::test]

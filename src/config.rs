@@ -7,7 +7,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub node: NodeConfig,
@@ -19,18 +19,6 @@ pub struct Config {
     pub persistence: PersistenceConfig,
     #[serde(default)]
     pub ha: HaConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            node: NodeConfig::default(),
-            sip: SipConfig::default(),
-            proxy: ProxyConfig::default(),
-            persistence: PersistenceConfig::default(),
-            ha: HaConfig::default(),
-        }
-    }
 }
 
 impl Config {
@@ -857,7 +845,7 @@ impl Default for ProxyConfig {
 
 impl ProxyConfig {
     pub fn effective_register_routing(&self) -> RegisterRoutingMode {
-        self.register_routing.unwrap_or_else(|| {
+        self.register_routing.unwrap_or({
             if self.rewrite_register_contact {
                 RegisterRoutingMode::ContactRewrite
             } else {
@@ -1084,19 +1072,14 @@ pub struct ProxyThreatIntelSourceConfig {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyThreatIntelFormat {
+    #[default]
     Cidr,
     Ips,
     Ipsum,
     SpamhausDrop,
-}
-
-impl Default for ProxyThreatIntelFormat {
-    fn default() -> Self {
-        Self::Cidr
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1105,43 +1088,28 @@ pub struct ProxyGeoCountryListConfig {
     pub countries: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyGeoProvider {
+    #[default]
     Ipdeny,
 }
 
-impl Default for ProxyGeoProvider {
-    fn default() -> Self {
-        Self::Ipdeny
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyGeoStartupRefresh {
     Blocking,
     Background,
+    #[default]
     Disabled,
 }
 
-impl Default for ProxyGeoStartupRefresh {
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyGeoUnknownCountryPolicy {
+    #[default]
     Allow,
     Deny,
-}
-
-impl Default for ProxyGeoUnknownCountryPolicy {
-    fn default() -> Self {
-        Self::Allow
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1247,19 +1215,14 @@ impl ProxyFloodSecurityConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxySecurityPreset {
+    #[default]
     Off,
     Trusted,
     Public,
     Strict,
-}
-
-impl Default for ProxySecurityPreset {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1378,17 +1341,12 @@ impl ProxySipPolicyConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyRegisteredInviteSourceMatch {
+    #[default]
     Ip,
     IpPort,
-}
-
-impl Default for ProxyRegisteredInviteSourceMatch {
-    fn default() -> Self {
-        Self::Ip
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1752,7 +1710,7 @@ impl Default for EffectiveProxyGeoSecurityConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveProxyDynamicBanConfig {
     pub enabled: bool,
     pub ban_seconds: u64,
@@ -1761,19 +1719,7 @@ pub struct EffectiveProxyDynamicBanConfig {
     pub sip_rate_violations_per_minute: u64,
 }
 
-impl Default for EffectiveProxyDynamicBanConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ban_seconds: 0,
-            invalid_packets_per_minute: 0,
-            parse_errors_per_minute: 0,
-            sip_rate_violations_per_minute: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveProxyFloodSecurityConfig {
     pub enabled: bool,
     pub udp_packets_per_second: u64,
@@ -1787,25 +1733,6 @@ pub struct EffectiveProxyFloodSecurityConfig {
     pub icmp_packets_per_second: u64,
     pub icmp_burst: u64,
     pub block_seconds: u64,
-}
-
-impl Default for EffectiveProxyFloodSecurityConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            udp_packets_per_second: 0,
-            udp_burst: 0,
-            tcp_packets_per_second: 0,
-            tcp_burst: 0,
-            tcp_syn_packets_per_second: 0,
-            tcp_syn_burst: 0,
-            tcp_ack_packets_per_second: 0,
-            tcp_ack_burst: 0,
-            icmp_packets_per_second: 0,
-            icmp_burst: 0,
-            block_seconds: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1834,24 +1761,16 @@ pub struct EffectiveProxySipRateLimitConfig {
     pub block_seconds: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveProxySipPolicyConfig {
     pub require_registered_invite_source: bool,
     pub registered_invite_source_match: ProxyRegisteredInviteSourceMatch,
 }
 
-impl Default for EffectiveProxySipPolicyConfig {
-    fn default() -> Self {
-        Self {
-            require_registered_invite_source: false,
-            registered_invite_source_match: ProxyRegisteredInviteSourceMatch::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RegisterRoutingMode {
+    #[default]
     Path,
     ContactRewrite,
 }
@@ -1862,12 +1781,6 @@ impl RegisterRoutingMode {
             Self::Path => "path",
             Self::ContactRewrite => "contact-rewrite",
         }
-    }
-}
-
-impl Default for RegisterRoutingMode {
-    fn default() -> Self {
-        Self::Path
     }
 }
 
@@ -1920,18 +1833,13 @@ fn default_affinity_ttl_seconds() -> u64 {
     3600
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProxyAffinityKey {
+    #[default]
     DialogId,
     CallId,
     RequestUri,
-}
-
-impl Default for ProxyAffinityKey {
-    fn default() -> Self {
-        Self::DialogId
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1978,17 +1886,12 @@ fn default_tcp_nodelay() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum SipTransport {
+    #[default]
     Udp,
     Tcp,
-}
-
-impl Default for SipTransport {
-    fn default() -> Self {
-        Self::Udp
-    }
 }
 
 impl SipTransport {
@@ -2032,16 +1935,11 @@ pub struct UpstreamGroupConfig {
     pub servers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpstreamMode {
+    #[default]
     RoundRobin,
-}
-
-impl Default for UpstreamMode {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2272,17 +2170,12 @@ impl Default for HaActiveStandbyConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum HaInitialRole {
     Active,
+    #[default]
     Standby,
-}
-
-impl Default for HaInitialRole {
-    fn default() -> Self {
-        Self::Standby
-    }
 }
 
 fn default_ha_heartbeat_bind() -> String {
@@ -2335,9 +2228,10 @@ fn default_ha_replication_request_timeout_ms() -> u64 {
     2_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum HaAddonConfig {
+    #[default]
     Noop,
     Command {
         on_become_leader: Option<String>,
@@ -2345,12 +2239,6 @@ pub enum HaAddonConfig {
         #[serde(default = "default_command_timeout_ms")]
         timeout_ms: u64,
     },
-}
-
-impl Default for HaAddonConfig {
-    fn default() -> Self {
-        Self::Noop
-    }
 }
 
 fn default_command_timeout_ms() -> u64 {
