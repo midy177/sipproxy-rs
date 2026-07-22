@@ -999,19 +999,20 @@ impl ProxyServer {
         target: UpstreamTarget,
         packet: Vec<u8>,
     ) {
+        let now = Instant::now();
         let mut transactions = self
             .udp_client_transactions
             .shard_for_key(&key)
             .lock()
             .await;
-        prune_udp_client_transactions(&mut transactions, Instant::now());
+        prune_udp_client_transactions(&mut transactions, now);
         transactions.insert(
             key,
             UdpClientTransactionRoute {
                 target,
                 packet,
                 final_response: None,
-                created_at: Instant::now(),
+                created_at: now,
             },
         );
         enforce_udp_client_transaction_shard_limit(
@@ -1515,7 +1516,7 @@ impl ProxyServer {
             self.record_upstream_response_latency(
                 "udp",
                 SipTransport::Udp,
-                route.method.as_str(),
+                route.method,
                 route.created_at.elapsed(),
             );
             self.apply_register_response(&branch, &message, *code).await;
@@ -1604,7 +1605,7 @@ impl ProxyServer {
         message: SipMessage,
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
-        method: &str,
+        method: &'static str,
     ) -> Result<()> {
         let client_transaction_key = udp_client_transaction_key(&message, peer, method)?;
         if let Some(key) = client_transaction_key.as_deref()
@@ -1648,15 +1649,16 @@ impl ProxyServer {
                 self.record_forwarded_request("udp", target.transport, Some(method));
                 let packet = message.to_bytes();
                 {
+                    let now = Instant::now();
                     let mut branches = self.udp_branches.shard_for_key(&branch).lock().await;
-                    prune_udp_branches(&mut branches, Instant::now());
+                    prune_udp_branches(&mut branches, now);
                     branches.insert(
                         branch.clone(),
                         UdpBranchRoute {
                             client_peer: peer,
                             upstream: target.addr,
-                            method: method.to_string(),
-                            created_at: Instant::now(),
+                            method,
+                            created_at: now,
                             remove_on_final: method != "INVITE",
                             client_transaction_key: client_transaction_key.clone(),
                         },
@@ -1763,7 +1765,7 @@ impl ProxyServer {
         message: SipMessage,
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
-        method: &str,
+        method: &'static str,
     ) -> Result<()> {
         let (message, target, branch, invite_transaction_key) = self
             .prepare_forward(message, peer, listener, method)
@@ -2983,7 +2985,7 @@ struct UpstreamServerRef {
 struct UdpBranchRoute {
     client_peer: SocketAddr,
     upstream: SocketAddr,
-    method: String,
+    method: &'static str,
     created_at: Instant,
     remove_on_final: bool,
     client_transaction_key: Option<String>,
