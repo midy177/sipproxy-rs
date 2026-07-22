@@ -1849,7 +1849,11 @@ impl ProxyServer {
         } else {
             None
         };
-        let invite_transaction_key = invite_transaction_key(&message)?;
+        let invite_transaction_key = if matches!(method, "INVITE" | "CANCEL" | "ACK") {
+            invite_transaction_key(&message)?
+        } else {
+            None
+        };
         let transaction_route =
             if method == "CANCEL" || (method == "ACK" && direct_request_uri_target.is_none()) {
                 self.lookup_invite_transaction(invite_transaction_key.as_deref())
