@@ -36,7 +36,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock as StdRwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -57,6 +57,7 @@ const SECURITY_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_BUCKET_IDLE_TTL: Duration = Duration::from_secs(600);
 const HEALTH_CHECK_STANDBY_ROLE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_CHECK_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const SECURITY_MAP_SHARDS: usize = 64;
 const ROUTE_MAP_SHARDS: usize = 64;
 const METRIC_TRANSPORT_COUNT: usize = 2;
@@ -142,6 +143,7 @@ pub struct ProxyServer {
     local_invite_rejections: Mutex<HashMap<String, Instant>>,
     tcp_upstreams: TcpUpstreamPool,
     advertised_addrs: StdRwLock<HashMap<String, String>>,
+    udp_handler_queue_drop_logs: StdMutex<HashMap<String, UdpHandlerQueueDropLog>>,
     local_ips: HashSet<IpAddr>,
 }
 
@@ -165,6 +167,28 @@ struct UdpClientTransactionRef<'a> {
 struct UdpPacket {
     packet: Vec<u8>,
     peer: SocketAddr,
+}
+
+#[derive(Default)]
+struct UdpHandlerQueueDropLog {
+    last_warned_at: Option<Instant>,
+    suppressed: u64,
+}
+
+impl UdpHandlerQueueDropLog {
+    fn warn_if_due(&mut self, now: Instant) -> Option<u64> {
+        if self
+            .last_warned_at
+            .is_some_and(|last| now.duration_since(last) < UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL)
+        {
+            self.suppressed += 1;
+            return None;
+        }
+        self.last_warned_at = Some(now);
+        let suppressed = self.suppressed;
+        self.suppressed = 0;
+        Some(suppressed)
+    }
 }
 
 struct ProxyMetricHandles {
@@ -360,6 +384,7 @@ impl ProxyServer {
             local_invite_rejections: Mutex::new(HashMap::new()),
             tcp_upstreams: TcpUpstreamPool::new(max_message_bytes),
             advertised_addrs: StdRwLock::new(HashMap::new()),
+            udp_handler_queue_drop_logs: StdMutex::new(HashMap::new()),
             local_ips,
         })
     }
@@ -898,23 +923,33 @@ impl ProxyServer {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(UdpPacket { packet, peer })) => {
                             self.record_udp_handler_queue_drop(&listener);
-                            warn!(
-                                %peer,
-                                bytes = packet.len(),
-                                preview = %packet_preview(&packet),
-                                handler_index,
-                                "dropping UDP SIP packet because handler queue is full"
-                            );
+                            if let Some(suppressed) =
+                                self.udp_handler_queue_drop_log_suppressed(&listener)
+                            {
+                                warn!(
+                                    %peer,
+                                    bytes = packet.len(),
+                                    preview = %packet_preview(&packet),
+                                    handler_index,
+                                    suppressed_udp_handler_queue_drops = suppressed,
+                                    "dropping UDP SIP packet because handler queue is full"
+                                );
+                            }
                         }
                         Err(mpsc::error::TrySendError::Closed(UdpPacket { packet, peer })) => {
                             self.record_udp_handler_queue_drop(&listener);
-                            warn!(
-                                %peer,
-                                bytes = packet.len(),
-                                preview = %packet_preview(&packet),
-                                handler_index,
-                                "dropping UDP SIP packet because handler queue is closed"
-                            );
+                            if let Some(suppressed) =
+                                self.udp_handler_queue_drop_log_suppressed(&listener)
+                            {
+                                warn!(
+                                    %peer,
+                                    bytes = packet.len(),
+                                    preview = %packet_preview(&packet),
+                                    handler_index,
+                                    suppressed_udp_handler_queue_drops = suppressed,
+                                    "dropping UDP SIP packet because handler queue is closed"
+                                );
+                            }
                         }
                     }
                 }
@@ -2367,6 +2402,17 @@ impl ProxyServer {
             "proxy_udp_handler_queue_drops_total",
             &[("listener", listener_key.as_str())],
         );
+    }
+
+    fn udp_handler_queue_drop_log_suppressed(&self, listener: &ProxyListenerConfig) -> Option<u64> {
+        let listener_key = listener.key();
+        let mut logs = self
+            .udp_handler_queue_drop_logs
+            .lock()
+            .expect("UDP handler queue drop log lock poisoned");
+        logs.entry(listener_key)
+            .or_default()
+            .warn_if_due(Instant::now())
     }
 
     fn record_local_response(&self, transport: &str, code: u16) {
@@ -9517,6 +9563,25 @@ Content-Length: 0\r\n\r\n"
             probe_tcp_connect(addr, Duration::from_millis(500))
                 .await
                 .healthy
+        );
+    }
+
+    #[test]
+    fn udp_handler_queue_drop_log_throttles_repeated_drops() {
+        let mut log = UdpHandlerQueueDropLog::default();
+        let start = Instant::now();
+        assert_eq!(log.warn_if_due(start), Some(0));
+        assert_eq!(
+            log.warn_if_due(start + UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL / 2),
+            None
+        );
+        assert_eq!(
+            log.warn_if_due(start + UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL),
+            Some(1)
+        );
+        assert_eq!(
+            log.warn_if_due(start + UDP_HANDLER_QUEUE_DROP_LOG_INTERVAL * 2),
+            Some(0)
         );
     }
 
