@@ -707,9 +707,20 @@ impl ProxyServer {
             UdpClientTransactionRoute {
                 target,
                 packet,
+                final_response: None,
                 created_at: Instant::now(),
             },
         );
+    }
+
+    async fn remember_udp_client_transaction_final_response(&self, key: &str, response: Vec<u8>) {
+        let now = Instant::now();
+        let mut transactions = self.udp_client_transactions.shard_for_key(key).lock().await;
+        prune_udp_client_transactions(&mut transactions, now);
+        if let Some(route) = transactions.get_mut(key) {
+            route.final_response = Some(response);
+            route.created_at = now;
+        }
     }
 
     async fn remove_udp_client_transaction(&self, key: &str) {
@@ -823,13 +834,13 @@ impl ProxyServer {
                     .await;
             }
             response_message.apply_top_via_received_rport(client_peer)?;
-            socket
-                .send_to(&response_message.to_bytes(), client_peer)
-                .await?;
+            let response = response_message.to_bytes();
+            if is_final && let Some(key) = transaction.key {
+                self.remember_udp_client_transaction_final_response(key, response.clone())
+                    .await;
+            }
+            socket.send_to(&response, client_peer).await?;
             if is_final {
-                if let Some(key) = transaction.key {
-                    self.remove_udp_client_transaction(key).await;
-                }
                 break;
             }
         }
@@ -1186,12 +1197,14 @@ impl ProxyServer {
             .pop_top_via()?
             .context("upstream response is missing Via")?;
         message.apply_top_via_received_rport(route.client_peer)?;
-        let send_result = socket.send_to(&message.to_bytes(), route.client_peer).await;
+        let response = message.to_bytes();
+        if is_final && let Some(key) = route.client_transaction_key.as_deref() {
+            self.remember_udp_client_transaction_final_response(key, response.clone())
+                .await;
+        }
+        let send_result = socket.send_to(&response, route.client_peer).await;
         if is_final && route.remove_on_final {
             self.remove_udp_branch(&branch).await;
-            if let Some(key) = route.client_transaction_key.as_deref() {
-                self.remove_udp_client_transaction(key).await;
-            }
         }
         send_result?;
         Ok(())
@@ -1277,7 +1290,12 @@ impl ProxyServer {
                 method,
                 "reusing upstream SIP request for UDP client retransmission"
             );
-            if route.target.transport == SipTransport::Udp {
+            if let Some(response) = route.final_response {
+                socket
+                    .send_to(&response, peer)
+                    .await
+                    .context("failed to retransmit cached SIP response to UDP client")?;
+            } else if route.target.transport == SipTransport::Udp {
                 socket
                     .send_to(&route.packet, route.target.addr)
                     .await
@@ -2492,6 +2510,7 @@ struct UdpBranchRoute {
 struct UdpClientTransactionRoute {
     target: UpstreamTarget,
     packet: Vec<u8>,
+    final_response: Option<Vec<u8>>,
     created_at: Instant,
 }
 
@@ -6229,6 +6248,78 @@ Content-Length: 0\r\n\r\n";
                 .unwrap()
         );
         assert_eq!(server.active_udp_branch_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_register_retransmission_after_final_response_is_answered_locally() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let listener = test_listener();
+        let client_addr = client_socket.local_addr().unwrap();
+        let request = format!(
+            "REGISTER sip:127.0.0.1:5060 SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};rport;branch=z9hG4bK-register-final-retry\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>\r\n\
+Contact: <sip:100@{client_addr};transport=UDP>\r\n\
+Call-ID: register-final-retry\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(&proxy_socket, request.as_bytes(), client_addr, &listener)
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let response = format!(
+            "SIP/2.0 401 Unauthorized\r\n\
+{proxy_via}\r\n\
+Via: SIP/2.0/UDP {client_addr};rport;branch=z9hG4bK-register-final-retry\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:100@example.com>;tag=b\r\n\
+Call-ID: register-final-retry\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n",
+            proxy_via = top_via_line(&forwarded),
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                response.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &listener,
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let first_response = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(first_response.starts_with("SIP/2.0 401 Unauthorized"));
+        assert!(!first_response.contains(PROXY_BRANCH_PREFIX));
+
+        server
+            .handle_udp_packet(&proxy_socket, request.as_bytes(), client_addr, &listener)
+            .await
+            .unwrap();
+        let (len, _) = timeout(Duration::from_secs(1), client_socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let retransmitted_response = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert_eq!(retransmitted_response, first_response);
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
