@@ -413,6 +413,7 @@ impl ProxyServer {
     async fn render_metrics(&self) -> String {
         let mut output = self.metrics.render_prometheus();
         let udp_branch_routes = self.active_udp_branch_count().await;
+        let udp_client_transactions = self.active_udp_client_transaction_count().await;
         let invite_transaction_routes = self.active_invite_transaction_count().await;
         let (tcp_upstream_connections, tcp_branch_routes) =
             self.tcp_upstreams.active_counts().await;
@@ -439,6 +440,11 @@ impl ProxyServer {
             &mut output,
             "proxy_udp_branch_routes",
             udp_branch_routes as u64,
+        );
+        append_gauge(
+            &mut output,
+            "proxy_udp_client_transactions",
+            udp_client_transactions as u64,
         );
         append_gauge(
             &mut output,
@@ -585,6 +591,13 @@ impl ProxyServer {
     async fn active_udp_branch_count(&self) -> usize {
         let now = Instant::now();
         self.udp_branches
+            .len_after_retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL)
+            .await
+    }
+
+    async fn active_udp_client_transaction_count(&self) -> usize {
+        let now = Instant::now();
+        self.udp_client_transactions
             .len_after_retain(|_, route| now.duration_since(route.created_at) <= UDP_BRANCH_TTL)
             .await
     }
@@ -7517,6 +7530,8 @@ Content-Length: 0\r\n\r\n",
         assert!(metrics.contains("proxy_affinity_lookup_total{result=\"miss\"} 2"));
         assert!(metrics.contains("# TYPE proxy_udp_branch_routes gauge"));
         assert!(metrics.contains("proxy_udp_branch_routes 2"));
+        assert!(metrics.contains("# TYPE proxy_udp_client_transactions gauge"));
+        assert!(metrics.contains("proxy_udp_client_transactions 2"));
         assert!(metrics.contains("proxy_invite_transaction_routes 0"));
         assert!(metrics.contains("proxy_affinity_bindings 1"));
         assert!(metrics.contains("proxy_location_bindings 0"));
