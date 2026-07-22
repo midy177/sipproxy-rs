@@ -65,8 +65,17 @@ const METRIC_TRANSPORTS: [&str; METRIC_TRANSPORT_COUNT] = ["udp", "tcp"];
 const METRIC_METHODS: [&str; METRIC_METHOD_COUNT] = [
     "ACK", "BYE", "CANCEL", "INVITE", "MESSAGE", "OPTIONS", "REGISTER", "UNKNOWN",
 ];
-const UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS: [u64; 13] = [
+const UPSTREAM_RESPONSE_LATENCY_MS_FINITE_BUCKET_COUNT: usize = 13;
+const UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT: usize =
+    UPSTREAM_RESPONSE_LATENCY_MS_FINITE_BUCKET_COUNT + 1;
+const UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS: [u64;
+    UPSTREAM_RESPONSE_LATENCY_MS_FINITE_BUCKET_COUNT] = [
     1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000,
+];
+const UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_LABELS: [&str;
+    UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT] = [
+    "1", "5", "10", "25", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "30000",
+    "+Inf",
 ];
 const PROXY_BRANCH_PREFIX: &str = "z9hG4bK-sigproxy-";
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -114,6 +123,13 @@ struct ProxyMetricHandles {
     sip_requests: [[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT],
     forwarded_requests:
         [[[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT]; METRIC_TRANSPORT_COUNT],
+    upstream_response_latency_buckets: [[[[CounterHandle; UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT];
+        METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT];
+        METRIC_TRANSPORT_COUNT],
+    upstream_response_latency_count:
+        [[[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT]; METRIC_TRANSPORT_COUNT],
+    upstream_response_latency_sum:
+        [[[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT]; METRIC_TRANSPORT_COUNT],
 }
 
 impl ProxyMetricHandles {
@@ -135,6 +151,51 @@ impl ProxyMetricHandles {
                     std::array::from_fn(|method| {
                         metrics.counter(
                             "proxy_forwarded_requests_total",
+                            &[
+                                ("downstream_transport", METRIC_TRANSPORTS[downstream]),
+                                ("upstream_transport", METRIC_TRANSPORTS[upstream]),
+                                ("method", METRIC_METHODS[method]),
+                            ],
+                        )
+                    })
+                })
+            }),
+            upstream_response_latency_buckets: std::array::from_fn(|downstream| {
+                std::array::from_fn(|upstream| {
+                    std::array::from_fn(|method| {
+                        std::array::from_fn(|bucket| {
+                            metrics.counter(
+                                "proxy_upstream_response_latency_ms_bucket",
+                                &[
+                                    ("downstream_transport", METRIC_TRANSPORTS[downstream]),
+                                    ("upstream_transport", METRIC_TRANSPORTS[upstream]),
+                                    ("method", METRIC_METHODS[method]),
+                                    ("le", UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_LABELS[bucket]),
+                                ],
+                            )
+                        })
+                    })
+                })
+            }),
+            upstream_response_latency_count: std::array::from_fn(|downstream| {
+                std::array::from_fn(|upstream| {
+                    std::array::from_fn(|method| {
+                        metrics.counter(
+                            "proxy_upstream_response_latency_ms_count",
+                            &[
+                                ("downstream_transport", METRIC_TRANSPORTS[downstream]),
+                                ("upstream_transport", METRIC_TRANSPORTS[upstream]),
+                                ("method", METRIC_METHODS[method]),
+                            ],
+                        )
+                    })
+                })
+            }),
+            upstream_response_latency_sum: std::array::from_fn(|downstream| {
+                std::array::from_fn(|upstream| {
+                    std::array::from_fn(|method| {
+                        metrics.counter(
+                            "proxy_upstream_response_latency_ms_sum",
                             &[
                                 ("downstream_transport", METRIC_TRANSPORTS[downstream]),
                                 ("upstream_transport", METRIC_TRANSPORTS[upstream]),
@@ -2138,17 +2199,41 @@ impl ProxyServer {
         elapsed: Duration,
     ) {
         let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        if let (Some(downstream), Some(method)) = (
+            metric_transport_index(downstream_transport),
+            metric_method_index(method),
+        ) {
+            let upstream = sip_transport_metric_index(upstream_transport);
+            for (bucket_index, bucket) in UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS.iter().enumerate() {
+                if elapsed_ms <= *bucket {
+                    self.metric_handles.upstream_response_latency_buckets[downstream][upstream]
+                        [method][bucket_index]
+                        .incr();
+                }
+            }
+            self.metric_handles.upstream_response_latency_buckets[downstream][upstream][method]
+                [UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT - 1]
+                .incr();
+            self.metric_handles.upstream_response_latency_count[downstream][upstream][method]
+                .incr();
+            self.metric_handles.upstream_response_latency_sum[downstream][upstream][method]
+                .incr_by(elapsed_ms);
+            return;
+        }
+
         let upstream_transport = upstream_transport.as_str();
-        for bucket in UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS {
-            if elapsed_ms <= bucket {
-                let le = latency_bucket_label(bucket);
+        for (bucket_index, bucket) in UPSTREAM_RESPONSE_LATENCY_MS_BUCKETS.iter().enumerate() {
+            if elapsed_ms <= *bucket {
                 self.metrics.incr(
                     "proxy_upstream_response_latency_ms_bucket",
                     &[
                         ("downstream_transport", downstream_transport),
                         ("upstream_transport", upstream_transport),
                         ("method", method),
-                        ("le", le),
+                        (
+                            "le",
+                            UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_LABELS[bucket_index],
+                        ),
                     ],
                 );
             }
@@ -4819,25 +4904,6 @@ fn status_class(code: u16) -> &'static str {
         500..=599 => "5xx",
         600..=699 => "6xx",
         _ => "unknown",
-    }
-}
-
-fn latency_bucket_label(bucket: u64) -> &'static str {
-    match bucket {
-        1 => "1",
-        5 => "5",
-        10 => "10",
-        25 => "25",
-        50 => "50",
-        100 => "100",
-        250 => "250",
-        500 => "500",
-        1_000 => "1000",
-        2_500 => "2500",
-        5_000 => "5000",
-        10_000 => "10000",
-        30_000 => "30000",
-        _ => "+Inf",
     }
 }
 
