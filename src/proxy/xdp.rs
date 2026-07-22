@@ -35,25 +35,25 @@ use tracing::{debug, info, warn};
 #[cfg(target_os = "linux")]
 const XDP_OBJECT_PATH: &str = "/usr/local/share/sigproxy/sigproxy_xdp.o";
 #[cfg(target_os = "linux")]
-const XDP_PIN_DIR: &str = "/sys/fs/bpf/sigproxy/v2";
+const XDP_PIN_DIR: &str = "/sys/fs/bpf/sigproxy/v3";
 #[cfg(target_os = "linux")]
-const XDP_PROG_DIR: &str = "/sys/fs/bpf/sigproxy/v2/progs";
+const XDP_PROG_DIR: &str = "/sys/fs/bpf/sigproxy/v3/progs";
 #[cfg(target_os = "linux")]
-const XDP_MAP_DIR: &str = "/sys/fs/bpf/sigproxy/v2/maps";
+const XDP_MAP_DIR: &str = "/sys/fs/bpf/sigproxy/v3/maps";
 #[cfg(target_os = "linux")]
-const XDP_BLOCKED_IPS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/blocked_ips";
+const XDP_BLOCKED_IPS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/blocked_ips";
 #[cfg(target_os = "linux")]
-const XDP_LISTENER_POLICIES_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/listener_policies";
+const XDP_LISTENER_POLICIES_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/listener_policies";
 #[cfg(target_os = "linux")]
-const XDP_ALLOW_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/allow_cidrs";
+const XDP_ALLOW_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/allow_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_DENY_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/deny_cidrs";
+const XDP_DENY_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/deny_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_TRUSTED_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/trusted_cidrs";
+const XDP_TRUSTED_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/trusted_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_GEO_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/geo_cidrs";
+const XDP_GEO_CIDRS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/geo_cidrs";
 #[cfg(target_os = "linux")]
-const XDP_STATS_MAP: &str = "/sys/fs/bpf/sigproxy/v2/maps/stats";
+const XDP_STATS_MAP: &str = "/sys/fs/bpf/sigproxy/v3/maps/stats";
 const XDP_PROTO_ICMP: u8 = 1;
 const XDP_PROTO_TCP: u8 = 6;
 const XDP_PROTO_UDP: u8 = 17;
@@ -754,7 +754,7 @@ struct AyaXdpBackend {
     allow_cidrs: StdMutex<LpmTrie<MapData, XdpLpmData, XdpCidrValue>>,
     deny_cidrs: StdMutex<LpmTrie<MapData, XdpLpmData, XdpCidrValue>>,
     trusted_cidrs: StdMutex<LpmTrie<MapData, XdpLpmData, XdpCidrValue>>,
-    geo_cidrs: StdMutex<LpmTrie<MapData, XdpLpmData, XdpGeoValue>>,
+    geo_cidrs: StdMutex<LpmTrie<MapData, XdpGeoLpmData, XdpGeoValue>>,
     stats: StdMutex<AyaArray<MapData, u64>>,
     static_state: StdMutex<XdpStaticState>,
 }
@@ -827,6 +827,15 @@ struct XdpLpmData {
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(C)]
+struct XdpGeoLpmData {
+    family: u8,
+    pad: [u8; 3],
+    addr: [u8; 16],
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct XdpCidrValue {
@@ -869,6 +878,8 @@ unsafe impl Pod for XdpIpKey {}
 unsafe impl Pod for XdpIpValue {}
 #[cfg(target_os = "linux")]
 unsafe impl Pod for XdpLpmData {}
+#[cfg(target_os = "linux")]
+unsafe impl Pod for XdpGeoLpmData {}
 #[cfg(target_os = "linux")]
 unsafe impl Pod for XdpCidrValue {}
 #[cfg(target_os = "linux")]
@@ -934,7 +945,7 @@ impl AyaXdpBackend {
             allow_cidrs: StdMutex::new(take_lpm_map(&mut ebpf, "allow_cidrs")?),
             deny_cidrs: StdMutex::new(take_lpm_map(&mut ebpf, "deny_cidrs")?),
             trusted_cidrs: StdMutex::new(take_lpm_map(&mut ebpf, "trusted_cidrs")?),
-            geo_cidrs: StdMutex::new(take_lpm_map(&mut ebpf, "geo_cidrs")?),
+            geo_cidrs: StdMutex::new(take_geo_lpm_map(&mut ebpf, "geo_cidrs")?),
             stats: StdMutex::new(take_array(&mut ebpf, "stats")?),
             ebpf,
             listeners: listeners.to_vec(),
@@ -1068,8 +1079,7 @@ impl AyaXdpBackend {
                 }
                 if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
                     for (index, prefix) in geo_prefixes.iter().enumerate() {
-                        let key =
-                            make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
+                        let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
                         geo_cidrs.insert(
                             &key,
                             XdpGeoValue {
@@ -1179,7 +1189,7 @@ impl AyaXdpBackend {
             &current.keys.trusted_cidrs,
             &next.trusted_cidrs,
         )?;
-        delete_stale_lpm_keys(&mut geo_cidrs, &current.keys.geo_cidrs, &next.geo_cidrs)?;
+        delete_stale_geo_lpm_keys(&mut geo_cidrs, &current.keys.geo_cidrs, &next.geo_cidrs)?;
         current.keys = next;
         current.fingerprint = Some(fingerprint);
         Ok(())
@@ -1285,8 +1295,8 @@ fn build_xdp_static_keys(
         }
         if spec.policy.flags & XDP_POLICY_GEO_ENABLED != 0 {
             for prefix in geo_prefixes {
-                let key = make_lpm_key(spec.l4_proto, spec.port, prefix.addr, prefix.prefix);
-                keys.geo_cidrs.insert(encode_lpm_key_bytes(&key));
+                let key = make_geo_lpm_key(prefix.addr, prefix.prefix);
+                keys.geo_cidrs.insert(encode_geo_lpm_key_bytes(&key));
             }
         }
     }
@@ -1537,6 +1547,17 @@ fn take_lpm_map<V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<LpmTrie<MapData, 
 }
 
 #[cfg(target_os = "linux")]
+fn take_geo_lpm_map<V: Pod>(
+    ebpf: &mut Ebpf,
+    name: &str,
+) -> Result<LpmTrie<MapData, XdpGeoLpmData, V>> {
+    ebpf.take_map(name)
+        .with_context(|| format!("XDP LPM map '{name}' is missing from object"))?
+        .try_into()
+        .with_context(|| format!("XDP LPM map '{name}' has an unexpected type or layout"))
+}
+
+#[cfg(target_os = "linux")]
 fn take_array<V: Pod>(ebpf: &mut Ebpf, name: &str) -> Result<AyaArray<MapData, V>> {
     ebpf.take_map(name)
         .with_context(|| format!("XDP array map '{name}' is missing from object"))?
@@ -1567,6 +1588,20 @@ fn delete_stale_lpm_keys<V: Pod>(
         let key = decode_lpm_key_bytes(raw)?;
         map.remove(&key)
             .context("failed to delete stale XDP LPM key")?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn delete_stale_geo_lpm_keys<V: Pod>(
+    map: &mut LpmTrie<MapData, XdpGeoLpmData, V>,
+    current: &BTreeSet<Vec<u8>>,
+    next: &BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    for raw in current.difference(next) {
+        let key = decode_geo_lpm_key_bytes(raw)?;
+        map.remove(&key)
+            .context("failed to delete stale XDP geo LPM key")?;
     }
     Ok(())
 }
@@ -1647,6 +1682,29 @@ fn make_lpm_key(l4_proto: u8, port: u16, addr: IpAddr, prefix: u8) -> LpmKey<Xdp
 }
 
 #[cfg(target_os = "linux")]
+fn make_geo_lpm_key(addr: IpAddr, prefix: u8) -> LpmKey<XdpGeoLpmData> {
+    let family = match addr {
+        IpAddr::V4(_) => 4_u8,
+        IpAddr::V6(_) => 6_u8,
+    };
+    let mut bytes = [0_u8; 16];
+    match addr {
+        IpAddr::V4(ip) => {
+            bytes[..4].copy_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => bytes.copy_from_slice(&ip.octets()),
+    }
+    LpmKey::new(
+        u32::from(32 + prefix),
+        XdpGeoLpmData {
+            family,
+            pad: [0; 3],
+            addr: bytes,
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn encode_lpm_key_bytes(key: &LpmKey<XdpLpmData>) -> Vec<u8> {
     let data = key.data();
     let mut out = Vec::with_capacity(24);
@@ -1654,6 +1712,17 @@ fn encode_lpm_key_bytes(key: &LpmKey<XdpLpmData>) -> Vec<u8> {
     out.push(data.family);
     out.push(data.l4_proto);
     out.extend_from_slice(&data.dport.to_ne_bytes());
+    out.extend_from_slice(&data.addr);
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn encode_geo_lpm_key_bytes(key: &LpmKey<XdpGeoLpmData>) -> Vec<u8> {
+    let data = key.data();
+    let mut out = Vec::with_capacity(24);
+    out.extend_from_slice(&key.prefix_len().to_ne_bytes());
+    out.push(data.family);
+    out.extend_from_slice(&data.pad);
     out.extend_from_slice(&data.addr);
     out
 }
@@ -1672,6 +1741,24 @@ fn decode_lpm_key_bytes(raw: &[u8]) -> Result<LpmKey<XdpLpmData>> {
             family: raw[4],
             l4_proto: raw[5],
             dport: u16::from_ne_bytes(raw[6..8].try_into().unwrap()),
+            addr,
+        },
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_geo_lpm_key_bytes(raw: &[u8]) -> Result<LpmKey<XdpGeoLpmData>> {
+    if raw.len() != 24 {
+        bail!("invalid encoded XDP geo LPM key length {}", raw.len());
+    }
+    let prefix_len = u32::from_ne_bytes(raw[0..4].try_into().unwrap());
+    let mut addr = [0_u8; 16];
+    addr.copy_from_slice(&raw[8..24]);
+    Ok(LpmKey::new(
+        prefix_len,
+        XdpGeoLpmData {
+            family: raw[4],
+            pad: raw[5..8].try_into().unwrap(),
             addr,
         },
     ))
@@ -1770,6 +1857,79 @@ mod tests {
                 prefix: 32
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn xdp_test_policy(flags: u64) -> XdpListenerPolicySpec {
+        XdpListenerPolicySpec {
+            flags,
+            packets_per_second: 0,
+            burst: 0,
+            udp_flood_packets_per_second: 0,
+            udp_flood_burst: 0,
+            tcp_flood_packets_per_second: 0,
+            tcp_flood_burst: 0,
+            tcp_syn_flood_packets_per_second: 0,
+            tcp_syn_flood_burst: 0,
+            tcp_ack_flood_packets_per_second: 0,
+            tcp_ack_flood_burst: 0,
+            icmp_flood_packets_per_second: 0,
+            icmp_flood_burst: 0,
+            geo_allow: [0; XDP_COUNTRY_WORDS],
+            geo_deny: [0; XDP_COUNTRY_WORDS],
+            trusted_cidrs: Vec::new(),
+            allow_cidrs: Vec::new(),
+            deny_cidrs: Vec::new(),
+            threat_intel: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn geo_cidrs_are_shared_across_xdp_listeners() {
+        let policy = xdp_test_policy(XDP_POLICY_GEO_ENABLED);
+        let listeners = vec![
+            XdpListenerSpec {
+                listener_key: "udp/0.0.0.0:5060".to_string(),
+                l4_proto: XDP_PROTO_UDP,
+                port: 5060,
+                policy: policy.clone(),
+            },
+            XdpListenerSpec {
+                listener_key: "tcp/0.0.0.0:5060".to_string(),
+                l4_proto: XDP_PROTO_TCP,
+                port: 5060,
+                policy: policy.clone(),
+            },
+            XdpListenerSpec {
+                listener_key: "udp/0.0.0.0:5092".to_string(),
+                l4_proto: XDP_PROTO_UDP,
+                port: 5092,
+                policy: policy.clone(),
+            },
+            XdpListenerSpec {
+                listener_key: "tcp/0.0.0.0:5092".to_string(),
+                l4_proto: XDP_PROTO_TCP,
+                port: 5092,
+                policy,
+            },
+        ];
+        let geo_prefixes = vec![
+            crate::proxy::geo::GeoIpPrefix {
+                addr: "203.0.113.0".parse().unwrap(),
+                prefix: 24,
+                country: u16::from_be_bytes(*b"US"),
+            },
+            crate::proxy::geo::GeoIpPrefix {
+                addr: "198.51.100.0".parse().unwrap(),
+                prefix: 24,
+                country: u16::from_be_bytes(*b"HK"),
+            },
+        ];
+
+        let keys = build_xdp_static_keys(&listeners, &geo_prefixes, &[]);
+
+        assert_eq!(keys.geo_cidrs.len(), geo_prefixes.len());
     }
 
     #[cfg(target_os = "linux")]

@@ -84,6 +84,13 @@ struct lpm_ip_key {
     __u8 addr[16];
 };
 
+struct lpm_geo_key {
+    __u32 prefixlen;
+    __u8 family;
+    __u8 pad[3];
+    __u8 addr[16];
+};
+
 struct cidr_value {
     __u8 enabled;
 };
@@ -156,7 +163,7 @@ struct {
     __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(map_flags, BPF_F_NO_PREALLOC);
     __uint(max_entries, 262144);
-    __type(key, struct lpm_ip_key);
+    __type(key, struct lpm_geo_key);
     __type(value, struct geo_value);
 } geo_cidrs SEC(".maps");
 
@@ -347,7 +354,7 @@ static __always_inline int check_flood_limit(struct listener_policy *policy, str
     return check_bucket_rate_limit(&rate_key, packets_per_second, burst, stat);
 }
 
-static __always_inline int evaluate_packet(struct listener_key *listener, struct ip_key *ip_key, struct lpm_ip_key *lpm_key, __u8 packet_class)
+static __always_inline int evaluate_packet(struct listener_key *listener, struct ip_key *ip_key, struct lpm_ip_key *lpm_key, struct lpm_geo_key *geo_key, __u8 packet_class)
 {
     struct listener_policy *policy = bpf_map_lookup_elem(&listener_policies, listener);
     if (!policy) {
@@ -378,7 +385,7 @@ static __always_inline int evaluate_packet(struct listener_key *listener, struct
     }
 
     if (policy->flags & XDP_POLICY_GEO_ENABLED) {
-        struct geo_value *geo = bpf_map_lookup_elem(&geo_cidrs, lpm_key);
+        struct geo_value *geo = bpf_map_lookup_elem(&geo_cidrs, geo_key);
         if (!geo) {
             if (!(policy->flags & XDP_POLICY_GEO_UNKNOWN_ALLOW)) {
                 incr_stat(XDP_STAT_GEO_UNKNOWN_DROP);
@@ -425,7 +432,12 @@ static __always_inline int handle_l4(__u8 family, __u8 proto, __be16 dport, __u8
     lpm_key.dport = dport;
     __builtin_memcpy(lpm_key.addr, src, family == 4 ? 4 : 16);
 
-    return evaluate_packet(&listener, &ip_key, &lpm_key, packet_class);
+    struct lpm_geo_key geo_key = {};
+    geo_key.prefixlen = family == 4 ? 64 : 160;
+    geo_key.family = family;
+    __builtin_memcpy(geo_key.addr, src, family == 4 ? 4 : 16);
+
+    return evaluate_packet(&listener, &ip_key, &lpm_key, &geo_key, packet_class);
 }
 
 static __always_inline int handle_icmp(__u8 family, __u8 *src)
@@ -447,7 +459,12 @@ static __always_inline int handle_icmp(__u8 family, __u8 *src)
     lpm_key.dport = 0;
     __builtin_memcpy(lpm_key.addr, src, family == 4 ? 4 : 16);
 
-    return evaluate_packet(&listener, &ip_key, &lpm_key, SIG_RATE_ICMP_FLOOD);
+    struct lpm_geo_key geo_key = {};
+    geo_key.prefixlen = family == 4 ? 64 : 160;
+    geo_key.family = family;
+    __builtin_memcpy(geo_key.addr, src, family == 4 ? 4 : 16);
+
+    return evaluate_packet(&listener, &ip_key, &lpm_key, &geo_key, SIG_RATE_ICMP_FLOOD);
 }
 
 SEC("xdp")
