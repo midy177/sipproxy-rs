@@ -249,6 +249,7 @@ impl Config {
                 );
             }
         }
+        validate_upstream_targets_do_not_loop_to_proxy(self)?;
         if self.ha.leader_check_interval_ms == 0 {
             bail!("ha.leader_check_interval_ms must be greater than 0");
         }
@@ -450,6 +451,116 @@ fn split_host_port(value: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+fn validate_upstream_targets_do_not_loop_to_proxy(config: &Config) -> Result<()> {
+    for configured_listener in &config.proxy.listeners {
+        for listener in configured_listener.concrete_listeners() {
+            let listener_groups =
+                upstream_groups_used_by_listener(&config.proxy, configured_listener, &listener);
+            let self_addrs = proxy_self_addrs_for_listener(&config.sip, &listener);
+            if self_addrs.is_empty() {
+                continue;
+            }
+
+            for group_name in listener_groups {
+                let Some(group) = config
+                    .proxy
+                    .upstream_groups
+                    .iter()
+                    .find(|group| group.name == group_name)
+                else {
+                    continue;
+                };
+                for server in &group.servers {
+                    let Ok(server_addr) = server.parse::<SocketAddr>() else {
+                        continue;
+                    };
+                    if let Some((source, _)) = self_addrs
+                        .iter()
+                        .find(|(_, self_addr)| *self_addr == server_addr)
+                    {
+                        bail!(
+                            "proxy upstream group '{}' server '{}' points back to this proxy listener '{}' via {}; use a real backend address to avoid SIP forwarding loops",
+                            group.name,
+                            server,
+                            listener.key(),
+                            source
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn upstream_groups_used_by_listener(
+    proxy: &ProxyConfig,
+    configured_listener: &ProxyListenerConfig,
+    listener: &ProxyListenerConfig,
+) -> HashSet<String> {
+    let mut groups = HashSet::new();
+    groups.insert(listener.upstream_group.clone());
+    let configured_key = configured_listener.key();
+    let listener_key = listener.key();
+    for route in &proxy.routes {
+        let applies = route.listener.as_ref().is_none_or(|route_listener| {
+            route_listener == &listener_key || route_listener == &configured_key
+        });
+        if applies {
+            groups.insert(route.upstream_group.clone());
+        }
+    }
+    groups
+}
+
+fn proxy_self_addrs_for_listener(
+    sip: &SipConfig,
+    listener: &ProxyListenerConfig,
+) -> Vec<(&'static str, SocketAddr)> {
+    let default_port = listener_port(listener);
+    let mut addrs = Vec::new();
+    for (source, value) in [
+        ("sip.external_addr", sip.external_addr.as_deref()),
+        ("sip.public_addr", sip.public_addr.as_deref()),
+        ("sip.internal_addr", sip.internal_addr.as_deref()),
+    ] {
+        if let Some(value) = value.and_then(|value| parse_ip_socket_addr(value, default_port)) {
+            addrs.push((source, value));
+        }
+    }
+    if let Ok(bind) = listener.bind.parse::<SocketAddr>()
+        && !bind.ip().is_unspecified()
+    {
+        addrs.push(("listener.bind", bind));
+    }
+    addrs
+}
+
+fn parse_ip_socket_addr(value: &str, default_port: u16) -> Option<SocketAddr> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    if let Some((host, port)) = split_host_port(value) {
+        let ip = host.trim_matches(['[', ']']).parse::<IpAddr>().ok()?;
+        let port = port.parse::<u16>().ok()?;
+        return Some(SocketAddr::new(ip, port));
+    }
+    let ip = value.trim_matches(['[', ']']).parse::<IpAddr>().ok()?;
+    Some(SocketAddr::new(ip, default_port))
+}
+
+fn listener_port(listener: &ProxyListenerConfig) -> u16 {
+    listener
+        .bind
+        .parse::<SocketAddr>()
+        .map(|addr| addr.port())
+        .unwrap_or(5060)
 }
 
 fn validate_security_config(config: &ProxySecurityConfig, path: &str) -> Result<()> {
@@ -2977,6 +3088,49 @@ literal = "$-not-a-placeholder"
         config.proxy.upstream_groups[0].servers = vec!["edge0.example.com:5060".to_string()];
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_upstream_server_matching_internal_addr() {
+        let mut config = Config {
+            sip: SipConfig {
+                internal_addr: Some("172.30.0.254".to_string()),
+                ..SipConfig::default()
+            },
+            ..Config::default()
+        };
+        config.proxy.listeners[0].bind = "0.0.0.0:5060".to_string();
+        config.proxy.upstream_groups[0].servers = vec!["172.30.0.254:5060".to_string()];
+
+        let err = config.validate().unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("points back to this proxy listener")
+        );
+    }
+
+    #[test]
+    fn rejects_route_upstream_server_matching_listener_bind() {
+        let mut config = Config::default();
+        config.proxy.listeners[0].bind = "127.0.0.1:5060".to_string();
+        config.proxy.upstream_groups.push(UpstreamGroupConfig {
+            name: "loop".to_string(),
+            mode: UpstreamMode::RoundRobin,
+            health_check: UpstreamHealthCheckConfig::default(),
+            servers: vec!["127.0.0.1:5060".to_string()],
+        });
+        config.proxy.routes.push(RouteConfig {
+            name: "loop-route".to_string(),
+            listener: None,
+            domain: Some("example.com".to_string()),
+            prefix: None,
+            upstream_group: "loop".to_string(),
+        });
+
+        let err = config.validate().unwrap_err();
+
+        assert!(err.to_string().contains("listener.bind"));
     }
 
     #[test]
