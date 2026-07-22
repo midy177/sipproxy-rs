@@ -96,6 +96,12 @@ impl Config {
         if matches!(self.proxy.socket.send_buffer_bytes, Some(0)) {
             bail!("proxy.socket.send_buffer_bytes must be greater than 0 when set");
         }
+        if self.proxy.socket.udp_handler_workers_per_socket == 0 {
+            bail!("proxy.socket.udp_handler_workers_per_socket must be greater than 0");
+        }
+        if self.proxy.socket.udp_handler_queue_size == 0 {
+            bail!("proxy.socket.udp_handler_queue_size must be greater than 0");
+        }
         if self.proxy.metrics.enabled {
             self.proxy
                 .metrics
@@ -2013,6 +2019,10 @@ pub struct ProxySocketConfig {
     pub reuse_port: bool,
     #[serde(default = "default_workers_per_listener")]
     pub workers_per_listener: usize,
+    #[serde(default = "default_udp_handler_workers_per_socket")]
+    pub udp_handler_workers_per_socket: usize,
+    #[serde(default = "default_udp_handler_queue_size")]
+    pub udp_handler_queue_size: usize,
     #[serde(default)]
     pub recv_buffer_bytes: Option<usize>,
     #[serde(default)]
@@ -2026,6 +2036,8 @@ impl Default for ProxySocketConfig {
         Self {
             reuse_port: false,
             workers_per_listener: default_workers_per_listener(),
+            udp_handler_workers_per_socket: default_udp_handler_workers_per_socket(),
+            udp_handler_queue_size: default_udp_handler_queue_size(),
             recv_buffer_bytes: None,
             send_buffer_bytes: None,
             tcp_nodelay: default_tcp_nodelay(),
@@ -2045,6 +2057,14 @@ impl ProxySocketConfig {
 
 fn default_workers_per_listener() -> usize {
     1
+}
+
+fn default_udp_handler_workers_per_socket() -> usize {
+    1
+}
+
+fn default_udp_handler_queue_size() -> usize {
+    4096
 }
 
 fn default_tcp_nodelay() -> bool {
@@ -2459,6 +2479,8 @@ register_routing = "path"
 [proxy.socket]
 reuse_port = false
 workers_per_listener = 1
+udp_handler_workers_per_socket = 1
+udp_handler_queue_size = 4096
 recv_buffer_bytes = 4194304
 send_buffer_bytes = 4194304
 tcp_nodelay = true
@@ -3056,6 +3078,36 @@ literal = "$-not-a-placeholder"
                 socket: ProxySocketConfig {
                     workers_per_listener: 0,
                     reuse_port: false,
+                    ..ProxySocketConfig::default()
+                },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_udp_handler_workers_per_socket() {
+        let config = Config {
+            proxy: ProxyConfig {
+                socket: ProxySocketConfig {
+                    udp_handler_workers_per_socket: 0,
+                    ..ProxySocketConfig::default()
+                },
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_udp_handler_queue_size() {
+        let config = Config {
+            proxy: ProxyConfig {
+                socket: ProxySocketConfig {
+                    udp_handler_queue_size: 0,
                     ..ProxySocketConfig::default()
                 },
                 ..ProxyConfig::default()

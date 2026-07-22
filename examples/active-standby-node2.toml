@@ -26,6 +26,8 @@ udp_client_transaction_cache_entries = 65536
 [proxy.socket]
 reuse_port = false
 workers_per_listener = 1
+udp_handler_workers_per_socket = 1
+udp_handler_queue_size = 4096
 recv_buffer_bytes = 4194304
 send_buffer_bytes = 4194304
 tcp_nodelay = true

@@ -162,6 +162,11 @@ struct UdpClientTransactionRef<'a> {
     request_started_at: Instant,
 }
 
+struct UdpPacket {
+    packet: Vec<u8>,
+    peer: SocketAddr,
+}
+
 struct ProxyMetricHandles {
     sip_requests: [[CounterHandle; METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT],
     forwarded_requests:
@@ -171,6 +176,7 @@ struct ProxyMetricHandles {
     upstream_responses: [[CounterHandle; METRIC_STATUS_CLASS_COUNT]; METRIC_TRANSPORT_COUNT],
     affinity_lookups: [CounterHandle; METRIC_AFFINITY_LOOKUP_RESULT_COUNT],
     security_drops: HashMap<String, [CounterHandle; METRIC_SECURITY_DROP_REASON_COUNT]>,
+    udp_handler_queue_drops: HashMap<String, CounterHandle>,
     upstream_response_latency_buckets: [[[[CounterHandle; UPSTREAM_RESPONSE_LATENCY_MS_BUCKET_COUNT];
         METRIC_METHOD_COUNT]; METRIC_TRANSPORT_COUNT];
         METRIC_TRANSPORT_COUNT],
@@ -183,6 +189,7 @@ struct ProxyMetricHandles {
 impl ProxyMetricHandles {
     fn new(metrics: &ProxyMetrics, config: &ProxyConfig) -> Self {
         let mut security_drops = HashMap::new();
+        let mut udp_handler_queue_drops = HashMap::new();
         for configured_listener in &config.listeners {
             for listener in configured_listener.concrete_listeners() {
                 let listener_key = listener.key();
@@ -197,6 +204,13 @@ impl ProxyMetricHandles {
                             ],
                         )
                     }),
+                );
+                udp_handler_queue_drops.insert(
+                    listener_key.clone(),
+                    metrics.counter(
+                        "proxy_udp_handler_queue_drops_total",
+                        &[("listener", listener_key.as_str())],
+                    ),
                 );
             }
         }
@@ -262,6 +276,7 @@ impl ProxyMetricHandles {
                 )
             }),
             security_drops,
+            udp_handler_queue_drops,
             upstream_response_latency_buckets: std::array::from_fn(|downstream| {
                 std::array::from_fn(|upstream| {
                     std::array::from_fn(|method| {
@@ -800,6 +815,8 @@ impl ProxyServer {
             affinity_ttl_seconds = self.config.proxy.affinity.ttl_seconds,
             reuse_port = self.config.proxy.socket.reuse_port,
             workers_per_listener = self.config.proxy.socket.resolved_workers_per_listener(),
+            udp_handler_workers_per_socket = self.config.proxy.socket.udp_handler_workers_per_socket,
+            udp_handler_queue_size = self.config.proxy.socket.udp_handler_queue_size,
             "SIP listener runtime config resolved"
         );
     }
@@ -825,6 +842,42 @@ impl ProxyServer {
     ) -> Result<()> {
         let mut buf = vec![0; self.config.sip.max_message_bytes];
         let listener = Arc::new(listener);
+        let handler_workers = self.config.proxy.socket.udp_handler_workers_per_socket;
+        let queue_size = self.config.proxy.socket.udp_handler_queue_size;
+        let queue_size_per_worker = queue_size.div_ceil(handler_workers).max(1);
+        let mut handlers = Vec::with_capacity(handler_workers);
+        for worker in 0..handler_workers {
+            let (tx, mut rx) = mpsc::channel::<UdpPacket>(queue_size_per_worker);
+            let this = self.clone();
+            let socket = socket.clone();
+            let listener = listener.clone();
+            tokio::spawn(async move {
+                while let Some(UdpPacket { packet, peer }) = rx.recv().await {
+                    if let Err(err) = this
+                        .handle_udp_packet(&socket, &packet, peer, &listener)
+                        .await
+                    {
+                        warn!(
+                            %peer,
+                            bytes = packet.len(),
+                            preview = %packet_preview(&packet),
+                            error = %err,
+                            worker,
+                            "failed to handle UDP SIP packet"
+                        );
+                    }
+                }
+            });
+            handlers.push(tx);
+        }
+        let mut next_handler = 0;
+        info!(
+            bind = %listener.bind,
+            transport = %listener.transport.as_str(),
+            handler_workers,
+            queue_size,
+            "SIP UDP handler workers started"
+        );
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -839,20 +892,31 @@ impl ProxyServer {
                         }
                     };
                     let packet = buf[..len].to_vec();
-                    let this = self.clone();
-                    let socket = socket.clone();
-                    let listener = listener.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = this.handle_udp_packet(&socket, &packet, peer, &listener).await {
+                    let handler_index = next_handler;
+                    next_handler = (next_handler + 1) % handlers.len();
+                    match handlers[handler_index].try_send(UdpPacket { packet, peer }) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(UdpPacket { packet, peer })) => {
+                            self.record_udp_handler_queue_drop(&listener);
                             warn!(
                                 %peer,
                                 bytes = packet.len(),
                                 preview = %packet_preview(&packet),
-                                error = %err,
-                                "failed to handle UDP SIP packet"
+                                handler_index,
+                                "dropping UDP SIP packet because handler queue is full"
                             );
                         }
-                    });
+                        Err(mpsc::error::TrySendError::Closed(UdpPacket { packet, peer })) => {
+                            self.record_udp_handler_queue_drop(&listener);
+                            warn!(
+                                %peer,
+                                bytes = packet.len(),
+                                preview = %packet_preview(&packet),
+                                handler_index,
+                                "dropping UDP SIP packet because handler queue is closed"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2285,6 +2349,23 @@ impl ProxyServer {
         self.metrics.incr(
             "proxy_forward_errors_total",
             &[("downstream_transport", downstream_transport)],
+        );
+    }
+
+    fn record_udp_handler_queue_drop(&self, listener: &ProxyListenerConfig) {
+        let listener_key = listener.key();
+        if let Some(counter) = self
+            .metric_handles
+            .udp_handler_queue_drops
+            .get(listener_key.as_str())
+        {
+            counter.incr();
+            return;
+        }
+
+        self.metrics.incr(
+            "proxy_udp_handler_queue_drops_total",
+            &[("listener", listener_key.as_str())],
         );
     }
 
