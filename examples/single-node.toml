@@ -43,7 +43,8 @@ ttl_seconds = 3600
 # Public is the recommended baseline for an internet-facing UDP listener.
 # Use "off" only for private lab deployments.
 preset = "public"
-trusted_cidrs = ["172.30.0.0/16"]
+# Keep this to exact PBX/backend IPs; do not include the phone subnet.
+trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
 
 [proxy.security.geo]
 enabled = true

@@ -1225,7 +1225,7 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
-        if self.user_space_security_enabled {
+        if self.user_space_security_enabled && !self.upstreams.contains(peer) {
             match self.security.check_packet(listener, peer, packet).await {
                 SecurityDecision::Allow => {}
                 SecurityDecision::Drop(reason) => {
@@ -1258,7 +1258,7 @@ impl ProxyServer {
             debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
             return Ok(());
         }
-        if self.user_space_security_enabled {
+        if self.user_space_security_enabled && !self.upstreams.contains(peer) {
             if let Some(reason) = self
                 .security
                 .check_sip_request(listener, peer, &message, method)
@@ -1553,7 +1553,7 @@ impl ProxyServer {
         if method != "INVITE" {
             return None;
         }
-        if self.upstreams.contains(peer) || self.security.is_trusted_peer(listener, peer.ip()) {
+        if self.upstreams.contains(peer) {
             return None;
         }
         let policy = self
@@ -3171,11 +3171,6 @@ impl SecurityRuntime {
             .is_some_and(|runtime| runtime.config.enabled())
     }
 
-    fn is_trusted_peer(&self, listener: &ProxyListenerConfig, ip: IpAddr) -> bool {
-        self.listener(listener)
-            .is_some_and(|runtime| runtime.is_trusted(ip))
-    }
-
     async fn check_packet(
         &self,
         listener: &ProxyListenerConfig,
@@ -3195,13 +3190,12 @@ impl SecurityRuntime {
         if !runtime.is_allowed(peer.ip()) {
             return SecurityDecision::Drop("not-allowed-cidr");
         }
-        if runtime.is_trusted(peer.ip()) {
-            return SecurityDecision::Allow;
-        }
-
         let block_key = ip_security_key("block", listener_key.as_str(), peer.ip());
         if self.is_blocked(&block_key).await {
             return SecurityDecision::Drop("ip-blocked");
+        }
+        if runtime.is_trusted(peer.ip()) {
+            return SecurityDecision::Allow;
         }
 
         match evaluate_geo_policy(&runtime.geo_policy, self.geo.as_ref(), peer.ip()) {
@@ -3303,7 +3297,7 @@ impl SecurityRuntime {
         let Some(runtime) = self.listener_by_key(&listener_key) else {
             return SecurityDecision::Allow;
         };
-        if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
+        if !runtime.config.enabled() {
             return SecurityDecision::Allow;
         }
 
@@ -3347,7 +3341,7 @@ impl SecurityRuntime {
         let offense = offense?;
         let listener_key = listener.key();
         let runtime = self.listener_by_key(&listener_key)?;
-        if !runtime.config.dynamic_ban.enabled || runtime.is_trusted(peer.ip()) {
+        if !runtime.config.dynamic_ban.enabled {
             return None;
         }
         let dynamic_ban = &runtime.config.dynamic_ban;
@@ -3356,6 +3350,9 @@ impl SecurityRuntime {
             DynamicOffense::ParseError => dynamic_ban.parse_errors_per_minute,
             DynamicOffense::SipRateViolation => dynamic_ban.sip_rate_violations_per_minute,
         };
+        if runtime.is_trusted(peer.ip()) && !matches!(offense, DynamicOffense::SipRateViolation) {
+            return None;
+        }
         if per_minute == 0 {
             return None;
         }
@@ -3422,7 +3419,7 @@ impl SecurityRuntime {
         }
         let listener_key = listener.key();
         let runtime = self.listener_by_key(&listener_key)?;
-        if !runtime.config.enabled() || runtime.is_trusted(peer.ip()) {
+        if !runtime.config.enabled() {
             return None;
         }
         let sip_rate = &runtime.config.sip_rate_limit;
@@ -6300,6 +6297,125 @@ Content-Length: 0\r\n\r\n"
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn trusted_cidr_udp_sip_policy_rejects_unregistered_invite_source() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                trusted_cidrs: Some(vec!["127.0.0.0/8".to_string()]),
+                sip_policy: ProxySipPolicyConfig {
+                    require_registered_invite_source: Some(true),
+                    ..ProxySipPolicyConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        let invite = format!(
+            "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-trusted-unregistered-invite;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: trusted-unregistered-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut upstream_buf = [0_u8; 4096];
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut upstream_buf)
+            )
+            .await
+            .is_err()
+        );
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 403 Forbidden"));
+        assert!(response.contains(&format!("rport={}", client_addr.port())));
+    }
+
+    #[tokio::test]
+    async fn trusted_cidr_udp_sip_rate_limit_returns_503() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_socket.local_addr().unwrap();
+        let server = test_server_with_security(
+            upstream_socket.local_addr().unwrap(),
+            ProxySecurityConfig {
+                trusted_cidrs: Some(vec!["127.0.0.0/8".to_string()]),
+                preset: Some(ProxySecurityPreset::Public),
+                sip_rate_limit: ProxySipRateLimitConfig {
+                    invite_per_minute_per_aor: Some(1),
+                    ..ProxySipRateLimitConfig::default()
+                },
+                ..ProxySecurityConfig::default()
+            },
+        );
+
+        for branch in [
+            "z9hG4bK-trusted-security-invite-a",
+            "z9hG4bK-trusted-security-invite-b",
+        ] {
+            let invite = format!(
+                "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch={branch};rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: {branch}\r\n\
+CSeq: 1 INVITE\r\n\
+Content-Length: 0\r\n\r\n"
+            );
+            server
+                .handle_udp_packet(
+                    &proxy_socket,
+                    invite.as_bytes(),
+                    client_addr,
+                    &test_listener(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut upstream_buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut upstream_buf).await.unwrap();
+        let forwarded = String::from_utf8(upstream_buf[..len].to_vec()).unwrap();
+        assert!(forwarded.contains("z9hG4bK-trusted-security-invite-a"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut upstream_buf)
+            )
+            .await
+            .is_err()
+        );
+
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 503 Service Unavailable"));
+        assert!(response.contains(&format!("rport={}", client_addr.port())));
     }
 
     #[tokio::test]

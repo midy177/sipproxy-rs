@@ -17,7 +17,8 @@ Global defaults live under `[proxy.security]`:
 ```toml
 [proxy.security]
 preset = "public"
-trusted_cidrs = ["172.30.0.0/16"]
+# Exact PBX/backend addresses only; do not include the phone/client subnet.
+trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
 deny_cidrs = []
 allow_cidrs = []
 
@@ -66,7 +67,7 @@ upstream_group = "default"
 
 [proxy.listeners.security]
 preset = "strict"
-trusted_cidrs = ["172.30.0.0/16"]
+trusted_cidrs = ["172.30.12.228/32", "172.30.11.57/32"]
 ```
 
 Preset values are `off`, `trusted`, `public`, and `strict`. Without an explicit
@@ -109,7 +110,9 @@ For UDP packets:
 
 1. Ignore CRLF keepalive and handle STUN before SIP security checks.
 2. Apply listener CIDR rules: deny, allow, trusted. `deny_cidrs` has the
-   highest priority when ranges overlap.
+   highest priority when ranges overlap. Trusted CIDRs skip packet-level
+   geo/threat/flood checks only; non-upstream clients still pass SIP identity
+   policy, SIP method rate limits, and SIP dynamic bans.
 3. Apply per-listener per-IP packet token bucket.
 4. Apply per-listener geo allow/deny using the in-memory binary range snapshot.
 5. Drop invalid or non-SIP start lines when prefiltering is enabled.

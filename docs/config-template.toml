@@ -117,10 +117,11 @@ ttl_seconds = 3600
 # - "strict": tighter limits for exposed listeners under attack.
 preset = "off"
 
-# CIDR lists are evaluated before rate limits. Exact IPs are allowed too.
+# CIDR lists are evaluated before packet-level rate limits. Keep trusted_cidrs
+# to exact PBX/backend IPs; do not include broad phone/client subnets.
 # deny_cidrs = ["203.0.113.10", "198.51.100.0/24"]
 # allow_cidrs = []
-# trusted_cidrs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+# trusted_cidrs = ["10.0.1.10/32", "10.0.1.11/32"]
 
 # Optional overrides for the selected preset.
 # [proxy.security.geo]
