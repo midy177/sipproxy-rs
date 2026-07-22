@@ -68,10 +68,11 @@ reuse_port = false
 # to use the host CPU count.
 workers_per_listener = 1
 
-# Number of fixed UDP handler workers behind each UDP socket. Raising this can
-# reduce head-of-line blocking when UDP handling waits on shared state or TCP
-# upstreams, without creating one Tokio task per packet.
-udp_handler_workers_per_socket = 1
+# Number of fixed UDP handler workers behind each UDP socket. Set 0 to use the
+# host CPU count capped at 16. Raising this can reduce head-of-line blocking
+# when UDP handling waits on shared state or TCP upstreams, without creating one
+# Tokio task per packet.
+udp_handler_workers_per_socket = 0
 
 # Maximum queued UDP packets per socket before sigproxy drops new packets and
 # increments proxy_udp_handler_queue_drops_total.

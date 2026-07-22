@@ -840,7 +840,7 @@ impl ProxyServer {
             affinity_ttl_seconds = self.config.proxy.affinity.ttl_seconds,
             reuse_port = self.config.proxy.socket.reuse_port,
             workers_per_listener = self.config.proxy.socket.resolved_workers_per_listener(),
-            udp_handler_workers_per_socket = self.config.proxy.socket.udp_handler_workers_per_socket,
+            udp_handler_workers_per_socket = self.config.proxy.socket.resolved_udp_handler_workers_per_socket(),
             udp_handler_queue_size = self.config.proxy.socket.udp_handler_queue_size,
             "SIP listener runtime config resolved"
         );
@@ -867,7 +867,11 @@ impl ProxyServer {
     ) -> Result<()> {
         let mut buf = vec![0; self.config.sip.max_message_bytes];
         let listener = Arc::new(listener);
-        let handler_workers = self.config.proxy.socket.udp_handler_workers_per_socket;
+        let handler_workers = self
+            .config
+            .proxy
+            .socket
+            .resolved_udp_handler_workers_per_socket();
         let queue_size = self.config.proxy.socket.udp_handler_queue_size;
         let queue_size_per_worker = queue_size.div_ceil(handler_workers).max(1);
         let mut handlers = Vec::with_capacity(handler_workers);

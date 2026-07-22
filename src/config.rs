@@ -96,9 +96,6 @@ impl Config {
         if matches!(self.proxy.socket.send_buffer_bytes, Some(0)) {
             bail!("proxy.socket.send_buffer_bytes must be greater than 0 when set");
         }
-        if self.proxy.socket.udp_handler_workers_per_socket == 0 {
-            bail!("proxy.socket.udp_handler_workers_per_socket must be greater than 0");
-        }
         if self.proxy.socket.udp_handler_queue_size == 0 {
             bail!("proxy.socket.udp_handler_queue_size must be greater than 0");
         }
@@ -2053,6 +2050,16 @@ impl ProxySocketConfig {
             self.workers_per_listener
         }
     }
+
+    pub fn resolved_udp_handler_workers_per_socket(&self) -> usize {
+        if self.udp_handler_workers_per_socket == 0 {
+            std::thread::available_parallelism()
+                .map_or(1, usize::from)
+                .clamp(1, 16)
+        } else {
+            self.udp_handler_workers_per_socket
+        }
+    }
 }
 
 fn default_workers_per_listener() -> usize {
@@ -2060,7 +2067,7 @@ fn default_workers_per_listener() -> usize {
 }
 
 fn default_udp_handler_workers_per_socket() -> usize {
-    1
+    0
 }
 
 fn default_udp_handler_queue_size() -> usize {
@@ -2479,7 +2486,7 @@ register_routing = "path"
 [proxy.socket]
 reuse_port = false
 workers_per_listener = 1
-udp_handler_workers_per_socket = 1
+udp_handler_workers_per_socket = 0
 udp_handler_queue_size = 4096
 recv_buffer_bytes = 4194304
 send_buffer_bytes = 4194304
@@ -3088,7 +3095,7 @@ literal = "$-not-a-placeholder"
     }
 
     #[test]
-    fn rejects_zero_udp_handler_workers_per_socket() {
+    fn allows_auto_udp_handler_workers_per_socket() {
         let config = Config {
             proxy: ProxyConfig {
                 socket: ProxySocketConfig {
@@ -3099,7 +3106,14 @@ literal = "$-not-a-placeholder"
             },
             ..Config::default()
         };
-        assert!(config.validate().is_err());
+        config.validate().unwrap();
+        assert!(
+            config
+                .proxy
+                .socket
+                .resolved_udp_handler_workers_per_socket()
+                >= 1
+        );
     }
 
     #[test]
