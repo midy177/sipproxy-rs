@@ -132,6 +132,7 @@ pub struct ProxyServer {
     persistence: Option<Persistence>,
     routes: ArcSwap<RouteTable>,
     upstreams: UpstreamGroups,
+    upstream_sources: UpstreamSources,
     affinity: AffinityTable,
     security: Arc<SecurityRuntime>,
     user_space_security_enabled: bool,
@@ -393,6 +394,8 @@ impl ProxyServer {
         let routes = RouteTable::new(&config.proxy).context("failed to build proxy route table")?;
         let upstreams = UpstreamGroups::new(&config.proxy.upstream_groups)
             .context("failed to build upstream groups")?;
+        let upstream_sources = UpstreamSources::new(&config.proxy.upstream_source_cidrs)
+            .context("failed to build upstream source CIDR matcher")?;
         let max_message_bytes = config.sip.max_message_bytes;
         let affinity_config = config.proxy.affinity.clone();
         let security_config =
@@ -409,6 +412,7 @@ impl ProxyServer {
             persistence,
             routes: ArcSwap::from_pointee(routes),
             upstreams,
+            upstream_sources,
             affinity: AffinityTable::new(affinity_config),
             security,
             user_space_security_enabled,
@@ -432,6 +436,10 @@ impl ProxyServer {
 
     pub fn has_persistence(&self) -> bool {
         self.persistence.is_some()
+    }
+
+    fn is_upstream_source(&self, peer: SocketAddr) -> bool {
+        self.upstreams.contains(peer) || self.upstream_sources.contains(peer)
     }
 
     pub async fn run(self: Arc<Self>, shutdown: watch::Receiver<bool>) -> Result<()> {
@@ -1227,7 +1235,7 @@ impl ProxyServer {
         peer: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Result<()> {
-        if self.user_space_security_enabled && !self.upstreams.contains(peer) {
+        if self.user_space_security_enabled && !self.is_upstream_source(peer) {
             match self.security.check_packet(listener, peer, packet).await {
                 SecurityDecision::Allow => {}
                 SecurityDecision::Drop(reason) => {
@@ -1260,7 +1268,7 @@ impl ProxyServer {
             debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
             return Ok(());
         }
-        if self.user_space_security_enabled && !self.upstreams.contains(peer) {
+        if self.user_space_security_enabled && !self.is_upstream_source(peer) {
             if let Some(reason) = self
                 .security
                 .check_sip_request(listener, peer, &message, method)
@@ -1358,7 +1366,7 @@ impl ProxyServer {
             return Ok(());
         }
 
-        if self.user_space_security_enabled {
+        if self.user_space_security_enabled && !self.is_upstream_source(peer) {
             match self.security.check_packet(listener, peer, packet).await {
                 SecurityDecision::Allow => {}
                 SecurityDecision::Drop(reason) => {
@@ -1390,7 +1398,7 @@ impl ProxyServer {
             debug!(%peer, listener = %listener.key(), "absorbed ACK for locally rejected INVITE");
             return Ok(());
         }
-        if self.user_space_security_enabled {
+        if self.user_space_security_enabled && !self.is_upstream_source(peer) {
             if let Some(reason) = self
                 .security
                 .check_sip_request(listener, peer, &message, method)
@@ -1555,7 +1563,7 @@ impl ProxyServer {
         if method != "INVITE" {
             return None;
         }
-        if self.upstreams.contains(peer) {
+        if self.is_upstream_source(peer) {
             return None;
         }
         let policy = self
@@ -1835,7 +1843,7 @@ impl ProxyServer {
             .request_uri()
             .context("request forwarding requires a request URI")?
             .to_string();
-        let from_upstream = self.upstreams.contains(_peer);
+        let from_upstream = self.is_upstream_source(_peer);
         let route_set_targets_this_proxy = if from_upstream {
             self.top_route_targets_this_proxy(&message, listener, _peer)
                 .await?
@@ -2198,7 +2206,7 @@ impl ProxyServer {
         target: SocketAddr,
         listener: &ProxyListenerConfig,
     ) -> Vec<String> {
-        let from_upstream = self.upstreams.contains(peer);
+        let from_upstream = self.is_upstream_source(peer);
         let to_upstream = self.upstreams.contains(target);
         if from_upstream == to_upstream {
             let side = if to_upstream {
@@ -2976,6 +2984,10 @@ struct UpstreamGroups {
     servers_by_addr: HashMap<SocketAddr, Vec<UpstreamServerRef>>,
 }
 
+struct UpstreamSources {
+    cidrs: Vec<Cidr>,
+}
+
 #[derive(Clone)]
 struct UpstreamServerRef {
     group: Arc<UpstreamGroupRuntime>,
@@ -3058,7 +3070,12 @@ fn proxy_config_with_automatic_upstream_trusted_cidrs(
     config: &ProxyConfig,
     upstreams: &UpstreamGroups,
 ) -> ProxyConfig {
-    let automatic = upstreams.automatic_trusted_cidrs();
+    let mut automatic = upstreams.automatic_trusted_cidrs();
+    for cidr in &config.upstream_source_cidrs {
+        if !automatic.iter().any(|existing| existing == cidr) {
+            automatic.push(cidr.clone());
+        }
+    }
     if automatic.is_empty() {
         return config.clone();
     }
@@ -4236,6 +4253,18 @@ impl UpstreamGroups {
             .values()
             .flat_map(|group| group.health_snapshots())
             .collect()
+    }
+}
+
+impl UpstreamSources {
+    fn new(cidrs: &[String]) -> Result<Self> {
+        Ok(Self {
+            cidrs: parse_cidrs(cidrs)?,
+        })
+    }
+
+    fn contains(&self, peer: SocketAddr) -> bool {
+        self.cidrs.iter().any(|cidr| cidr.contains(peer.ip()))
     }
 }
 
@@ -5860,6 +5889,7 @@ mod tests {
             affinity: Default::default(),
             security,
             listeners,
+            upstream_source_cidrs: Vec::new(),
             upstream_groups: vec![UpstreamGroupConfig {
                 name: "default".to_string(),
                 mode: UpstreamMode::RoundRobin,
@@ -5901,8 +5931,11 @@ mod tests {
             trusted_cidrs: Some(vec!["192.0.2.10/32".to_string()]),
             ..ProxySecurityConfig::default()
         });
-        let config =
+        let mut config =
             test_proxy_config_with_security(ProxySecurityConfig::default(), vec![listener]);
+        config
+            .upstream_source_cidrs
+            .push("198.51.100.0/24".to_string());
         let upstreams = UpstreamGroups::new(&config.upstream_groups).unwrap();
         let merged = proxy_config_with_automatic_upstream_trusted_cidrs(&config, &upstreams);
         let effective = merged.effective_security_for_listener(&merged.listeners[0]);
@@ -5916,6 +5949,11 @@ mod tests {
             effective
                 .trusted_cidrs
                 .contains(&"192.0.2.10/32".to_string())
+        );
+        assert!(
+            effective
+                .trusted_cidrs
+                .contains(&"198.51.100.0/24".to_string())
         );
     }
 
@@ -5958,6 +5996,55 @@ mod tests {
         test_server_with_upstream_config(upstream, false)
     }
 
+    fn test_server_with_upstream_sources(
+        upstream: SocketAddr,
+        upstream_source_cidrs: Vec<String>,
+    ) -> ProxyServer {
+        let state = Arc::new(SharedState::default());
+        let replicator = Arc::new(StandaloneReplicator::new(state.clone(), None));
+        ProxyServer::new(
+            Config {
+                sip: SipConfig {
+                    external_addr: Some("127.0.0.1:5060".to_string()),
+                    internal_probe_addr: upstream.to_string(),
+                    ..SipConfig::default()
+                },
+                proxy: ProxyConfig {
+                    record_route: true,
+                    register_routing: None,
+                    rewrite_register_contact: false,
+                    udp_client_transaction_cache_entries: 65_536,
+                    socket: ProxySocketConfig::default(),
+                    metrics: Default::default(),
+                    affinity: Default::default(),
+                    security: ProxySecurityConfig {
+                        sip_policy: ProxySipPolicyConfig {
+                            require_registered_invite_source: Some(true),
+                            registered_invite_source_match: Some(
+                                ProxyRegisteredInviteSourceMatch::Ip,
+                            ),
+                        },
+                        ..ProxySecurityConfig::default()
+                    },
+                    listeners: vec![test_listener()],
+                    upstream_source_cidrs,
+                    upstream_groups: vec![UpstreamGroupConfig {
+                        name: "default".to_string(),
+                        mode: UpstreamMode::RoundRobin,
+                        health_check: UpstreamHealthCheckConfig::default(),
+                        servers: vec![upstream.to_string()],
+                    }],
+                    routes: vec![],
+                },
+                ..Config::default()
+            },
+            state,
+            replicator,
+            None,
+        )
+        .unwrap()
+    }
+
     fn test_server_with_upstream_config(
         upstream: SocketAddr,
         rewrite_register_contact: bool,
@@ -5981,6 +6068,7 @@ mod tests {
                     affinity: Default::default(),
                     security: Default::default(),
                     listeners: vec![test_listener()],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -6024,6 +6112,7 @@ mod tests {
                     affinity: Default::default(),
                     security: Default::default(),
                     listeners: vec![test_listener()],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -6059,6 +6148,7 @@ mod tests {
                         ..ProxySecurityConfig::default()
                     },
                     listeners: vec![test_wildcard_listener()],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -6099,6 +6189,7 @@ mod tests {
                     affinity: Default::default(),
                     security: Default::default(),
                     listeners: vec![test_listener()],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -6142,6 +6233,7 @@ mod tests {
                     affinity,
                     security: Default::default(),
                     listeners: vec![test_listener()],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -6190,6 +6282,7 @@ mod tests {
                     affinity: Default::default(),
                     security,
                     listeners: vec![listener],
+                    upstream_source_cidrs: Vec::new(),
                     upstream_groups: vec![UpstreamGroupConfig {
                         name: "default".to_string(),
                         mode: UpstreamMode::RoundRobin,
@@ -7965,6 +8058,84 @@ Content-Length: 0\r\n\r\n";
                 &proxy_socket,
                 invite.as_bytes(),
                 upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let (len, _) = registered_client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.starts_with("INVITE sip:3001@127.0.0.1:5060 SIP/2.0"));
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+        assert!(!forwarded.lines().any(|line| line.starts_with("Route:")));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_source_cidr_routes_to_registered_location_without_invite_policy_rejection() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let registered_client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream_sources(
+            upstream_socket.local_addr().unwrap(),
+            vec!["192.0.2.0/24".to_string()],
+        );
+        let registered_client_addr = registered_client_socket.local_addr().unwrap();
+        let register = format!(
+            "REGISTER sip:example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {registered_client_addr};branch=z9hG4bK-register-3001-source-cidr\r\n\
+From: <sip:3001@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Contact: <sip:3001@{registered_client_addr}>;expires=60\r\n\
+Call-ID: register-3001-source-cidr\r\n\
+CSeq: 1 REGISTER\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                register.as_bytes(),
+                registered_client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_register = String::from_utf8(buf[..len].to_vec()).unwrap();
+        complete_register_ok(
+            &server,
+            &proxy_socket,
+            upstream_socket.local_addr().unwrap(),
+            &forwarded_register,
+            &format!("sip:3001@{registered_client_addr}"),
+            60,
+        )
+        .await;
+        let _ = registered_client_socket.recv_from(&mut buf).await.unwrap();
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                b"INVITE sip:3001@127.0.0.1:5060 SIP/2.0\r\n\
+Route: <sip:127.0.0.1:5060;lr>\r\n\
+Via: SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-upstream-source-cidr\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:3000@example.com>;tag=a\r\n\
+To: <sip:3001@example.com>\r\n\
+Call-ID: upstream-source-cidr-invite\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:3000@example.com>\r\n\
+Content-Length: 0\r\n\r\n",
+                "192.0.2.10:5060".parse().unwrap(),
                 &test_listener(),
             )
             .await

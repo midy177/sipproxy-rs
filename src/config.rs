@@ -109,6 +109,10 @@ impl Config {
         if self.proxy.affinity.enabled && self.proxy.affinity.ttl_seconds == 0 {
             bail!("proxy.affinity.ttl_seconds must be greater than 0 when affinity is enabled");
         }
+        for cidr in &self.proxy.upstream_source_cidrs {
+            validate_cidr(cidr)
+                .with_context(|| format!("proxy.upstream_source_cidrs contains '{cidr}'"))?;
+        }
         validate_security_config(&self.proxy.security, "proxy.security")?;
         if self.proxy.register_routing == Some(RegisterRoutingMode::Path)
             && self.proxy.rewrite_register_contact
@@ -957,6 +961,8 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub listeners: Vec<ProxyListenerConfig>,
     #[serde(default)]
+    pub upstream_source_cidrs: Vec<String>,
+    #[serde(default)]
     pub upstream_groups: Vec<UpstreamGroupConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
@@ -979,6 +985,7 @@ impl Default for ProxyConfig {
                 upstream_group: "default".to_string(),
                 security: None,
             }],
+            upstream_source_cidrs: Vec::new(),
             upstream_groups: vec![UpstreamGroupConfig {
                 name: "default".to_string(),
                 mode: UpstreamMode::RoundRobin,

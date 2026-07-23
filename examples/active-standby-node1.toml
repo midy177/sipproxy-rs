@@ -20,6 +20,9 @@ max_message_bytes = 65535
 record_route = true
 register_routing = "path"
 udp_client_transaction_cache_entries = 65536
+# Additional PBX/opensips-edge source networks that may send SIP requests back
+# to this proxy but are not selectable upstream load-balancing targets.
+upstream_source_cidrs = ["10.42.0.0/16"]
 # Legacy compatibility equivalent to register_routing = "contact-rewrite".
 # rewrite_register_contact = true
 
@@ -90,6 +93,9 @@ icmp_packets_per_second = 50
 icmp_burst = 100
 block_seconds = 300
 
+[proxy.security.ip_rate_limit]
+enabled = false
+
 [proxy.security.sip_policy]
 require_registered_invite_source = true
 registered_invite_source_match = "ip"
@@ -103,7 +109,7 @@ sync_dynamic_ban = true
 cidr_filter = true
 geo_filter = true
 threat_intel = true
-ip_rate_limit = true
+ip_rate_limit = false
 
 # Backends: 172.30.12.228 and 172.30.11.57, each serving several SIP ports.
 # One upstream group per backend port; the listener transport matches the

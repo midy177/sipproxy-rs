@@ -55,6 +55,12 @@ register_routing = "path"
 # memory during abnormal retransmission floods.
 udp_client_transaction_cache_entries = 65536
 
+# Additional PBX/edge source CIDRs that may send SIP requests back to this
+# proxy but are not selectable upstream load-balancing targets. Use this when
+# an upstream load balancer forwards to internal SIP nodes that reply from
+# different pod/node IPs.
+# upstream_source_cidrs = ["10.42.0.0/16"]
+
 # Legacy compatibility equivalent to register_routing = "contact-rewrite".
 # rewrite_register_contact = true
 

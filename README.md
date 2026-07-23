@@ -270,6 +270,19 @@ prefix = "sip:1"
 upstream_group = "pbx-a"
 ```
 
+If an upstream load balancer forwards to internal SIP nodes that send requests
+back from different source IPs, mark those sources without adding them as
+load-balancing targets:
+
+```toml
+[proxy]
+upstream_source_cidrs = ["10.42.0.0/16"]
+```
+
+These CIDRs are treated as upstream-side sources for request routing and are
+trusted for packet-level security, but they are not selected as upstream
+servers.
+
 Route selection order is:
 
 1. Match listener key.

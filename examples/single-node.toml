@@ -18,6 +18,9 @@ max_message_bytes = 65535
 record_route = true
 register_routing = "path"
 udp_client_transaction_cache_entries = 65536
+# Additional PBX/opensips-edge source networks that may send SIP requests back
+# to this proxy but are not selectable upstream load-balancing targets.
+upstream_source_cidrs = ["10.42.0.0/16"]
 # Legacy compatibility equivalent to register_routing = "contact-rewrite".
 # rewrite_register_contact = true
 

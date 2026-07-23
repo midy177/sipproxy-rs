@@ -15,6 +15,11 @@
 Global defaults live under `[proxy.security]`:
 
 ```toml
+[proxy]
+# Optional PBX/edge source CIDRs used only to identify upstream-side requests.
+# They are not selected as upstream load-balancing targets.
+upstream_source_cidrs = ["10.42.0.0/16"]
+
 [proxy.security]
 preset = "public"
 # Upstream PBX/backend IPs are trusted automatically from proxy.upstream_groups.

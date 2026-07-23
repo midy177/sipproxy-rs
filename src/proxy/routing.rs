@@ -153,6 +153,7 @@ mod tests {
                 upstream_group: "tenant-a".to_string(),
             }],
             listeners: vec![],
+            upstream_source_cidrs: vec![],
             upstream_groups: vec![],
         })
         .unwrap();
@@ -207,6 +208,7 @@ mod tests {
                 upstream_group: "default".to_string(),
                 security: None,
             }],
+            upstream_source_cidrs: vec![],
             upstream_groups: vec![],
         })
         .unwrap();
