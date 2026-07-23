@@ -157,13 +157,15 @@ struct UdpToTcpForward<'a> {
     branch: String,
     client_transaction_key: Option<String>,
     invite_transaction_key: Option<String>,
-    method: &'a str,
+    record_route_addrs: Vec<String>,
+    method: &'static str,
 }
 
 struct UdpClientTransactionRef<'a> {
     branch: &'a str,
     key: Option<&'a str>,
     request_started_at: Instant,
+    record_route_addrs: &'a [String],
 }
 
 #[derive(Debug)]
@@ -1162,6 +1164,11 @@ impl ProxyServer {
                 self.apply_register_response(transaction.branch, &response_message, *code)
                     .await;
             }
+            ensure_dialog_record_routes(
+                &mut response_message,
+                method,
+                transaction.record_route_addrs,
+            )?;
             response_message.apply_top_via_received_rport(client_peer)?;
             let response = response_message.to_bytes();
             if is_final && let Some(key) = transaction.key {
@@ -1536,6 +1543,7 @@ impl ProxyServer {
             );
             self.apply_register_response(&branch, &message, *code).await;
         }
+        ensure_dialog_record_routes(&mut message, route.method, &route.record_route_addrs)?;
         message
             .pop_top_via()?
             .context("upstream response is missing Via")?;
@@ -1650,7 +1658,7 @@ impl ProxyServer {
             return Ok(());
         }
 
-        let (message, target, branch, invite_transaction_key) = self
+        let (message, target, branch, invite_transaction_key, record_route_addrs) = self
             .prepare_forward(message, peer, listener, method)
             .await?;
 
@@ -1679,6 +1687,7 @@ impl ProxyServer {
                             created_at: now,
                             remove_on_final: method != "INVITE",
                             client_transaction_key: client_transaction_key.clone(),
+                            record_route_addrs: record_route_addrs.clone(),
                         },
                     );
                 }
@@ -1713,6 +1722,7 @@ impl ProxyServer {
                     branch,
                     client_transaction_key,
                     invite_transaction_key,
+                    record_route_addrs,
                     method,
                 })
                 .await
@@ -1732,13 +1742,20 @@ impl ProxyServer {
             branch,
             client_transaction_key,
             invite_transaction_key,
+            record_route_addrs,
             method,
         } = request;
         let packet = message.to_bytes();
         let request_started_at = Instant::now();
         let mut responses = match self
             .tcp_upstreams
-            .send_request(upstream, &branch, &packet)
+            .send_request(
+                upstream,
+                &branch,
+                &packet,
+                method,
+                record_route_addrs.clone(),
+            )
             .await
         {
             Ok(responses) => responses,
@@ -1769,6 +1786,7 @@ impl ProxyServer {
                 branch: &branch,
                 key: client_transaction_key.as_deref(),
                 request_started_at,
+                record_route_addrs: &record_route_addrs,
             },
             method,
         )
@@ -1783,7 +1801,7 @@ impl ProxyServer {
         listener: &ProxyListenerConfig,
         method: &'static str,
     ) -> Result<()> {
-        let (message, target, branch, invite_transaction_key) = self
+        let (message, target, branch, invite_transaction_key, record_route_addrs) = self
             .prepare_forward(message, peer, listener, method)
             .await?;
         self.record_forwarded_request("tcp", target.transport, Some(method));
@@ -1791,7 +1809,7 @@ impl ProxyServer {
         let request_started_at = Instant::now();
         let mut responses = match self
             .tcp_upstreams
-            .send_request(target.addr, &branch, &packet)
+            .send_request(target.addr, &branch, &packet, method, record_route_addrs)
             .await
         {
             Ok(responses) => responses,
@@ -1838,7 +1856,13 @@ impl ProxyServer {
         _peer: SocketAddr,
         listener: &ProxyListenerConfig,
         method: &str,
-    ) -> Result<(SipMessage, UpstreamTarget, String, Option<String>)> {
+    ) -> Result<(
+        SipMessage,
+        UpstreamTarget,
+        String,
+        Option<String>,
+        Vec<String>,
+    )> {
         let request_uri = message
             .request_uri()
             .context("request forwarding requires a request URI")?
@@ -1966,16 +1990,15 @@ impl ProxyServer {
             branch.clone(),
         )?;
 
-        if self.config.proxy.record_route && should_record_route(method) {
-            for addr in self
-                .record_route_addrs(_peer, target.addr, listener)
-                .await
-                .into_iter()
-                .rev()
-            {
-                message.prepend_record_route(&addr)?;
+        let record_route_addrs = if self.config.proxy.record_route && should_record_route(method) {
+            let addrs = self.record_route_addrs(_peer, target.addr, listener).await;
+            for addr in addrs.iter().rev() {
+                message.prepend_record_route(addr)?;
             }
-        }
+            addrs
+        } else {
+            Vec::new()
+        };
         if method == "REGISTER" {
             let pending_register = match self.config.proxy.effective_register_routing() {
                 RegisterRoutingMode::ContactRewrite => self.rewrite_register_contact_and_pending(
@@ -1995,7 +2018,13 @@ impl ProxyServer {
                 .await;
         }
 
-        Ok((message, target, branch, invite_transaction_key))
+        Ok((
+            message,
+            target,
+            branch,
+            invite_transaction_key,
+            record_route_addrs,
+        ))
     }
 
     async fn top_route_targets_this_proxy(
@@ -3002,6 +3031,7 @@ struct UdpBranchRoute {
     created_at: Instant,
     remove_on_final: bool,
     client_transaction_key: Option<String>,
+    record_route_addrs: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -3965,11 +3995,16 @@ impl TcpUpstreamPool {
         target: SocketAddr,
         branch: &str,
         packet: &[u8],
+        method: &'static str,
+        record_route_addrs: Vec<String>,
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         let mut last_error = None;
         for _ in 0..2 {
             let connection = self.get_or_connect(target).await?;
-            match connection.send_request(branch, packet).await {
+            match connection
+                .send_request(branch, packet, method, record_route_addrs.clone())
+                .await
+            {
                 Ok(responses) => return Ok(responses),
                 Err(err) => {
                     last_error = Some(err);
@@ -4032,6 +4067,8 @@ struct TcpUpstreamConnection {
 
 struct TcpBranchRoute {
     tx: mpsc::UnboundedSender<Vec<u8>>,
+    method: &'static str,
+    record_route_addrs: Vec<String>,
     created_at: Instant,
 }
 
@@ -4063,6 +4100,8 @@ impl TcpUpstreamConnection {
         &self,
         branch: &str,
         packet: &[u8],
+        method: &'static str,
+        record_route_addrs: Vec<String>,
     ) -> Result<mpsc::UnboundedReceiver<Vec<u8>>> {
         if !self.is_alive() {
             bail!("upstream SIP TCP connection {} is closed", self.target);
@@ -4076,6 +4115,8 @@ impl TcpUpstreamConnection {
                 branch.to_string(),
                 TcpBranchRoute {
                     tx,
+                    method,
+                    record_route_addrs,
                     created_at: Instant::now(),
                 },
             );
@@ -4147,12 +4188,8 @@ async fn dispatch_tcp_upstream_response(
         &message.start_line,
         SipStartLine::Response { code, .. } if *code >= 200
     );
-    message
-        .pop_top_via()?
-        .context("upstream TCP response is missing Via")?;
-    let response = message.to_bytes();
 
-    let route = {
+    let (tx, method, record_route_addrs) = {
         let mut branches = connection.branches.lock().await;
         prune_tcp_branches(&mut branches, Instant::now());
         let Some(route) = branches.get(&branch) else {
@@ -4164,13 +4201,21 @@ async fn dispatch_tcp_upstream_response(
             return Ok(());
         };
         let tx = route.tx.clone();
+        let method = route.method;
+        let record_route_addrs = route.record_route_addrs.clone();
         if is_final {
             branches.remove(&branch);
         }
-        tx
+        (tx, method, record_route_addrs)
     };
 
-    let _ = route.send(response);
+    ensure_dialog_record_routes(&mut message, method, &record_route_addrs)?;
+    message
+        .pop_top_via()?
+        .context("upstream TCP response is missing Via")?;
+    let response = message.to_bytes();
+
+    let _ = tx.send(response);
     Ok(())
 }
 
@@ -5353,6 +5398,34 @@ fn udp_client_transaction_key(
 
 fn should_record_route(method: &str) -> bool {
     matches!(method, "INVITE" | "SUBSCRIBE" | "REFER")
+}
+
+fn ensure_dialog_record_routes(
+    message: &mut SipMessage,
+    method: &str,
+    record_route_addrs: &[String],
+) -> Result<()> {
+    if method != "INVITE" || record_route_addrs.is_empty() {
+        return Ok(());
+    }
+    if !matches!(
+        &message.start_line,
+        SipStartLine::Response { code, .. } if (200..300).contains(code)
+    ) {
+        return Ok(());
+    }
+
+    let existing = message
+        .headers("Record-Route")
+        .collect::<Vec<_>>()
+        .join(",");
+    for addr in record_route_addrs.iter().rev() {
+        let needle = format!("sip:{addr};lr");
+        if !existing.contains(&needle) {
+            message.prepend_record_route(addr)?;
+        }
+    }
+    Ok(())
 }
 
 fn status_class(code: u16) -> &'static str {
@@ -7329,7 +7402,7 @@ Content-Length: 0\r\n\r\n",
         .unwrap();
 
         assert!(server.request_uri_targets_this_proxy("sip:127.0.0.1:5060", &listener));
-        let (_message, target, _branch, _invite_transaction_key) = server
+        let (_message, target, _branch, _invite_transaction_key, _record_route_addrs) = server
             .prepare_forward(
                 message,
                 "127.0.0.1:9400".parse().unwrap(),
@@ -7442,6 +7515,85 @@ Content-Length: 0\r\n\r\n"
             ]
         );
         assert!(!invite.lines().any(|line| line.starts_with("Route:")));
+    }
+
+    #[tokio::test]
+    async fn udp_invite_2xx_response_repairs_missing_record_route() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let invite = format!(
+            "INVITE sip:6805@{client_addr} SIP/2.0\r\n\
+Route: <sip:172.30.0.101:5060;lr>\r\n\
+Via: SIP/2.0/UDP 10.42.0.209:5060;branch=z9hG4bK-repair-rr-upstream\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>\r\n\
+Call-ID: repair-missing-rr\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:100@example.com>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                invite.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let vias = header_lines(&forwarded, "Via");
+        assert_eq!(vias.len(), 2);
+        assert_eq!(
+            header_lines(&forwarded, "Record-Route"),
+            vec![
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+            ]
+        );
+
+        let response = format!(
+            "SIP/2.0 200 OK\r\n\
+{proxy_via}\r\n\
+{upstream_via}\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>;tag=b\r\n\
+Call-ID: repair-missing-rr\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:6805@{client_addr}>\r\n\
+Content-Length: 0\r\n\r\n",
+            proxy_via = vias[0],
+            upstream_via = vias[1],
+        );
+        client_socket
+            .send_to(response.as_bytes(), proxy_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (len, peer) = proxy_socket.recv_from(&mut buf).await.unwrap();
+        server
+            .handle_udp_packet(&proxy_socket, &buf[..len], peer, &test_listener())
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_response = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded_response.starts_with("SIP/2.0 200 OK"));
+        assert!(!forwarded_response.contains(PROXY_BRANCH_PREFIX));
+        assert_eq!(
+            header_lines(&forwarded_response, "Record-Route"),
+            vec![
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+            ]
+        );
     }
 
     #[tokio::test]
