@@ -1647,6 +1647,9 @@ impl ProxyServer {
                     .await
                     .context("failed to retransmit cached SIP response to UDP client")?;
             } else {
+                if method == "INVITE" && !self.is_upstream_source(peer) {
+                    self.send_udp_invite_trying(socket, &message, peer).await?;
+                }
                 debug!(
                     %peer,
                     target = %route.target.addr,
@@ -1658,9 +1661,18 @@ impl ProxyServer {
             return Ok(());
         }
 
+        let local_trying_request = if method == "INVITE" && !self.is_upstream_source(peer) {
+            Some(message.clone())
+        } else {
+            None
+        };
         let (message, target, branch, invite_transaction_key, record_route_addrs) = self
             .prepare_forward(message, peer, listener, method)
             .await?;
+
+        if let Some(request) = local_trying_request.as_ref() {
+            self.send_udp_invite_trying(socket, request, peer).await?;
+        }
 
         debug!(
             %peer,
@@ -1731,6 +1743,22 @@ impl ProxyServer {
                 bail!("tcp_udp upstream target must be expanded before forwarding")
             }
         }
+    }
+
+    async fn send_udp_invite_trying(
+        &self,
+        socket: &UdpSocket,
+        request: &SipMessage,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let mut response = SipMessage::response_like(request, 100, "Trying");
+        response.apply_top_via_received_rport(peer)?;
+        self.record_local_response("udp", 100);
+        socket
+            .send_to(&response.to_bytes(), peer)
+            .await
+            .context("failed to send local SIP 100 Trying to UDP client")?;
+        Ok(())
     }
 
     async fn forward_udp_to_tcp_upstream(&self, request: UdpToTcpForward<'_>) -> Result<()> {
@@ -6488,6 +6516,9 @@ Content-Length: 0\r\n\r\n"
 
         let mut client_buf = [0_u8; 4096];
         let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let trying = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(trying.starts_with("SIP/2.0 100 Trying"));
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
         let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
         assert!(response.starts_with("SIP/2.0 503 Service Unavailable"));
         assert!(response.contains(&format!("rport={}", client_addr.port())));
@@ -6683,6 +6714,9 @@ Content-Length: 0\r\n\r\n"
         );
 
         let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let trying = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(trying.starts_with("SIP/2.0 100 Trying"));
         let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
         let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
         assert!(response.starts_with("SIP/2.0 503 Service Unavailable"));
@@ -7281,6 +7315,65 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(server.active_udp_branch_count().await, 1);
         assert_eq!(server.active_udp_client_transaction_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn udp_invite_retransmission_gets_local_trying_while_pending() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_upstream(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let request = format!(
+            "INVITE sip:200@example.com SIP/2.0\r\n\
+Via: SIP/2.0/UDP {client_addr};branch=z9hG4bK-invite-retry;rport\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:200@example.com>\r\n\
+Call-ID: invite-retry\r\n\
+CSeq: 1 INVITE\r\n\
+Contact: <sip:100@{client_addr}>\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                request.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let trying = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(trying.starts_with("SIP/2.0 100 Trying"));
+        assert!(trying.contains("branch=z9hG4bK-invite-retry"));
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded.contains(PROXY_BRANCH_PREFIX));
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                request.as_bytes(),
+                client_addr,
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let retry_trying = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(retry_trying.starts_with("SIP/2.0 100 Trying"));
+        assert!(
+            timeout(
+                Duration::from_millis(100),
+                upstream_socket.recv_from(&mut buf)
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -9152,6 +9245,13 @@ Content-Length: 0\r\n\r\n",
             .await
             .unwrap();
 
+        let mut client_buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
+        let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
+        assert!(response.starts_with("SIP/2.0 100 Trying"));
+        assert!(!response.contains(PROXY_BRANCH_PREFIX));
+        assert!(response.contains("z9hG4bK-client"));
+
         for code in ["100 Trying", "180 Ringing", "200 OK", "200 OK"] {
             let mut proxy_buf = [0_u8; 4096];
             let (len, upstream_peer) = proxy_socket.recv_from(&mut proxy_buf).await.unwrap();
@@ -9160,7 +9260,6 @@ Content-Length: 0\r\n\r\n",
                 .await
                 .unwrap();
 
-            let mut client_buf = [0_u8; 4096];
             let (len, _) = client_socket.recv_from(&mut client_buf).await.unwrap();
             let response = String::from_utf8(client_buf[..len].to_vec()).unwrap();
             assert!(response.starts_with(&format!("SIP/2.0 {code}")));
