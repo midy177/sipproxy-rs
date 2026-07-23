@@ -5405,7 +5405,7 @@ fn ensure_dialog_record_routes(
     method: &str,
     record_route_addrs: &[String],
 ) -> Result<()> {
-    if method != "INVITE" || record_route_addrs.is_empty() {
+    if !should_record_route(method) || record_route_addrs.is_empty() {
         return Ok(());
     }
     if !matches!(
@@ -7587,6 +7587,87 @@ Content-Length: 0\r\n\r\n",
         let forwarded_response = String::from_utf8(buf[..len].to_vec()).unwrap();
         assert!(forwarded_response.starts_with("SIP/2.0 200 OK"));
         assert!(!forwarded_response.contains(PROXY_BRANCH_PREFIX));
+        assert_eq!(
+            header_lines(&forwarded_response, "Record-Route"),
+            vec![
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn dialog_forming_2xx_response_repairs_missing_record_route_for_subscribe() {
+        let proxy_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = test_server_with_dual_advertise(upstream_socket.local_addr().unwrap());
+        let client_addr = client_socket.local_addr().unwrap();
+        let subscribe = format!(
+            "SUBSCRIBE sip:6805@{client_addr} SIP/2.0\r\n\
+Route: <sip:172.30.0.101:5060;lr>\r\n\
+Via: SIP/2.0/UDP 10.42.0.209:5060;branch=z9hG4bK-repair-rr-subscribe\r\n\
+Max-Forwards: 70\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>\r\n\
+Call-ID: repair-missing-rr-subscribe\r\n\
+CSeq: 1 SUBSCRIBE\r\n\
+Contact: <sip:100@example.com>\r\n\
+Event: presence\r\n\
+Expires: 3600\r\n\
+Content-Length: 0\r\n\r\n"
+        );
+
+        server
+            .handle_udp_packet(
+                &proxy_socket,
+                subscribe.as_bytes(),
+                upstream_socket.local_addr().unwrap(),
+                &test_listener(),
+            )
+            .await
+            .unwrap();
+
+        let mut buf = [0_u8; 4096];
+        let (len, _) = client_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded = String::from_utf8(buf[..len].to_vec()).unwrap();
+        let vias = header_lines(&forwarded, "Via");
+        assert_eq!(vias.len(), 2);
+        assert_eq!(
+            header_lines(&forwarded, "Record-Route"),
+            vec![
+                "Record-Route: <sip:95.40.96.117:5060;lr>",
+                "Record-Route: <sip:172.30.0.101:5060;lr>",
+            ]
+        );
+
+        let response = format!(
+            "SIP/2.0 200 OK\r\n\
+{proxy_via}\r\n\
+{upstream_via}\r\n\
+From: <sip:100@example.com>;tag=a\r\n\
+To: <sip:6805@example.com>;tag=b\r\n\
+Call-ID: repair-missing-rr-subscribe\r\n\
+CSeq: 1 SUBSCRIBE\r\n\
+Contact: <sip:6805@{client_addr}>\r\n\
+Expires: 3600\r\n\
+Content-Length: 0\r\n\r\n",
+            proxy_via = vias[0],
+            upstream_via = vias[1],
+        );
+        client_socket
+            .send_to(response.as_bytes(), proxy_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (len, peer) = proxy_socket.recv_from(&mut buf).await.unwrap();
+        server
+            .handle_udp_packet(&proxy_socket, &buf[..len], peer, &test_listener())
+            .await
+            .unwrap();
+
+        let (len, _) = upstream_socket.recv_from(&mut buf).await.unwrap();
+        let forwarded_response = String::from_utf8(buf[..len].to_vec()).unwrap();
+        assert!(forwarded_response.starts_with("SIP/2.0 200 OK"));
         assert_eq!(
             header_lines(&forwarded_response, "Record-Route"),
             vec![
